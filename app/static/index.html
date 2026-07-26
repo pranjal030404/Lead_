@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arthvex LeadGen</title>
+  <link rel="stylesheet" href="/static/vendor/leaflet.css">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="dot"></span>
+        <div>Arthvex LeadGen<small id="providerLabel">loading...</small></div>
+      </div>
+      <nav class="nav" id="nav">
+        <a href="#/dashboard">Dashboard</a>
+        <a href="#/search">Search</a>
+        <a href="#/leads">Leads <span class="badge quiet" data-badge="leads"></span></a>
+        <a href="#/map">Map</a>
+        <a href="#/followups">Follow-ups <span class="badge" data-badge="followups"></span></a>
+        <a href="#/pipeline">Pipeline</a>
+        <a href="#/coverage">Coverage map</a>
+
+        <div class="nav-group">Automation</div>
+        <a href="#/approvals">Approve sends <span class="badge" data-badge="approvals"></span></a>
+        <a href="#/automation">Control</a>
+        <a href="#/reports">Reports</a>
+
+        <div class="nav-group">Setup</div>
+        <a href="#/targets">Targets</a>
+        <a href="#/templates">Templates</a>
+        <a href="#/settings">Settings</a>
+      </nav>
+    </aside>
+
+    <main class="main" id="view">
+      <div class="loading">Loading...</div>
+    </main>
+  </div>
+
+  <div id="drawerRoot"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# Never bake secrets or local state into an image.
+.env
+data/
+backups/
+.venv/
+venv/
+
+.git/
+.gitignore
+.pytest_cache/
+**/__pycache__/
+**/*.pyc
+tests/
+*.md
+!README.md
+.claude/
+deploy/
+Dockerfile
+docker-compose.yml

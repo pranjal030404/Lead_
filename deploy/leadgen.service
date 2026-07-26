@@ -1,0 +1,47 @@
+# Non-Docker deploy. Adjust User and the two paths, then:
+#
+#   sudo cp deploy/leadgen.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now leadgen
+#   journalctl -u leadgen -f
+#
+# Run it behind Caddy or nginx with TLS and set COOKIE_SECURE=true - the app
+# binds loopback here on purpose and should not be exposed directly.
+
+[Unit]
+Description=Arthvex LeadGen
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=leadgen
+Group=leadgen
+WorkingDirectory=/opt/leadgen
+EnvironmentFile=/opt/leadgen/.env
+ExecStart=/opt/leadgen/.venv/bin/python run.py
+
+# SIGTERM lets the app release the scheduler lease on the way out, so a standby
+# worker (or the next boot) picks the jobs up straight away.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+
+# Hardening. The app only ever writes to data/ and backups/.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/leadgen/data /opt/leadgen/backups
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=leadgen
+
+[Install]
+WantedBy=multi-user.target

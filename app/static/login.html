@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in - Arthvex LeadGen</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="card login-card" id="form">
+      <div class="brand"><span class="dot"></span> Arthvex LeadGen</div>
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" autofocus required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button class="primary" style="width:100%; justify-content:center" type="submit">Sign in</button>
+      <p id="error" class="banner err" style="display:none; margin:14px 0 0"></p>
+      <p class="faint" style="margin-top:14px; font-size:11.5px; text-align:center">
+        Credentials come from ADMIN_USER / ADMIN_PASSWORD in your .env file.
+      </p>
+    </form>
+  </div>
+
+  <script>
+    const form = document.getElementById('form');
+    const error = document.getElementById('error');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      error.style.display = 'none';
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: form.username.value,
+          password: form.password.value,
+        }),
+      });
+      if (response.ok) {
+        window.location.href = '/';
+        return;
+      }
+      const data = await response.json().catch(() => ({}));
+      error.textContent = data.detail || 'Sign in failed';
+      error.style.display = 'block';
+    });
+  </script>
+</body>
+</html>

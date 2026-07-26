@@ -1,0 +1,36 @@
+# Caddy gets a certificate from Let's Encrypt and renews it, with no cron job
+# and no certbot. Point DOMAIN's A record at this box first, or the ACME
+# challenge fails and you get no certificate.
+
+{
+	email {$TLS_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# The app sets its own Cache-Control on /static (revalidate every load, so a
+	# deploy lands immediately). Nothing here should override that.
+	reverse_proxy app:8000 {
+		header_up X-Real-IP {remote_host}
+		# The in-app rate limiter keys on the client address. Without this the
+		# proxy's own IP is the key and every visitor shares one bucket.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options    "nosniff"
+		X-Frame-Options           "DENY"
+		Referrer-Policy           "same-origin"
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}

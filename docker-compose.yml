@@ -1,0 +1,62 @@
+# Arthvex LeadGen.
+#
+#   docker compose up -d              app only, on 127.0.0.1:8000
+#   docker compose --profile tls up -d   app + Caddy with automatic HTTPS
+#
+# Set DOMAIN and TLS_EMAIL in .env before using the tls profile.
+
+services:
+  app:
+    build: .
+    image: arthvex-leadgen:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8000"
+    volumes:
+      # Named volumes, not bind mounts: SQLite over a bind mount into a VM
+      # (Docker Desktop, some VPS setups) can break its file locking, and
+      # broken locking on a database is a data-loss bug, not a slow one.
+      - leadgen-data:/app/data
+      - leadgen-backups:/app/backups
+    ports:
+      # Loopback only. Anything public should terminate TLS at the proxy -
+      # this app holds your whole pipeline and ships session cookies.
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      TLS_EMAIL: ${TLS_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  leadgen-data:
+  leadgen-backups:
+  caddy-data:
+  caddy-config:
