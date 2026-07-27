@@ -12,34 +12,38 @@ database server, no paid API required to start. It runs on a $4/month VPS.
 ## Quick start
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 ```
 
 ```bash
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt
 ```
 
 ```bash
-copy .env.example .env
+cp .env.example .env
 ```
 
 Set `ADMIN_PASSWORD` and `SECRET_KEY` in `.env`, then:
 
 ```bash
-.venv\Scripts\python.exe run.py
+.venv/bin/python run.py
 ```
 
 Open http://127.0.0.1:8000 and sign in. Generate a secret key with:
 
 ```bash
-python -c "import secrets;print(secrets.token_hex(32))"
+python3 -c "import secrets;print(secrets.token_hex(32))"
 ```
 
 Run the tests any time with:
 
 ```bash
-.venv\Scripts\python.exe -m pytest tests -q
+.venv/bin/python -m pytest tests -q
 ```
+
+### Windows
+
+Replace `.venv/bin/` with `.venv\Scripts\` and `cp` with `copy` in the commands above.
 
 ---
 
