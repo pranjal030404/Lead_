@@ -214,6 +214,87 @@ into a VM, and broken locking on a database is data loss, not slowness.
 **Without Docker** — `deploy/leadgen.service` is a hardened systemd unit; adjust
 `User` and the paths, then `systemctl enable --now leadgen`.
 
+### Deploy behind Apache on a VPS
+
+Same flow as above, with Apache as the TLS-terminating proxy instead of Caddy.
+The app binds loopback in both cases; nothing is ever exposed directly.
+
+1. **Point DNS first.** Set an `A` (and `AAAA`) record for your domain at the
+   box's IP before running certbot, or the ACME challenge fails.
+2. **Install Apache and the toolchain:**
+
+   ```bash
+   sudo apt update
+   sudo apt install apache2 python3-venv python3-dev certbot python3-certbot-apache
+   sudo a2enmod proxy proxy_http headers ssl
+   ```
+
+3. **Deploy the app.** Create a `leadgen` user, put the code at `/opt/leadgen`
+   (git clone or rsync), and install dependencies:
+
+   ```bash
+   sudo useradd --system --home /opt/leadgen --shell /usr/sbin/nologin leadgen
+   sudo mkdir -p /opt/leadgen && sudo chown leadgen:leadgen /opt/leadgen
+   cd /opt/leadgen
+   sudo -u leadgen python3 -m venv .venv
+   sudo -u leadgen .venv/bin/pip install -r requirements.txt
+   ```
+
+4. **Configure** — copy `.env.example` to `.env` owned by `leadgen` and set at
+   minimum:
+
+   ```bash
+   ADMIN_PASSWORD=<a strong password>
+   SECRET_KEY=<python3 -c "import secrets;print(secrets.token_hex(32))">
+   COOKIE_SECURE=true      # we're behind HTTPS now
+   TRUST_PROXY=true        # rate limits key on X-Forwarded-For
+   HOST=127.0.0.1          # loopback only - Apache is the front door
+   PORT=8000
+   ```
+
+5. **Run the app as a service**, so it survives reboots and Apache restarts:
+
+   ```bash
+   sudo cp deploy/leadgen.service /etc/systemd/system/
+   # edit User/WorkingDirectory if you didn't use /opt/leadgen
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now leadgen
+   sudo systemctl status leadgen
+   ```
+
+6. **Install the Apache vhost** (`deploy/leadgen-apache.conf`), set your
+   `ServerName`, then load it:
+
+   ```bash
+   sudo cp deploy/leadgen-apache.conf /etc/apache2/sites-available/leadgen.conf
+   sudo sed -i 's/leadgen\.example\.com/your.domain/' /etc/apache2/sites-available/leadgen.conf
+   sudo a2dissite 000-default
+   sudo a2ensite leadgen
+   sudo systemctl reload apache2
+   ```
+
+7. **Get TLS.** certbot edits the vhost for HTTPS and wires auto-renewal:
+
+   ```bash
+   sudo certbot --apache -d your.domain
+   ```
+
+   `http://your.domain` now bounces to `https://`, which proxies to uvicorn on
+   `127.0.0.1:8000`. Confirm at `https://your.domain/health` — it should return
+   `{"status":"ok"}` — then sign in at `/login`.
+
+8. **Config for a live run** — pick up the shared checklist below exactly as
+   written: quotas, `ALERT_EMAIL`, `DRY_RUN` for a week, then flip automation
+   switches one at a time.
+
+> The `deploy/leadgen-apache.conf` ships with the same security headers as
+> `deploy/Caddyfile`. Do not add a `DocumentRoot` for the app vhost: every
+> request is proxied, and `.env`/`data/` must stay out of Apache's document
+> tree. mod_proxy already forwards `X-Forwarded-For` (`ProxyAddHeaders` is on
+> by default) and the app reads its *first* entry — don't also enable
+> `RemoteIPHeader`/`mod_remoteip` for this vhost or the address gets
+> double-stamped.
+
 Either way, in order:
 
 1. `PROVIDER`, `ADMIN_PASSWORD`, `SECRET_KEY` in `.env`.
@@ -304,6 +385,7 @@ app/
   static/vendor/       Leaflet, vendored so the map needs no CDN
 deploy/
   Caddyfile            reverse proxy + automatic HTTPS
+  leadgen-apache.conf  Apache vhost: TLS + reverse proxy to 127.0.0.1:8000
   leadgen.service      hardened systemd unit
 Dockerfile             non-root image, healthcheck, tini
 docker-compose.yml     app alone, or `--profile tls` with Caddy
