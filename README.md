@@ -214,78 +214,130 @@ into a VM, and broken locking on a database is data loss, not slowness.
 **Without Docker** — `deploy/leadgen.service` is a hardened systemd unit; adjust
 `User` and the paths, then `systemctl enable --now leadgen`.
 
-### Deploy behind Apache on a VPS
+### Deploy behind Apache on a VPS — full walkthrough
 
-Same flow as above, with Apache as the TLS-terminating proxy instead of Caddy.
-The app binds loopback in both cases; nothing is ever exposed directly.
+The complete path from a fresh Ubuntu VPS (22.04/24.04) to a live site at
+`https://your.domain`. Same flow as the Docker route — the app binds loopback
+and Apache terminates TLS; nothing is ever exposed directly.
 
-1. **Point DNS first.** Set an `A` (and `AAAA`) record for your domain at the
-   box's IP before running certbot, or the ACME challenge fails.
-2. **Install Apache and the toolchain:**
+**Step 0 — DNS first.** In your DNS panel, point an `A` record `your.domain`
+at the box's public IP *before* running certbot, or the ACME challenge fails.
 
-   ```bash
-   sudo apt update
-   sudo apt install apache2 python3-venv python3-dev certbot python3-certbot-apache
-   sudo a2enmod proxy proxy_http headers ssl
-   ```
+**Step 1 — log in and prep the box.**
 
-3. **Deploy the app.** Create a `leadgen` user, put the code at `/opt/leadgen`
-   (git clone or rsync), and install dependencies:
+```bash
+ssh user@<VPS_IP>
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y git python3 python3-venv python3-pip apache2 certbot python3-certbot-apache
+sudo a2enmod proxy proxy_http headers ssl
+```
 
-   ```bash
-   sudo useradd --system --home /opt/leadgen --shell /usr/sbin/nologin leadgen
-   sudo mkdir -p /opt/leadgen && sudo chown leadgen:leadgen /opt/leadgen
-   cd /opt/leadgen
-   sudo -u leadgen python3 -m venv .venv
-   sudo -u leadgen .venv/bin/pip install -r requirements.txt
-   ```
+**Step 2 — firewall.** Allow SSH + web, drop the rest:
 
-4. **Configure** — copy `.env.example` to `.env` owned by `leadgen` and set at
-   minimum:
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 'Apache Full'          # opens 80 and 443
+sudo ufw --force enable
+sudo ufw status                       # confirm both are allowed
+```
 
-   ```bash
-   ADMIN_PASSWORD=<a strong password>
-   SECRET_KEY=<python3 -c "import secrets;print(secrets.token_hex(32))">
-   COOKIE_SECURE=true      # we're behind HTTPS now
-   TRUST_PROXY=true        # rate limits key on X-Forwarded-For
-   HOST=127.0.0.1          # loopback only - Apache is the front door
-   PORT=8000
-   ```
+**Step 3 — app user.** The service must never run as root:
 
-5. **Run the app as a service**, so it survives reboots and Apache restarts:
+```bash
+sudo useradd --system --home /opt/leadgen --shell /usr/sbin/nologin leadgen
+sudo mkdir -p /opt/leadgen
+sudo chown leadgen:leadgen /opt/leadgen
+```
 
-   ```bash
-   sudo cp deploy/leadgen.service /etc/systemd/system/
-   # edit User/WorkingDirectory if you didn't use /opt/leadgen
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now leadgen
-   sudo systemctl status leadgen
-   ```
+**Step 4 — pull the code.**
 
-6. **Install the Apache vhost** (`deploy/leadgen-apache.conf`), set your
-   `ServerName`, then load it:
+```bash
+sudo -u leadgen git clone https://github.com/pranjal030404/Lead_ /opt/leadgen
+```
 
-   ```bash
-   sudo cp deploy/leadgen-apache.conf /etc/apache2/sites-available/leadgen.conf
-   sudo sed -i 's/leadgen\.example\.com/your.domain/' /etc/apache2/sites-available/leadgen.conf
-   sudo a2dissite 000-default
-   sudo a2ensite leadgen
-   sudo systemctl reload apache2
-   ```
+(Future updates are just `sudo -u leadgen git -C /opt/leadgen pull`.)
 
-7. **Get TLS.** certbot edits the vhost for HTTPS and wires auto-renewal:
+**Step 5 — venv and dependencies.**
 
-   ```bash
-   sudo certbot --apache -d your.domain
-   ```
+```bash
+sudo -u leadgen python3 -m venv /opt/leadgen/.venv
+sudo -u leadgen /opt/leadgen/.venv/bin/pip install --upgrade pip
+sudo -u leadgen /opt/leadgen/.venv/bin/pip install -r /opt/leadgen/requirements.txt
+```
 
-   `http://your.domain` now bounces to `https://`, which proxies to uvicorn on
-   `127.0.0.1:8000`. Confirm at `https://your.domain/health` — it should return
-   `{"status":"ok"}` — then sign in at `/login`.
+**Step 6 — `.env`.** Generate a key first with `python3 -c "import secrets;print(secrets.token_hex(32))"`, then:
 
-8. **Config for a live run** — pick up the shared checklist below exactly as
-   written: quotas, `ALERT_EMAIL`, `DRY_RUN` for a week, then flip automation
-   switches one at a time.
+```bash
+sudo -u leadgen cp /opt/leadgen/.env.example /opt/leadgen/.env
+sudo -u leadgen nano /opt/leadgen/.env
+```
+
+Set at minimum:
+
+```env
+ADMIN_USER=admin
+ADMIN_PASSWORD=<your strong password>
+SECRET_KEY=<paste the generated hex>
+COOKIE_SECURE=true      # we're behind HTTPS now
+TRUST_PROXY=true        # rate limits key on X-Forwarded-For from Apache
+HOST=127.0.0.1          # loopback only - Apache is the front door
+PORT=8000
+PROVIDER=osm            # or google (needs GOOGLE_API_KEY)
+DRY_RUN=true            # keep true until you've watched the queue for a week
+```
+
+**Step 7 — run the app as a service.** The repo ships a hardened unit at
+`deploy/leadgen.service`. Confirm it says `User=leadgen`,
+`WorkingDirectory=/opt/leadgen`, `EnvironmentFile=/opt/leadgen/.env`, then:
+
+```bash
+sudo cp /opt/leadgen/deploy/leadgen.service /etc/systemd/system/leadgen.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now leadgen
+sudo systemctl status leadgen                          # active (running)
+sudo curl -s http://127.0.0.1:8000/health              # {"status":"ok"}
+```
+
+**Step 8 — point Apache at it.** Install the shipped vhost and swap in your
+domain:
+
+```bash
+sudo cp /opt/leadgen/deploy/leadgen-apache.conf /etc/apache2/sites-available/leadgen.conf
+sudo sed -i 's/leadgen\.example\.com/your.domain/g' /etc/apache2/sites-available/leadgen.conf
+sudo a2dissite 000-default
+sudo a2ensite leadgen
+sudo apachectl configtest                              # Syntax OK
+sudo systemctl reload apache2
+```
+
+`http://your.domain` now reverse-proxies to uvicorn on `127.0.0.1:8000`.
+
+**Step 9 — TLS, the moment it goes live.** certbot rewrites the vhost for
+HTTPS and wires auto-renewal:
+
+```bash
+sudo certbot --apache -d your.domain
+sudo certbot renew --dry-run                            # renewal actually works
+curl -s https://your.domain/health                      # {"status":"ok"}
+```
+
+Sign in at `https://your.domain/login`.
+
+**Step 10 — config for a live run.** Pick up the shared checklist below
+exactly as written: quotas, `ALERT_EMAIL`, `DRY_RUN` for a week, then flip
+automation switches one at a time.
+
+**Updating the app later.**
+
+```bash
+sudo -u leadgen git -C /opt/leadgen pull
+sudo -u leadgen /opt/leadgen/.venv/bin/pip install -r /opt/leadgen/requirements.txt
+sudo systemctl restart leadgen
+```
+
+Traffic path once live: browser → Apache `:443` (TLS) → uvicorn
+`127.0.0.1:8000` → SQLite. `journalctl -u leadgen -f` for app logs,
+`/var/log/apache2/leadgen-*.{log}` for web logs.
 
 > The `deploy/leadgen-apache.conf` ships with the same security headers as
 > `deploy/Caddyfile`. Do not add a `DocumentRoot` for the app vhost: every

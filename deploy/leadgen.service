@@ -5,8 +5,9 @@
 #   sudo systemctl enable --now leadgen
 #   journalctl -u leadgen -f
 #
-# Run it behind Caddy or nginx with TLS and set COOKIE_SECURE=true - the app
-# binds loopback here on purpose and should not be exposed directly.
+# Run it behind Caddy, nginx, or Apache with TLS and set COOKIE_SECURE=true
+# and TRUST_PROXY=true - the app binds loopback here on purpose and should not
+# be exposed directly.
 
 [Unit]
 Description=Arthvex LeadGen
