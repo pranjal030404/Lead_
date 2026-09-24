@@ -11,8 +11,8 @@ from fastapi.staticfiles import StaticFiles
 from .automation import start_scheduler, stop_scheduler
 from .config import settings
 from .db import init_db, query_one
-from .routers import auth, automation, leads, outreach, search, stats
-from .security import SESSION_COOKIE, client_ip, rate_limit, verify_token
+from .routers import auth, automation, leads, outreach, plans, search, stats, users
+from .security import (SESSION_COOKIE, client_ip, load_user, rate_limit, verify_token)
 
 PUBLIC_PATHS = {"/login", "/health", "/api/auth/login", "/favicon.ico"}
 PUBLIC_PREFIXES = ("/static/",)
@@ -82,6 +82,10 @@ async def auth_and_rate_limit(request: Request, call_next):
         return response
 
     user = verify_token(request.cookies.get(SESSION_COOKIE))
+    if user:
+        # Re-read the row so a deactivated or deleted account is locked out on
+        # the very next request, not whenever the token happened to expire.
+        user = load_user(user)
     if not user:
         if path.startswith("/api/"):
             return JSONResponse({"detail": "Not authenticated"}, status_code=401)
@@ -97,6 +101,8 @@ app.include_router(search.router)
 app.include_router(stats.router)
 app.include_router(outreach.router)
 app.include_router(automation.router)
+app.include_router(users.router)
+app.include_router(plans.router)
 
 app.mount("/static", StaticFiles(directory=settings.static_dir), name="static")
 

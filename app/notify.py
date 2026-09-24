@@ -45,7 +45,7 @@ def _claim(alert_key: str, kind: str) -> bool:
     """
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT OR IGNORE INTO alerts_sent(alert_key, kind, created_at) VALUES(?,?,?)",
+            "INSERT IGNORE INTO alerts_sent(alert_key, kind, created_at) VALUES(?,?,?)",
             (alert_key, kind, utcnow()),
         )
         return cur.rowcount > 0

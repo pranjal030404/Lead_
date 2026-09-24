@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from ..config import settings
-from ..security import (SESSION_COOKIE, check_credentials, client_ip, issue_token,
+from ..security import (SESSION_COOKIE, authenticate_user, client_ip, issue_token,
                         rate_limit)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -25,10 +25,11 @@ def login(payload: LoginPayload, request: Request, response: Response):
             f"Too many login attempts. Wait {settings.login_rate_window // 60} minutes.",
         )
 
-    if not check_credentials(payload.username, payload.password):
+    user = authenticate_user(payload.username, payload.password)
+    if not user:
         raise HTTPException(401, "Invalid username or password")
 
-    token = issue_token(payload.username)
+    token = issue_token(user["username"])
     response.set_cookie(
         SESSION_COOKIE, token,
         max_age=settings.session_hours * 3600,
@@ -38,7 +39,7 @@ def login(payload: LoginPayload, request: Request, response: Response):
         # is silently dropped over plain http, which looks like a broken login.
         secure=settings.cookie_secure,
     )
-    return {"ok": True, "user": payload.username}
+    return {"ok": True, "user": user}
 
 
 @router.post("/logout")
@@ -49,4 +50,9 @@ def logout(response: Response):
 
 @router.get("/me")
 def me(request: Request):
-    return {"user": getattr(request.state, "user", None)}
+    user = getattr(request.state, "user", None)
+    subscription = None
+    if user:
+        from ..subscription import active_subscription
+        subscription = active_subscription(user["id"])
+    return {"user": user, "subscription": subscription}

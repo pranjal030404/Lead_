@@ -4,8 +4,9 @@ Self-hosted lead generation for a web studio. Finds local businesses that need
 websites, enriches them, scores them, tracks every interaction, and never
 searches the same place twice.
 
-Built from the v3.1 blueprint. FastAPI + SQLite + vanilla JS — no build step, no
-database server, no paid API required to start. It runs on a $4/month VPS.
+Built from the v3.1 blueprint. FastAPI + MySQL + vanilla JS — no build step, no
+paid API required to start. It runs on a $4/month VPS, multi-user, with
+subscription plans gating lead searches.
 
 ---
 
@@ -23,17 +24,52 @@ python3 -m venv .venv
 cp .env.example .env
 ```
 
-Set `ADMIN_PASSWORD` and `SECRET_KEY` in `.env`, then:
+Set `ADMIN_PASSWORD`, `SECRET_KEY` and the `MYSQL_*` connection in `.env`, then
+provide the database (next section) and run:
 
 ```bash
 .venv/bin/python run.py
 ```
 
-Open http://127.0.0.1:8000 and sign in. Generate a secret key with:
+Open http://127.0.0.1:8000 and sign in with `ADMIN_USER`/`ADMIN_PASSWORD`
+(seeded as the `superadmin` on first boot). Generate a secret key with:
 
 ```bash
 python3 -c "import secrets;print(secrets.token_hex(32))"
 ```
+
+### Database setup
+
+The app needs a MySQL 8+/MariaDB server reachable at `MYSQL_HOST`:`MYSQL_PORT`
+from the machine running it. Two ways to get one:
+
+**Option A - Docker (as shipped):**
+
+```bash
+docker compose up -d mysql          # needs docker installed
+```
+
+**Option B - an existing local MySQL/MariaDB server.** Point `.env` at it
+(`MYSQL_HOST`/`MYSQL_PORT`) and create the app's user and databases once. On a
+typical Linux box with MariaDB running on 3306:
+
+```bash
+sudo mariadb <<'SQL'
+CREATE DATABASE IF NOT EXISTS leadgen      CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS leadgen_test CHARACTER SET utf8mb4;
+CREATE USER IF NOT EXISTS 'leadgen'@'localhost' IDENTIFIED BY 'leadgenpass';
+CREATE USER IF NOT EXISTS 'leadgen'@'127.0.0.1' IDENTIFIED BY 'leadgenpass';
+GRANT ALL PRIVILEGES ON leadgen.*      TO 'leadgen'@'localhost';
+GRANT ALL PRIVILEGES ON leadgen.*      TO 'leadgen'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON leadgen_test.* TO 'leadgen'@'localhost';
+GRANT ALL PRIVILEGES ON leadgen_test.* TO 'leadgen'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+```
+
+`init_db()` creates all tables on first boot, so no schema import is needed.
+If your `.env` uses different credentials, adjust the `CREATE USER`/`GRANT`
+lines to match `MYSQL_USER`/`MYSQL_PASSWORD`.
 
 Run the tests any time with:
 
@@ -41,9 +77,28 @@ Run the tests any time with:
 .venv/bin/python -m pytest tests -q
 ```
 
+Tests force `MYSQL_DATABASE=leadgen_test` (they refuse to run against any other
+database), so they are safe to run while the app is up.
+
 ### Windows
 
 Replace `.venv/bin/` with `.venv\Scripts\` and `cp` with `copy` in the commands above.
+
+### Troubleshooting
+
+**`pymysql.err.OperationalError: (2003, "Can't connect to MySQL server on
+'127.0.0.1')` — app won't start (or `pytest` fails at collection).** No server is
+listening at the `MYSQL_HOST`/`MYSQL_PORT` in `.env`. Common causes:
+
+- A mismatch between the configured port and the server that's actually running.
+  Check what's listening with `ss -tlnp | grep 3306` (or your port) and fix
+  `MYSQL_PORT`.
+- Docker is used for MySQL, but it isn't installed or the container isn't up
+  (`docker compose up -d mysql`). Without Docker, point `.env` at an existing
+  local server (see *Database setup* above).
+- The server is up but the database/user doesn't exist yet. `(1045, Access
+  denied)` on the same host/port means the server is fine but `MYSQL_USER` /
+  `MYSQL_PASSWORD` don't match a grant — run the bootstrap SQL above.
 
 ---
 
@@ -125,7 +180,15 @@ banned or blacklisted.
   history, for GDPR / DPDP erasure requests.
 - **Auth + rate limiting.** Session cookies, hashed comparison, 8 login attempts
   per 5 minutes, 600 API calls/minute per IP.
-- **Backups.** Nightly, via SQLite's online backup API so a backup taken
+- **Accounts and roles.** `user`, `admin`, `superadmin`. Only the superadmin can
+  grant privileged roles; a deactivated or deleted account locks out on its next
+  request. Created from `ADMIN_USER`/`ADMIN_PASSWORD` on first boot.
+- **Subscription plans gating searches.** Admins define plans (price, period,
+  search count, per-search result cap). Searches are blocked without an active
+  plan; each completed search counts against the plan. Superadmin is never
+  gated. Self-serve ordering can be enabled so users buy a plan and an admin
+  approves it, or admins assign plans directly.
+- **Backups.** Nightly via `mysqldump --single-transaction` so a backup taken
   mid-write is still consistent. 30-day retention, and `BACKUP_REMOTE` pushes
   each night's file off-server with rclone — a local backup survives losing the
   file, not losing the box. A failed sync never costs you the local copy that
@@ -160,17 +223,16 @@ Four things were genuinely slow. Measured, changed, measured again:
 
 What actually caused each one:
 
-- **A fresh SQLite connection per query**, re-running four PRAGMAs each time.
-  Connections are now thread-local and reused. `synchronous=NORMAL` (the standard
-  pairing for WAL) stopped the fsync on every commit — an OS crash can lose the
-  last few transactions, it cannot corrupt the file.
+- **Thread-local MySQL connections**, reused across queries instead of a fresh
+  connection (and its four PRAGMAs) per call. `autocommit=True`; explicit
+  transactions are taken only where a multi-statement unit needs them.
 - **A new `httpx.Client` per outbound call**, so every website check paid a fresh
   TCP and TLS handshake. One pooled client now, with keep-alive.
 - **Strictly sequential enrichment.** It's almost all waiting on other people's
   web servers, and a dead site burns the full timeout — so 60 leads meant 60
   timeouts end to end. A bounded pool (`ENRICH_WORKERS`) overlaps the wait.
 - **FastAPI's `jsonable_encoder`**, which walks every value of every response.
-  Rows out of SQLite are already primitives, so the walk found nothing to convert
+  Rows out of the database are already primitives, so the walk found nothing to convert
   and cost 13× plain `json.dumps` — 12.5ms per page, on the CPU running the event
   loop. The list endpoints return a `Response` directly to skip it, and send the
   12 columns the table draws instead of all 56 (`?full=true` for the whole row).
@@ -208,8 +270,9 @@ docker compose --profile tls up -d
 ```
 
 The app binds loopback and Caddy terminates TLS. Data and backups are named
-volumes, not bind mounts — SQLite's file locking is unreliable over a bind mount
-into a VM, and broken locking on a database is data loss, not slowness.
+volumes. `docker-compose.yml` also runs a `mysql:8.0` service with its own
+volume and a healthcheck the app waits on; the app gets `MYSQL_HOST=mysql` and
+`MYSQL_PORT=3306` inside the compose network.
 
 **Without Docker** — `deploy/leadgen.service` is a hardened systemd unit; adjust
 `User` and the paths, then `systemctl enable --now leadgen`.
@@ -336,7 +399,7 @@ sudo systemctl restart leadgen
 ```
 
 Traffic path once live: browser → Apache `:443` (TLS) → uvicorn
-`127.0.0.1:8000` → SQLite. `journalctl -u leadgen -f` for app logs,
+`127.0.0.1:8000` → MySQL. `journalctl -u leadgen -f` for app logs,
 `/var/log/apache2/leadgen-*.{log}` for web logs.
 
 > The `deploy/leadgen-apache.conf` ships with the same security headers as
@@ -359,8 +422,11 @@ Either way, in order:
 6. Turn the switches on one at a time: discovery, then enrichment, then
    follow-up generation, and sending last.
 
-Stay on SQLite until you have concurrent writers or 100k+ leads; move to
-Postgres at that point, not before.
+MySQL is the only storage backend now. Coming from SQLite? `scripts/migrate_sqlite_to_mysql.py`
+copies the whole old database across (IDs preserved so foreign keys survive) —
+run it once, then delete `data/leadgen.db`. Schema drift is applied at boot:
+`init_db()` creates missing tables and adds later columns (e.g. `searches.user_id`)
+to databases created by older builds.
 
 ---
 
@@ -415,7 +481,7 @@ pricing page before scaling usage up.
 app/
   main.py              FastAPI app, auth middleware, static serving
   config.py            environment / .env loading
-  db.py                schema + SQLite helpers
+  db.py                schema + MySQL helpers (thread-local connections)
   search_service.py    discovery -> dedup -> staged fetch -> enrichment
   dedup.py             duplicate detection and merging
   enrich.py            the enrichment pipeline
@@ -430,6 +496,7 @@ app/
   quota.py             API budget hard stop
   http.py              pooled client, timeouts, backoff, circuit breakers
   security.py          sessions, password hashing, rate limiting
+  subscription.py      plan entitlements, search accounting, gating
   backup.py            nightly backup + retention + off-site sync
   providers/           osm, google_places, mock
   routers/             the HTTP API
@@ -440,8 +507,9 @@ deploy/
   leadgen-apache.conf  Apache vhost: TLS + reverse proxy to 127.0.0.1:8000
   leadgen.service      hardened systemd unit
 Dockerfile             non-root image, healthcheck, tini
-docker-compose.yml     app alone, or `--profile tls` with Caddy
-tests/test_core.py     43 tests, no network, no API key
+docker-compose.yml     app + MySQL (+ `--profile tls` with Caddy)
+tests/test_core.py     43 tests, no network, no API key (run on `leadgen_test`)
+scripts/               migrate_sqlite_to_mysql.py: one-time SQLite -> MySQL copy
 ```
 
 ---
@@ -456,7 +524,6 @@ Honest list of what the blueprint describes that isn't here:
   against most of their terms, so `stage_social` in `app/enrich.py` is a
   documented extension point rather than a broken scraper.
 - **WhatsApp Business Cloud API.** Click-to-chat only, by design.
-- **Multi-user accounts.** Single operator, single login.
 - **Telegram/WhatsApp alert channels.** Part 7.6 offers these as alternatives to
   email; only email is wired up.
 "# Lead_" 

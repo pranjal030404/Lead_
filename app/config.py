@@ -26,6 +26,13 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
 def _str(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
@@ -35,14 +42,20 @@ class Settings:
     base_dir = BASE_DIR
     data_dir = BASE_DIR / "data"
     backup_dir = BASE_DIR / "backups"
-    db_path = BASE_DIR / "data" / "leadgen.db"
+    db_path = BASE_DIR / "data" / "leadgen.db"  # legacy SQLite path, used only by the migration script
     static_dir = Path(__file__).resolve().parent / "static"
 
-    # database tuning - raise these before reaching for Postgres
-    db_timeout = _int("DB_TIMEOUT", 30)
-    db_synchronous = _str("DB_SYNCHRONOUS", "NORMAL").upper()
-    db_cache_mb = _int("DB_CACHE_MB", 64)
-    db_mmap_mb = _int("DB_MMAP_MB", 256)
+    # MySQL connection (the primary store)
+    mysql_host = _str("MYSQL_HOST", "127.0.0.1")
+    mysql_port = _int("MYSQL_PORT", 3306)
+    mysql_user = _str("MYSQL_USER", "leadgen")
+    mysql_password = _str("MYSQL_PASSWORD")
+    mysql_database = _str("MYSQL_DATABASE", "leadgen")
+    mysql_charset = _str("MYSQL_CHARSET", "utf8mb4")
+    mysqldump_path = _str("MYSQLDUMP_PATH", "mysqldump")
+    # seconds to wait for a connection to the DB server - set high enough for a
+    # container that is still warming up when the app starts
+    mysql_connect_timeout = _float("MYSQL_CONNECT_TIMEOUT", 10)
 
     # concurrency
     enrich_workers = _int("ENRICH_WORKERS", 8)

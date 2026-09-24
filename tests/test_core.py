@@ -1,30 +1,20 @@
 """Core behaviour tests. Run with: python -m pytest tests -q
 
 These use the mock provider, so they need no API key and make no network calls.
+Environment (PROVIDER, MYSQL_*) and the isolated MySQL test database are set up
+in tests/conftest.py, which runs before this module is imported.
 """
 
 from __future__ import annotations
 
-import os
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Point the app at a throwaway database before anything imports config.
-_tmp = tempfile.mkdtemp(prefix="leadgen-test-")
-os.environ["PROVIDER"] = "mock"
-os.environ["DRY_RUN"] = "true"
-
 from app import config  # noqa: E402
 
-config.settings.db_path = Path(_tmp) / "test.db"
-config.settings.data_dir = Path(_tmp)
-config.settings.backup_dir = Path(_tmp) / "backups"
-config.settings.backup_dir.mkdir(exist_ok=True)
-
-from app.db import init_db, query, query_one, scalar  # noqa: E402
+from app.db import init_db, query, query_one, scalar, utcnow  # noqa: E402
 from app.dedup import find_duplicate, normalise_name, similarity  # noqa: E402
 from app.outreach import is_suppressed, render_template, suppress  # noqa: E402
 from app.scoring import score_lead  # noqa: E402
@@ -249,13 +239,16 @@ def test_hot_lead_alert_fires_once_and_only_above_the_threshold():
     from app.db import execute
 
     threshold = config.settings.hot_alert_min_score
+    now = utcnow()
     hot = execute(
         "INSERT INTO leads(business_name, city, lead_score, lead_priority, created_at) "
-        f"VALUES('Alertable Cafe','Testville',{threshold},'HOT',datetime('now'))"
+        "VALUES(?,?,?,?,?)",
+        ("Alertable Cafe", "Testville", threshold, "HOT", now),
     )
     cold = execute(
         "INSERT INTO leads(business_name, city, lead_score, lead_priority, created_at) "
-        f"VALUES('Middling Gym','Testville',{threshold - 2},'WARM',datetime('now'))"
+        "VALUES(?,?,?,?,?)",
+        ("Middling Gym", "Testville", threshold - 2, "WARM", now),
     )
 
     first = notify.alert_new_hot_leads([hot, cold])
@@ -319,17 +312,19 @@ def test_backup_sync_is_skipped_when_no_remote_is_configured():
     from app.backup import sync_offsite
 
     config.settings.backup_remote = ""
-    assert sync_offsite(config.settings.db_path)["skipped"] == "BACKUP_REMOTE not set"
+    dummy = Path(config.settings.backup_dir) / "dummy.sql"
+    assert sync_offsite(dummy)["skipped"] == "BACKUP_REMOTE not set"
 
 
 def test_backup_sync_failure_never_raises():
     """A dead remote must not cost you the local backup that already worked."""
     from app.backup import sync_offsite
 
+    dummy = Path(config.settings.backup_dir) / "dummy.sql"
     config.settings.backup_remote = "nosuchremote:bucket"
     config.settings.rclone_path = "definitely-not-a-real-binary"
     try:
-        result = sync_offsite(config.settings.db_path)
+        result = sync_offsite(dummy)
         assert result["ok"] is False and "not found" in result["error"]
     finally:
         config.settings.backup_remote = ""
@@ -337,17 +332,18 @@ def test_backup_sync_failure_never_raises():
 
 
 def test_backup_writes_a_restorable_file():
+    """mysqldump output must be a real SQL dump carrying the app's data."""
     from app.backup import run_backup
 
     config.settings.backup_remote = ""
     result = run_backup()
-    assert Path(result["file"]).exists()
-    restored = __import__("sqlite3").connect(result["file"])
-    try:
-        count = restored.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
-        assert count == scalar("SELECT COUNT(*) FROM leads")
-    finally:
-        restored.close()
+    path = Path(result["file"])
+    assert path.exists() and path.stat().st_size > 0
+
+    content = path.read_text(encoding="utf-8", errors="replace")
+    assert "CREATE TABLE" in content, "dump is not a SQL dump"
+    assert "`leads`" in content, "dump misses the leads table"
+    assert "INSERT INTO `leads`" in content, "dump carries no lead rows"
 
 
 # --------------------------------------------------------------- job runner --
@@ -366,9 +362,9 @@ def test_alert_prune_only_removes_old_quota_claims():
     from app import notify
     from app.db import execute, scalar
 
-    execute("INSERT OR REPLACE INTO alerts_sent(alert_key, kind, created_at) "
+    execute("REPLACE INTO alerts_sent(alert_key, kind, created_at) "
             "VALUES('quota:google:ancient','quota','2000-01-01T00:00:00+00:00')")
-    execute("INSERT OR REPLACE INTO alerts_sent(alert_key, kind, created_at) "
+    execute("REPLACE INTO alerts_sent(alert_key, kind, created_at) "
             "VALUES('hot:99999','hot_lead','2000-01-01T00:00:00+00:00')")
 
     assert notify.prune(days=90) >= 1

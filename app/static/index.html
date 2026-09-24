@@ -29,10 +29,19 @@
         <a href="#/reports">Reports</a>
 
         <div class="nav-group">Setup</div>
+        <a href="#/myplan">My Plan</a>
         <a href="#/targets">Targets</a>
         <a href="#/templates">Templates</a>
-        <a href="#/settings">Settings</a>
+
+        <div class="nav-group" id="admingroup" style="display:none">Administration</div>
+        <a href="#/users" id="navUsers" style="display:none">Users</a>
+        <a href="#/plans" id="navPlans" style="display:none">Plans</a>
+        <a href="#/settings" id="navSettings" style="display:none">Settings</a>
       </nav>
+      <div class="sidebar-foot" id="sidebarFoot" style="display:none">
+        <div class="me-name" id="meName"></div>
+        <button class="sm ghost" onclick="logout()">Sign out</button>
+      </div>
     </aside>
 
     <main class="main" id="view">

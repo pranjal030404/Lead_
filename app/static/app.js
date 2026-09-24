@@ -71,13 +71,56 @@ function table(headers, rows, emptyMessage = 'Nothing here yet.') {
     <tbody>${rows.join('')}</tbody></table></div>`;
 }
 
+// -------------------------------------------------------- session & roles ---
+const ROLE_LEVEL = { user: 0, admin: 1, superadmin: 2 };
+
+function me() {
+  return window.__me || { user: null, subscription: null };
+}
+
+function roleLevel() {
+  return ROLE_LEVEL[me().user && me().user.role] ?? 0;
+}
+
+function hasMinRole(role) {
+  return roleLevel() >= ROLE_LEVEL[role];
+}
+
+function isAdmin() { return hasMinRole('admin'); }
+
+const progressBar = (used, cap) => {
+  const pct = cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0;
+  const cls = pct >= 90 ? 'danger' : pct >= 70 ? '' : 'ok';
+  return `<div class="bar ${cls}" style="margin:6px 0">
+    <span style="width:${pct}%"></span></div>`;
+};
+
+function configureNav() {
+  const admin = isAdmin();
+  document.getElementById('admingroup').style.display = admin ? '' : 'none';
+  document.getElementById('navUsers').style.display = admin ? '' : 'none';
+  document.getElementById('navPlans').style.display = admin ? '' : 'none';
+  document.getElementById('navSettings').style.display = admin ? '' : 'none';
+  const user = me().user;
+  if (user) {
+    const name = [user.full_name, user.username].filter(Boolean).join(' · ');
+    document.getElementById('meName').textContent =
+      `${name} (${(user.role || 'user').replace(/_/g, ' ')})`;
+    document.getElementById('sidebarFoot').style.display = '';
+  }
+}
+
 // -------------------------------------------------------------- router ---
 const routes = {};
 let currentPath = '';
 
+const ADMIN_ONLY = { '/users': 1, '/plans': 1, '/settings': 1 };
+
 function navigate() {
   const hash = window.location.hash.slice(1) || '/dashboard';
-  const [path, queryString] = hash.split('?');
+  const [rawPath, queryString] = hash.split('?');
+  let path = rawPath;
+  if (!hasMinRole('admin') && ADMIN_ONLY[path]) path = '/dashboard';
   currentPath = path;
   const params = Object.fromEntries(new URLSearchParams(queryString || ''));
 
@@ -195,9 +238,31 @@ routes['/dashboard'] = async () => {
 
 // -------------------------------------------------------------- search ---
 routes['/search'] = async () => {
-  const [providers, history] = await Promise.all([
+  const [providers, history, plan] = await Promise.all([
     api('/api/providers'), api('/api/search/history?limit=15'),
+    me().user && me().user.role !== 'superadmin'
+      ? api('/api/me/subscription') : Promise.resolve({ subscription: null }),
   ]);
+
+  const sub = plan ? plan.subscription : null;
+  let quotaBanner = '';
+  let locked = false;
+  if (me().user && me().user.role === 'superadmin') {
+    quotaBanner = '';
+  } else if (!sub) {
+    quotaBanner = `<div class="banner warn">No active subscription. Searches are paused until
+      you have an active plan. <a href="#/myplan" style="color:inherit">Choose a plan</a>.</div>`;
+    locked = true;
+  } else if (sub.searches_used >= sub.search_limit) {
+    quotaBanner = `<div class="banner err">Plan search limit reached (${sub.searches_used}/${sub.search_limit}).
+      Upgrade or wait for renewal on <a href="#/myplan" style="color:inherit">My Plan</a>.</div>`;
+    locked = true;
+  } else {
+    quotaBanner = `<div class="banner info">Plan ${esc(sub.plan_name)} ·
+      <b>${sub.search_limit - sub.searches_used}</b> of ${sub.search_limit} searches left
+      · up to ${sub.max_results_per_search} results per search ·
+      renews ${date(sub.period_end)}.</div>`;
+  }
 
   const rows = history.map((run) => `<tr onclick="location.hash='#/leads?search=${run.id}'">
       <td class="faint">#${run.id}</td>
@@ -213,6 +278,7 @@ routes['/search'] = async () => {
     <div class="page-head"><div><h1>Search</h1>
       <div class="subtitle">Every search is logged, so you never search the same place twice.</div>
     </div></div>
+    ${quotaBanner}
 
     <div class="card" style="margin-bottom:16px">
       <div class="row">
@@ -251,6 +317,11 @@ routes['/search'] = async () => {
 
   const fields = ['niche', 'city', 'area', 'country'].map((id) => document.getElementById(id));
   const previewBox = document.getElementById('preview');
+
+  if (locked) {
+    document.getElementById('go').disabled = true;
+    document.getElementById('useLocation').disabled = true;
+  }
 
   async function updatePreview() {
     const [niche, city, area, country] = fields.map((f) => f.value.trim());
@@ -1463,11 +1534,337 @@ async function saveTemplate(name, type, stage, market, id) {
   toast('Template saved', 'ok');
 }
 
+// -------------------------------------------------------------- my plan ---
+routes['/myplan'] = async () => {
+  const [plan, plans, payment, history] = await Promise.all([
+    api('/api/me/subscription'),
+    api('/api/plans'),
+    api('/api/settings/payment'),
+    api('/api/me/subscriptions'),
+  ]);
+  const sub = plan.subscription;
+  const user = me().user;
+
+  const planCard = sub
+    ? `<div class="card">
+        <div class="flex between" style="margin-bottom:6px">
+          <h3 style="margin:0">${esc(sub.plan_name)}</h3>
+          <span class="pill active">Active</span></div>
+        <dl class="kv">
+          <dt>Price</dt><dd>${esc(sub.currency)} ${sub.price} / ${sub.period_days}d</dd>
+          <dt>Renews</dt><dd>${date(sub.period_end)}</dd>
+          <dt>Searches used</dt><dd>${sub.searches_used} / ${sub.search_limit}</dd>
+          <dt>Results per search</dt><dd>up to ${sub.max_results_per_search}</dd>
+          <dt>Source</dt><dd>${esc(sub.channel)} · ${esc(sub.payment_status)}</dd>
+        </dl>
+        ${progressBar(sub.searches_used, sub.search_limit)}
+        <div class="faint" style="font-size:12px">${sub.searches_used >= sub.search_limit
+          ? 'Limit reached — manual searches are paused until renewal or an upgrade.'
+          : 'Each completed manual search counts one against your limit.'}</div>
+      </div>`
+    : `<div class="card"><div class="empty">No active subscription.
+        ${user && user.role === 'superadmin'
+          ? 'Superadmins are never gated — you can still search freely.'
+          : 'Manual searches are blocked until you pick a plan.'}
+      </div></div>`;
+
+  const buyVisible = !sub;
+  const buyCard = `<div class="card">
+      <h3>${payment.enabled ? 'Buy a plan' : 'Plans'}</h3>
+      ${plans.rows.length ? plans.rows.map((p) => `
+        <div class="flex between" style="padding:9px 0;border-bottom:1px solid var(--line)">
+          <div>
+            <b>${esc(p.name)}</b>
+            <div class="faint" style="font-size:12px">${esc(p.currency)} ${p.price} / ${p.period_days}d
+              · ${p.search_limit} searches · up to ${p.max_results_per_search} results</div>
+          </div>
+          ${buyVisible && payment.enabled
+            ? `<button class="sm primary" onclick="orderPlan(${p.id}, '${esc(p.name)}')">Buy</button>`
+            : ''}
+        </div>`).join('')
+        : '<div class="empty">No active plans right now.</div>'}
+      ${buyVisible && !payment.enabled
+        ? `<div class="banner warn" style="margin-top:10px;font-size:12px">Self-serve
+            ordering is switched off. Contact an admin to assign a plan.</div>` : ''}
+    </div>`;
+
+  const historyRows = history.map((s) => `<tr>
+      <td>${esc(s.plan_name)}</td>
+      <td>${pill(s.status)}</td>
+      <td class="faint nowrap">${date(s.created_at, true)}</td>
+      <td class="faint">${s.channel} · ${s.payment_status}</td></tr>`);
+
+  view.innerHTML = `
+    <div class="page-head"><div><h1>My Plan</h1>
+      <div class="subtitle">${user ? esc(user.full_name || user.username) : ''}</div></div></div>
+    ${sub ? '' : buyVisible ? `<div class="banner warn">You need an active subscription
+      to search leads. Pick a plan below to place an order — an admin approves it.</div>` : ''}
+    <div class="grid cols-2">
+      ${planCard}
+      ${buyCard}
+    </div>
+    <h3 style="margin-top:22px">Subscription history</h3>
+    ${table(['Plan', 'Status', 'Ordered', 'Source'], historyRows,
+      'No orders yet.')}`;
+};
+
+async function orderPlan(planId, planName) {
+  await post('/api/me/subscriptions', { plan_id: planId });
+  toast(`Order for ${planName} placed — waiting on approval`, 'ok');
+  navigate();
+}
+
+// ---------------------------------------------------------------- users ---
+routes['/users'] = async () => {
+  const data = await api('/api/users?per_page=500');
+  const rows = data.rows.map((user) => `<tr>
+    <td class="mono">${esc(user.username)}</td>
+    <td>${esc(user.full_name || '—')}</td>
+    <td>${esc(user.email || '—')}</td>
+    <td>${pill(user.role)}</td>
+    <td>${user.is_active ? '<span class="pill ok">active</span>' : '<span class="pill faint">off</span>'}</td>
+    <td class="faint nowrap">${date(user.created_at)}</td>
+    <td class="right">
+      <button class="sm" onclick="openAssignDrawer(${user.id}, '${esc(user.username)}')">Assign plan</button>
+      <button class="sm" onclick="openUserDrawer(${user.id})">Edit</button>
+      <button class="sm ghost" onclick="deleteUser(${user.id}, '${esc(user.username)}')">✕</button>
+    </td></tr>`);
+
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Users</h1>
+      <div class="subtitle">${data.total} account(s)</div></div>
+      <button class="primary" onclick="openUserDrawer()">New user</button></div>
+    ${table(['Username', 'Name', 'Email', 'Role', 'Status', 'Joined', ''], rows,
+      'No users yet — create one.')}`;
+};
+
+async function openUserDrawer(userId) {
+  const user = userId ? (await api(`/api/users?q=`)).rows.find((u) => u.id === userId) : null;
+  const myRole = me().user.role;
+  const roleOptions = ['user', 'admin', 'superadmin'].map((r) =>
+    `<option value="${r}" ${user && user.role === r ? 'selected' : ''}
+      ${r !== 'user' && myRole !== 'superadmin' ? 'disabled' : ''}
+      ${r === 'superadmin' && myRole !== 'superadmin' ? 'disabled' : ''}>${r}</option>`).join('');
+
+  drawerRoot.innerHTML = `
+    <div class="drawer-backdrop" onclick="closeDrawer()"></div>
+    <div class="drawer">
+      <div class="drawer-head"><div><h2>${user ? 'Edit user' : 'New user'}</h2>
+        <div class="faint" style="font-size:12px">Only the superadmin can set privileged roles.</div></div>
+        <button class="sm ghost" onclick="closeDrawer()">✕</button></div>
+      <div class="field"><label>Username</label>
+        <input id="uName" value="${user ? esc(user.username) : ''}"></div>
+      <div class="field"><label>Full name</label>
+        <input id="uFull" value="${user ? esc(user.full_name) : ''}"></div>
+      <div class="field"><label>Email</label>
+        <input id="uEmail" value="${user ? esc(user.email) : ''}"></div>
+      <div class="field"><label>Password ${user ? '(leave blank to keep current)' : ''}</label>
+        <input id="uPass" type="password" autocomplete="new-password"></div>
+      <div class="field"><label>Role</label>
+        <select id="uRole">${roleOptions}</select></div>
+      <label class="row" style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
+        <input id="uActive" type="checkbox" ${!user || user.is_active ? 'checked' : ''}>
+        Account active</label>
+      <button class="primary" style="width:100%;justify-content:center"
+        onclick="saveUser(${user ? user.id : 'null'})">${user ? 'Save changes' : 'Create user'}</button>
+    </div>`;
+}
+
+async function saveUser(userId) {
+  const payload = {
+    username: document.getElementById('uName').value.trim(),
+    full_name: document.getElementById('uFull').value.trim(),
+    email: document.getElementById('uEmail').value.trim(),
+    password: document.getElementById('uPass').value,
+    role: document.getElementById('uRole').value,
+    is_active: document.getElementById('uActive').checked,
+  };
+  if (!payload.username) return toast('Username is required', 'err');
+  if (!userId && !payload.password) return toast('A password is required for new users', 'err');
+  await (userId ? patch(`/api/users/${userId}`, payload) : post('/api/users', payload));
+  closeDrawer();
+  toast('User saved', 'ok');
+  navigate();
+}
+
+async function deleteUser(userId, username) {
+  if (!confirm(`Delete ${username}? Their subscriptions stay on record but they lose access.`)) return;
+  await del(`/api/users/${userId}`);
+  toast('User deleted', 'ok');
+  navigate();
+}
+
+async function openAssignDrawer(userId, username) {
+  const plans = await api('/api/plans');
+  drawerRoot.innerHTML = `
+    <div class="drawer-backdrop" onclick="closeDrawer()"></div>
+    <div class="drawer">
+      <div class="drawer-head"><div><h2>Assign plan to ${esc(username)}</h2>
+        <div class="faint" style="font-size:12px">This starts a fresh period and rolls any
+          existing active plan off.</div></div>
+        <button class="sm ghost" onclick="closeDrawer()">✕</button></div>
+      <div class="field"><label>Plan</label>
+        <select id="assignPlan">${plans.rows.map((p) =>
+          `<option value="${p.id}">${esc(p.name)} — ${p.search_limit} searches /
+            ${p.period_days}d</option>`).join('')}</select></div>
+      <div class="field"><label>Period (days, optional)</label>
+        <input id="assignDays" type="number" min="1" placeholder="defaults to plan period"></div>
+      <button class="primary" style="width:100%;justify-content:center"
+        onclick="assignPlan(${userId})">Assign</button>
+    </div>`;
+}
+
+async function assignPlan(userId) {
+  const planId = Number(document.getElementById('assignPlan').value);
+  const days = Number(document.getElementById('assignDays').value) || null;
+  await post(`/api/users/${userId}/subscriptions`, { plan_id: planId, period_days: days });
+  closeDrawer();
+  toast('Plan assigned', 'ok');
+  navigate();
+}
+
+// ----------------------------------------------------------------- plans --
+routes['/plans'] = async () => {
+  const [plans, subs, payment] = await Promise.all([
+    api('/api/plans'), api('/api/subscriptions'), api('/api/settings/payment'),
+  ]);
+
+  const planRows = plans.rows.map((p) => `<tr>
+    <td><b>${esc(p.name)}</b></td>
+    <td class="faint">${esc(p.description || '—')}</td>
+    <td class="num">${esc(p.currency)} ${p.price}</td>
+    <td class="num">${p.period_days}d</td>
+    <td class="num">${p.search_limit}</td>
+    <td class="num">${p.max_results_per_search}</td>
+    <td>${p.is_active ? '<span class="pill ok">active</span>' : '<span class="pill faint">off</span>'}</td>
+    <td class="right">
+      <button class="sm" onclick="openPlanDrawer(${p.id})">Edit</button>
+      <button class="sm ghost" onclick="deletePlan(${p.id}, '${esc(p.name)}')">✕</button>
+    </td></tr>`);
+
+  const subRows = subs.map((s) => `<tr>
+    <td>${esc(s.full_name || s.username)}</td>
+    <td>${esc(s.plan_name)}</td>
+    <td>${pill(s.status)}</td>
+    <td class="faint">${s.channel} · ${s.payment_status}</td>
+    <td class="num">${s.searches_used}<span class="faint">/${s.search_limit}</span></td>
+    <td class="faint nowrap">${date(s.period_start)} → ${date(s.period_end)}</td>
+    <td class="faint nowrap">${date(s.created_at, true)}</td>
+    <td class="right">
+      ${s.status === 'pending' ? `<button class="sm" onclick="approveSub(${s.id})">Approve</button>
+        <button class="sm ghost" onclick="rejectSub(${s.id})">Reject</button>` : ''}
+      ${s.status === 'active' ? `<button class="sm ghost" onclick="cancelSub(${s.id})">Cancel</button>` : ''}
+    </td></tr>`);
+
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Plans</h1>
+      <div class="subtitle">One active plan per user. Assign or approve to activate.</div></div>
+      <button class="primary" onclick="openPlanDrawer()">New plan</button></div>
+
+    <label class="flex" style="justify-content:space-between;align-items:center;
+      background:var(--bg-raise);border:1px solid var(--line);border-radius:var(--radius);
+      padding:12px 16px;margin-bottom:20px;cursor:pointer">
+      <div><b>Self-serve ordering</b>
+        <div class="faint" style="font-size:12px">${payment.enabled
+          ? 'Users can order plans from “My Plan”.'
+          : 'Buy buttons are hidden and ordering is rejected.'}
+        ${payment.pending_orders ? ` · <b>${payment.pending_orders} pending order(s)</b>` : ''}</div></div>
+      <input id="payToggle" type="checkbox" style="width:20px;height:20px"
+        ${payment.enabled ? 'checked' : ''} onchange="togglePayment(this.checked)">
+    </label>
+
+    <h3>Plans</h3>
+    ${table(['Name', 'Description', 'Price', 'Period', { label: 'Searches', num: true },
+      { label: 'Max/result', num: true }, 'Status', ''], planRows, 'No plans yet.')}
+    <h3 style="margin-top:22px">Subscriptions</h3>
+    ${table(['User', 'Plan', 'Status', 'Source', { label: 'Used', num: true }, 'Period', 'When', ''],
+      subRows, 'No subscriptions yet — assign a plan or wait for a user order.')}`;
+};
+
+async function openPlanDrawer(planId) {
+  let plan = null;
+  if (planId) {
+    const plans = await api('/api/plans');
+    plan = plans.rows.find((p) => p.id === planId) || null;
+  }
+  const val = (key, dflt) => plan ? (plan[key] ?? dflt) : dflt;
+  drawerRoot.innerHTML = `
+    <div class="drawer-backdrop" onclick="closeDrawer()"></div>
+    <div class="drawer">
+      <div class="drawer-head"><div><h2>${plan ? 'Edit plan' : 'New plan'}</h2></div>
+        <button class="sm ghost" onclick="closeDrawer()">✕</button></div>
+      <div class="field"><label>Name</label><input id="pName" value="${esc(val('name', ''))}"></div>
+      <div class="field"><label>Description</label><input id="pDesc" value="${esc(val('description', ''))}"></div>
+      <div class="row">
+        <div><label>Price</label><input id="pPrice" type="number" step="0.01" min="0" value="${val('price', 0)}"></div>
+        <div><label>Currency</label><input id="pCur" value="${esc(val('currency', 'INR'))}"></div>
+        <div><label>Period (days)</label><input id="pDays" type="number" min="1" value="${val('period_days', 30)}"></div>
+      </div>
+      <div class="row">
+        <div><label>Search limit</label><input id="pLimit" type="number" min="0" value="${val('search_limit', 50)}"></div>
+        <div><label>Max results / search</label><input id="pMax" type="number" min="1" value="${val('max_results_per_search', 20)}"></div>
+      </div>
+      <label class="flex" style="align-items:center;gap:8px;margin-bottom:14px">
+        <input id="pActive" type="checkbox" ${val('is_active', true) ? 'checked' : ''}> Plan is purchasable</label>
+      <button class="primary" style="width:100%;justify-content:center"
+        onclick="savePlan(${plan ? plan.id : 'null'})">${plan ? 'Save changes' : 'Create plan'}</button>
+    </div>`;
+}
+
+async function savePlan(planId) {
+  const payload = {
+    name: document.getElementById('pName').value.trim(),
+    description: document.getElementById('pDesc').value.trim(),
+    price: Number(document.getElementById('pPrice').value) || 0,
+    currency: document.getElementById('pCur').value.trim() || 'INR',
+    period_days: Number(document.getElementById('pDays').value) || 30,
+    search_limit: Number(document.getElementById('pLimit').value) || 0,
+    max_results_per_search: Number(document.getElementById('pMax').value) || 20,
+    is_active: document.getElementById('pActive').checked,
+  };
+  if (!payload.name) return toast('Plan name is required', 'err');
+  await (planId ? patch(`/api/plans/${planId}`, payload) : post('/api/plans', payload));
+  closeDrawer();
+  toast('Plan saved', 'ok');
+  navigate();
+}
+
+async function deletePlan(planId, name) {
+  if (!confirm(`Delete plan "${name}"? Existing subscriptions keep their current terms.`)) return;
+  await del(`/api/plans/${planId}`);
+  toast('Plan deleted', 'ok');
+  navigate();
+}
+
+async function approveSub(subId) {
+  await post(`/api/subscriptions/${subId}/approve`);
+  toast('Approved — plan is active', 'ok');
+  navigate();
+}
+
+async function rejectSub(subId) {
+  await post(`/api/subscriptions/${subId}/reject`);
+  toast('Order rejected', 'ok');
+  navigate();
+}
+
+async function cancelSub(subId) {
+  await post(`/api/subscriptions/${subId}/cancel`);
+  toast('Subscription cancelled', 'ok');
+  navigate();
+}
+
+async function togglePayment(enabled) {
+  await post('/api/settings/payment', { enabled });
+  toast(enabled ? 'Self-serve ordering is ON' : 'Self-serve ordering is OFF', 'ok');
+  navigate();
+}
+
 // ------------------------------------------------------------ settings ---
 routes['/settings'] = async () => {
-  const [identity, quota, providers, suppression, backups] = await Promise.all([
+  const [identity, quota, providers, suppression, backups, payment] = await Promise.all([
     api('/api/identity'), api('/api/quota'), api('/api/providers'),
-    api('/api/suppression'), api('/api/automation/backups'),
+    api('/api/suppression'), api('/api/automation/backups'), api('/api/settings/payment'),
   ]);
 
   view.innerHTML = `
@@ -1532,6 +1929,21 @@ routes['/settings'] = async () => {
             <td class="faint nowrap">${date(backup.created, true)}</td></tr>`),
           'No backups yet — run one now.')}
       </div>
+
+      <div class="card">
+        <h3>Passwords &amp; self-serve orders</h3>
+        <dl class="kv">
+          <dt>Users and plans</dt><dd><a href="#/users">Manage users</a> ·
+            <a href="#/plans">Manage plans</a></dd>
+          <dt>Self-serve ordering</dt><dd>${payment.enabled ? 'ON' : 'OFF'}</dd>
+          <dt>Pending orders</dt><dd>${payment.pending_orders}</dd>
+          <dt>Active subscriptions</dt><dd>${payment.active_subscriptions}</dd>
+        </dl>
+        <label class="flex" style="align-items:center;gap:8px;margin-top:12px;cursor:pointer">
+          <input id="payToggle" type="checkbox" ${payment.enabled ? 'checked' : ''}
+            onchange="togglePayment(this.checked)"> Allow users to order plans
+            themselves</label>
+      </div>
     </div>`;
 };
 
@@ -1570,9 +1982,13 @@ async function logout() {
 // ---------------------------------------------------------------- boot ---
 (async function boot() {
   try {
-    const providers = await api('/api/providers');
+    const [who, providers] = await Promise.all([
+      api('/api/auth/me'), api('/api/providers'),
+    ]);
+    window.__me = who;
     document.getElementById('providerLabel').textContent = `provider: ${providers.active}`;
-  } catch (_) { /* not fatal */ }
+    configureNav();
+  } catch (_) { /* api() already sent 401 users to /login */ }
   refreshBadges();
   navigate();
   setInterval(refreshBadges, 60000);

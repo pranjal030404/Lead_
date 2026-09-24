@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from .. import geo
@@ -10,6 +10,7 @@ from ..fastjson import rows_response
 from ..providers import available_providers
 from ..quota import usage_summary
 from ..search_service import cancel_search, coverage_status, get_coverage, start_search
+from ..subscription import check_search_entitlement, max_results_for
 
 router = APIRouter(prefix="/api", tags=["search"])
 
@@ -30,9 +31,17 @@ class SearchPayload(BaseModel):
 
 
 @router.post("/search")
-def start(payload: SearchPayload):
+def start(payload: SearchPayload, request: Request):
     if not payload.niche.strip():
         raise HTTPException(400, "niche is required")
+
+    user = getattr(request.state, "user", None)
+    entitlement = check_search_entitlement(user or {})
+    if not entitlement["ok"]:
+        reason = entitlement.get("reason")
+        if reason == "search_limit_reached":
+            raise HTTPException(403, "Plan search limit reached. Upgrade or wait for renewal.")
+        raise HTTPException(403, "An active subscription is required to search leads.")
 
     city, area, country = payload.city.strip(), payload.area.strip(), payload.country.strip()
     radius = payload.radius_m
@@ -60,9 +69,10 @@ def start(payload: SearchPayload):
         )
     search_id = start_search(
         niche=payload.niche.strip(), city=city, area=area, country=country,
-        max_results=payload.max_results, provider_name=payload.provider,
+        max_results=max_results_for(user, payload.max_results), provider_name=payload.provider,
         enrich=payload.enrich, triggered_by="manual",
         lat=payload.lat, lng=payload.lng, radius_m=radius,
+        user_id=user["id"],
     )
     return {"search_id": search_id, "status": "RUNNING", "city": city,
             "area": area, "radius_m": radius}
@@ -196,10 +206,10 @@ def add_target(payload: TargetPayload):
     if payload.auto_search not in ("daily", "weekly", "monthly", "manual"):
         raise HTTPException(400, "auto_search must be daily, weekly, monthly or manual")
     execute(
-        """INSERT OR IGNORE INTO targets
+        """INSERT IGNORE INTO targets
            (niche, city, area, country, max_results, is_active, auto_search,
             next_search_date, created_at)
-           VALUES(?,?,?,?,?,1,?,date('now'),?)""",
+           VALUES(?,?,?,?,?,1,?,CURDATE(),?)""",
         (payload.niche.strip(), payload.city.strip(), payload.area.strip(),
          payload.country.strip(), payload.max_results, payload.auto_search, utcnow()),
     )
@@ -223,14 +233,20 @@ def delete_target(target_id: int):
 
 
 @router.post("/targets/{target_id}/search-now")
-def search_now(target_id: int):
+def search_now(target_id: int, request: Request):
     target = query_one("SELECT * FROM targets WHERE id = ?", (target_id,))
     if not target:
         raise HTTPException(404, "Target not found")
+    user = getattr(request.state, "user", None)
+    entitlement = check_search_entitlement(user or {})
+    if not entitlement["ok"]:
+        if entitlement.get("reason") == "search_limit_reached":
+            raise HTTPException(403, "Plan search limit reached. Upgrade or wait for renewal.")
+        raise HTTPException(403, "An active subscription is required to search leads.")
     search_id = start_search(
         niche=target["niche"], city=target["city"], area=target["area"] or "",
-        country=target["country"] or "", max_results=target["max_results"],
-        triggered_by="target",
+        country=target["country"] or "", max_results=max_results_for(user, target["max_results"]),
+        triggered_by="target", user_id=user["id"],
     )
     execute("UPDATE targets SET last_searched = ? WHERE id = ?", (utcnow(), target_id))
     return {"search_id": search_id}

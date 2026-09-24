@@ -53,26 +53,28 @@ def check_and_reserve(service: str = "google_places", tier: str = "default", n: 
     cap = cap_for(service)
     monthly = service == "hunter"
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("START TRANSACTION")
         try:
             if monthly:
                 row = conn.execute(
-                    "SELECT COALESCE(SUM(calls),0) FROM api_usage WHERE day LIKE ? AND service = ?",
+                    "SELECT COALESCE(SUM(calls),0) AS n FROM api_usage "
+                    "WHERE day LIKE ? AND service = ?",
                     (f"{_month()}-%", service),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT COALESCE(SUM(calls),0) FROM api_usage WHERE day = ? AND service = ?",
+                    "SELECT COALESCE(SUM(calls),0) AS n FROM api_usage "
+                    "WHERE day = ? AND service = ?",
                     (today(), service),
                 ).fetchone()
-            used = int(row[0])
+            used = int(row["n"])
             if used + n > cap:
                 conn.execute("ROLLBACK")
                 raise QuotaExceeded(service, used, cap)
             conn.execute(
                 "INSERT INTO api_usage(day, service, tier, calls) VALUES(?,?,?,?) "
-                "ON CONFLICT(day, service, tier) DO UPDATE SET calls = calls + ?",
-                (today(), service, tier, n, n),
+                "ON DUPLICATE KEY UPDATE calls = calls + VALUES(calls)",
+                (today(), service, tier, n),
             )
             conn.execute("COMMIT")
         except QuotaExceeded:
@@ -121,6 +123,6 @@ def record_free_call(service: str, tier: str = "default") -> None:
     """Log usage for a provider with no billing (OSM), for visibility only."""
     execute(
         "INSERT INTO api_usage(day, service, tier, calls) VALUES(?,?,?,1) "
-        "ON CONFLICT(day, service, tier) DO UPDATE SET calls = calls + 1",
+        "ON DUPLICATE KEY UPDATE calls = calls + 1",
         (today(), service, tier),
     )

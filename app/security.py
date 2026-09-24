@@ -1,8 +1,9 @@
-"""Single-operator auth and endpoint rate limiting (Part 7.5).
+"""Auth, roles and endpoint rate limiting (Part 7.5).
 
 This tool holds phone numbers, emails and your whole pipeline - it must not sit
 on a public URL unauthenticated. Sessions are signed cookies (HMAC), so there's
-no session store to keep in sync.
+no session store to keep in sync; the user row is looked up from MySQL on every
+authed request so a deactivated account is locked out immediately.
 """
 
 from __future__ import annotations
@@ -14,7 +15,10 @@ import threading
 import time
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 
+from fastapi import HTTPException, Request
+
 from .config import settings
+from .db import query_one
 
 SESSION_COOKIE = "leadgen_session"
 
@@ -36,10 +40,40 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(hash_password(password, salt), stored)
 
 
-def check_credentials(username: str, password: str) -> bool:
-    user_ok = hmac.compare_digest(username or "", settings.admin_user)
-    pass_ok = hmac.compare_digest(password or "", settings.admin_password)
-    return user_ok and pass_ok
+def load_user(username: str) -> dict | None:
+    """Full safe user row (password hash stripped) for this login."""
+    user = query_one(
+        "SELECT id, username, full_name, email, role, is_active FROM users WHERE username = ?",
+        (username,),
+    )
+    return user if user else None
+
+
+def authenticate_user(username: str, password: str) -> dict | None:
+    """Check a login against the users table. Returns the safe row, or None."""
+    user = query_one(
+        "SELECT * FROM users WHERE username = ? AND is_active = 1", (username or "",)
+    )
+    if not user or not verify_password(password or "", user["password_hash"]):
+        return None
+    return load_user(username)
+
+
+def require_role(*roles: str):
+    """FastAPI dependency: only users holding one of `roles` pass.
+
+    Reads request.state.user, which the auth middleware fills from the signed
+    cookie + MySQL row on every authed request.
+    """
+    def dependency(request: Request):
+        user = getattr(request.state, "user", None)
+        if not user:
+            raise HTTPException(401, "Not authenticated")
+        if user.get("role") not in roles:
+            raise HTTPException(403, f"Requires role: {' or '.join(roles)}")
+        return user
+
+    return dependency
 
 
 def _sign(payload: str) -> str:

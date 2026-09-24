@@ -216,7 +216,8 @@ def build_digest() -> str:
     if settings.backup_remote:
         synced = query_one(
             "SELECT created_at FROM automation_log WHERE job = 'backup' "
-            "AND message LIKE 'Off-site sync OK%' ORDER BY id DESC LIMIT 1"
+            "AND message LIKE ? ORDER BY id DESC LIMIT 1",
+            ("Off-site sync OK%",),
         )
         lines.append(
             f"  Last off-site sync:     "
@@ -302,16 +303,16 @@ _is_leader = False
 def claim_lease() -> bool:
     """Take or renew the scheduler lease. False means another worker holds it.
 
-    BEGIN IMMEDIATE takes the write lock before reading, so two workers starting
+    The transaction takes the write lock before reading, so two workers starting
     at the same instant can't both conclude the lease is free.
     """
     now = datetime.now(timezone.utc)
     expires = (now + timedelta(seconds=LEASE_SECONDS)).isoformat(timespec="seconds")
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("START TRANSACTION")
         try:
             row = conn.execute(
-                "SELECT owner, expires_at FROM scheduler_lease WHERE id = 1"
+                "SELECT owner, expires_at FROM scheduler_lease WHERE id = 1 FOR UPDATE"
             ).fetchone()
             mine_or_stale = row is None or row["owner"] == OWNER or (
                 (row["expires_at"] or "") < now.isoformat(timespec="seconds")
@@ -321,8 +322,8 @@ def claim_lease() -> bool:
                 return False
             conn.execute(
                 "INSERT INTO scheduler_lease(id, owner, expires_at) VALUES(1,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, "
-                "expires_at = excluded.expires_at",
+                "ON DUPLICATE KEY UPDATE owner = VALUES(owner), "
+                "expires_at = VALUES(expires_at)",
                 (OWNER, expires),
             )
             conn.execute("COMMIT")

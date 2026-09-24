@@ -156,7 +156,7 @@ kickoff checklist today.
 def seed_templates() -> None:
     for tpl in TEMPLATES:
         execute(
-            """INSERT OR IGNORE INTO templates
+            """INSERT IGNORE INTO templates
                (name, type, stage, subject, body, language, target_market, created_at)
                VALUES(?,?,?,?,?,?,?,?)""",
             (

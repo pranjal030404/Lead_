@@ -1,11 +1,33 @@
 # Arthvex LeadGen.
 #
-#   docker compose up -d              app only, on 127.0.0.1:8000
-#   docker compose --profile tls up -d   app + Caddy with automatic HTTPS
+#   docker compose up -d              app + MySQL, app on 127.0.0.1:8000
+#   docker compose --profile tls up -d   app + MySQL + Caddy with automatic HTTPS
 #
 # Set DOMAIN and TLS_EMAIL in .env before using the tls profile.
+# The app needs MYSQL_HOST=mysql inside the compose network - that override
+# lives here; your .env should hold MYSQL_USER/PASSWORD/DATABASE instead.
 
 services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-leadgen}
+      MYSQL_USER: ${MYSQL_USER:-leadgen}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+    volumes:
+      - leadgen-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
   app:
     build: .
     image: arthvex-leadgen:latest
@@ -14,11 +36,12 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8000"
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+    depends_on:
+      mysql:
+        condition: service_healthy
     volumes:
-      # Named volumes, not bind mounts: SQLite over a bind mount into a VM
-      # (Docker Desktop, some VPS setups) can break its file locking, and
-      # broken locking on a database is a data-loss bug, not a slow one.
-      - leadgen-data:/app/data
       - leadgen-backups:/app/backups
     ports:
       # Loopback only. Anything public should terminate TLS at the proxy -
@@ -56,7 +79,7 @@ services:
       options: { max-size: "10m", max-file: "3" }
 
 volumes:
-  leadgen-data:
+  leadgen-mysql:
   leadgen-backups:
   caddy-data:
   caddy-config:

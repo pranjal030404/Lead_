@@ -29,21 +29,21 @@ def status():
         "provider": settings.provider,
         "today": {
             "searches": scalar(
-                "SELECT COUNT(*) FROM searches WHERE date(started_at) = date('now')"
+                "SELECT COUNT(*) FROM searches WHERE LEFT(started_at, 10) = CURDATE()"
             ),
             "leads_found": scalar(
-                "SELECT COUNT(*) FROM leads WHERE date(created_at) = date('now')"
+                "SELECT COUNT(*) FROM leads WHERE LEFT(created_at, 10) = CURDATE()"
             ),
             "enriched": scalar(
                 "SELECT COUNT(*) FROM leads WHERE enrichment_status = 'complete' "
-                "AND date(updated_at) = date('now')"
+                "AND LEFT(updated_at, 10) = CURDATE()"
             ),
             "awaiting_approval": scalar(
                 "SELECT COUNT(*) FROM approval_queue WHERE status = 'PENDING'"
             ),
             "sent": scalar(
                 "SELECT COUNT(*) FROM approval_queue WHERE status = 'SENT' "
-                "AND date(sent_at) = date('now')"
+                "AND LEFT(sent_at, 10) = CURDATE()"
             ),
         },
         "circuit_breakers": breaker_state(),

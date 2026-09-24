@@ -130,11 +130,13 @@ def run_search(
     lat: float | None = None,
     lng: float | None = None,
     radius_m: int | None = None,
+    user_id: int | None = None,
 ) -> dict:
     """Run one search end to end. Blocking - call via start_search for the API.
 
     Passing lat/lng centres the search on a point instead of a geocoded city
-    name, which is what the "near me" button does.
+    name, which is what the "near me" button does. `user_id` marks who owns the
+    search so a completed run can be charged against their subscription.
     """
     from .dedup import find_duplicate, merge_into_existing
 
@@ -144,10 +146,10 @@ def run_search(
     if search_id is None:
         search_id = execute(
             """INSERT INTO searches
-               (niche, city, area, country, provider, max_results, status, progress,
+               (user_id, niche, city, area, country, provider, max_results, status, progress,
                 triggered_by, started_at)
-               VALUES(?,?,?,?,?,?,'RUNNING','Starting...',?,?)""",
-            (niche, city, area or "", country or "", provider.name, max_results,
+               VALUES(?,?,?,?,?,?,?,'RUNNING','Starting...',?,?)""",
+            (user_id, niche, city, area or "", country or "", provider.name, max_results,
              triggered_by, utcnow()),
         )
 
@@ -178,7 +180,7 @@ def run_search(
             candidate["country"] = candidate.get("country") or country or None
 
             with get_conn() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("START TRANSACTION")
                 try:
                     existing, reason = find_duplicate(conn, candidate)
                     if existing:
@@ -284,6 +286,9 @@ def run_search(
          stats["hot_count"], stats["warm_count"], stats["cold_count"], stats["api_calls"],
          status, "Done" if status == "COMPLETED" else status, error, utcnow(), search_id),
     )
+    if status == "COMPLETED" and user_id:
+        from .subscription import count_search
+        count_search(user_id)
     _update_coverage(niche, city, area, country, stats["results_found"], stats["new_leads"])
 
     if status == "COMPLETED":
@@ -301,10 +306,11 @@ def start_search(**kwargs) -> int:
     """Kick a search off in a worker thread; returns the search id immediately."""
     search_id = execute(
         """INSERT INTO searches
-           (niche, city, area, country, provider, max_results, status, progress,
+           (user_id, niche, city, area, country, provider, max_results, status, progress,
             triggered_by, started_at)
-           VALUES(?,?,?,?,?,?,'RUNNING','Queued...',?,?)""",
-        (kwargs.get("niche"), kwargs.get("city"), kwargs.get("area") or "",
+           VALUES(?,?,?,?,?,?,?,'RUNNING','Queued...',?,?)""",
+        (kwargs.get("user_id"),
+         kwargs.get("niche"), kwargs.get("city"), kwargs.get("area") or "",
          kwargs.get("country") or "", kwargs.get("provider_name") or settings.provider,
          kwargs.get("max_results", 20), kwargs.get("triggered_by", "manual"), utcnow()),
     )

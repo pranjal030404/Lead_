@@ -43,7 +43,7 @@ def is_suppressed(value: str | None, kind: str = "email") -> bool:
 
 def suppress(value: str, kind: str = "email", reason: str = "manual") -> None:
     execute(
-        "INSERT OR IGNORE INTO suppression_list(value, kind, reason, created_at) "
+        "INSERT IGNORE INTO suppression_list(value, kind, reason, created_at) "
         "VALUES(?,?,?,?)",
         (value.strip(), kind, reason, utcnow()),
     )
@@ -175,7 +175,8 @@ def generate_followups() -> dict:
 
         if days >= GIVE_UP_DAYS:
             execute(
-                "UPDATE leads SET status = 'LOST', notes = COALESCE(notes,'') || ?, updated_at = ? "
+                "UPDATE leads SET status = 'LOST', "
+                "notes = CONCAT(COALESCE(notes,''), ?), updated_at = ? "
                 "WHERE id = ?",
                 (f"\n[auto] No response after {GIVE_UP_DAYS} days.", utcnow(), lead["id"]),
             )
