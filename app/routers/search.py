@@ -9,7 +9,8 @@ from ..db import execute, query, query_one, utcnow
 from ..fastjson import rows_response
 from ..providers import available_providers
 from ..quota import usage_summary
-from ..search_service import cancel_search, coverage_status, get_coverage, start_search
+from ..search_service import (cancel_search, coverage_status, find_cached_search,
+                              get_coverage, start_search)
 from ..subscription import check_search_entitlement, max_results_for
 
 router = APIRouter(prefix="/api", tags=["search"])
@@ -60,8 +61,16 @@ def start(payload: SearchPayload, request: Request):
             country = country or place["country"] or ""
     elif not city:
         raise HTTPException(400, "city is required unless you search by location")
+    # A cache hit reuses previous leads without touching the provider, so the
+    # daily API quota must not block it - hitting the wall is exactly when the
+    # cache earns its keep. Run the cap logic here but leave the real check to
+    # run_search.
+    provider_name = payload.provider or settings.provider
+    cached = find_cached_search(payload.niche.strip(), city, area, country, provider_name,
+                                lat=payload.lat, lng=payload.lng, radius_m=radius)
     usage = usage_summary()
-    if usage["google"]["remaining"] <= 0 and (payload.provider or settings.provider) == "google":
+    if not cached and usage["google"]["remaining"] <= 0 and \
+            provider_name == "google":
         raise HTTPException(
             429,
             f"Daily API cap reached ({usage['google']['used_today']}/{usage['google']['cap']}). "
@@ -112,7 +121,10 @@ def geo_map(limit: int = Query(1000, ge=1, le=5000), priority: str | None = None
 
 @router.get("/search/history")
 def history(limit: int = Query(30, le=200)):
-    return query("SELECT * FROM searches ORDER BY id DESC LIMIT ?", (limit,))
+    rows = query("SELECT * FROM searches ORDER BY id DESC LIMIT ?", (limit,))
+    for row in rows:
+        row["from_cache"] = bool(row.get("cached_from"))
+    return rows
 
 
 @router.get("/search/preview")
@@ -137,12 +149,17 @@ def status(search_id: int):
     row = query_one("SELECT * FROM searches WHERE id = ?", (search_id,))
     if not row:
         raise HTTPException(404, "Search not found")
+    # A cache hit reused a previous search's leads; list those, not (there would
+    # be none) this row's own.
+    effective_id = row.get("cached_from") or row["id"]
     if row["status"] == "COMPLETED":
         row["leads"] = query(
             "SELECT id, business_name, phone, website_url, lead_score, lead_priority, city "
             "FROM leads WHERE search_id = ? ORDER BY lead_score DESC",
-            (search_id,),
+            (effective_id,),
         )
+    row["from_cache"] = bool(row.get("cached_from"))
+    row["cache_source_search_id"] = row.get("cached_from")
     return row
 
 

@@ -7,6 +7,7 @@ Part 1.2 before anything is inserted.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -93,6 +94,147 @@ def _update_coverage(niche, city, area, country, found, new_leads) -> None:
         )
 
 
+# ---------------------------------------------------------- search cache --
+
+def search_fingerprint(
+    niche: str,
+    city: str,
+    area: str = "",
+    country: str = "",
+    provider_name: str | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    radius_m: int | None = None,
+) -> str:
+    """Hash of everything that defines a result set.
+
+    max_results is deliberately NOT here: it is a page size, not content. Two
+    users on different plans have different caps, and shares between them are
+    the whole point of the cache. A different max_results still works - the
+    cached snapshot simply serves the top-N the requester asked for.
+    """
+    parts = (
+        (niche or "").strip().lower(),
+        (city or "").strip().lower(),
+        (area or "").strip().lower(),
+        (country or "").strip().lower(),
+        (provider_name or settings.provider or "").strip().lower(),
+        round(float(lat), 6) if lat is not None else None,
+        round(float(lng), 6) if lng is not None else None,
+        int(radius_m) if radius_m else settings.nearby_radius_m,
+    )
+    return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
+
+
+def find_cached_search(
+    niche: str,
+    city: str,
+    area: str = "",
+    country: str = "",
+    provider_name: str | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    radius_m: int | None = None,
+) -> dict | None:
+    """The cache entry (with its producing search) for an identical query, or
+    None. Refused when the snapshot is older than the TTL or the search that
+    produced it did not complete - either way the caller must scrape fresh."""
+    if not settings.search_cache_enabled:
+        return None
+    fp = search_fingerprint(niche, city, area, country, provider_name, lat, lng, radius_m)
+    row = query_one(
+        """SELECT sc.*, s.status AS search_status
+           FROM search_cache sc JOIN searches s ON s.id = sc.search_id
+           WHERE sc.fingerprint = ?""",
+        (fp,),
+    )
+    if not row or row["search_status"] != "COMPLETED":
+        return None
+    try:
+        created = datetime.fromisoformat(row["created_at"])
+    except (ValueError, TypeError):
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - created >= timedelta(days=settings.search_cache_ttl_days):
+        return None
+    return row
+
+
+def record_cache(
+    search_id: int,
+    niche: str,
+    city: str,
+    area: str,
+    country: str,
+    provider_name: str,
+    result_count: int,
+    lat: float | None = None,
+    lng: float | None = None,
+    radius_m: int | None = None,
+) -> None:
+    """Point the fingerprint at this completed search. `created_at` is reset on
+    every refresh, so the TTL measures from the last scrape - a fresh run (manual
+    or the automated sweep) starts a new 7-day serving window."""
+    fp = search_fingerprint(niche, city, area, country, provider_name, lat, lng, radius_m)
+    now = utcnow()
+    execute(
+        """INSERT INTO search_cache
+           (fingerprint, niche, city, area, country, provider, lat, lng, radius_m,
+            search_id, result_count, created_at, updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON DUPLICATE KEY UPDATE search_id = VALUES(search_id),
+             result_count = VALUES(result_count),
+             created_at = VALUES(created_at), updated_at = VALUES(updated_at)""",
+        (fp, niche, city, area or "", country or "", provider_name, lat, lng, radius_m,
+         search_id, result_count, now, now),
+    )
+
+
+def _serve_from_cache(
+    search_id: int,
+    cached: dict,
+    user_id: int | None,
+    niche: str,
+    city: str,
+    area: str,
+    country: str,
+) -> dict:
+    """Reuse a previous search's leads. Zero provider calls: the whole point of
+    the cache. Still counts against the user's plan (it is one of their searches)
+    and is logged, but enrichment/alerts are not re-run."""
+    source_id = cached["search_id"]
+    source = query_one(
+        "SELECT results_found, hot_count, warm_count, cold_count FROM searches WHERE id = ?",
+        (source_id,),
+    ) or {}
+    results_found = cached.get("result_count") or source.get("results_found") or 0
+    now = utcnow()
+    place = area or city + (", " + country if country else "")
+    execute(
+        """UPDATE searches SET cached_from = ?, status = 'COMPLETED',
+           results_found = ?, new_leads = 0, duplicates_skipped = 0,
+           api_calls = 0, hot_count = ?, warm_count = ?, cold_count = ?,
+           progress = ?, error_message = NULL, completed_at = ?
+           WHERE id = ?""",
+        (source_id, results_found, source.get("hot_count", 0),
+         source.get("warm_count", 0), source.get("cold_count", 0),
+         f"Served from cached search #{source_id} - no API calls made.", now, search_id),
+    )
+    log_automation(
+        "search",
+        f"Served '{niche}' in {place} from cached search #{source_id} - 0 API calls",
+    )
+    if user_id:
+        from .subscription import count_search
+        count_search(user_id)
+    return {"search_id": search_id, "status": "COMPLETED", "error": None,
+            "quota_hit": False, "from_cache": True, "cached_from": source_id,
+            "results_found": results_found, "new_leads": 0, "duplicates_skipped": 0,
+            "api_calls": 0, "hot_count": source.get("hot_count", 0),
+            "warm_count": source.get("warm_count", 0), "cold_count": source.get("cold_count", 0)}
+
+
 # ------------------------------------------------------------------ search --
 
 def _insert_lead(conn, candidate: dict, niche: str, search_id: int) -> int:
@@ -154,6 +296,17 @@ def run_search(
         )
 
     _running[search_id] = True
+
+    # Serve an identical manual query straight from a previous search's leads.
+    # Automated/target runs bypass this and always scrape fresh, so the daily
+    # sweep refreshes the snapshot and the cache never goes stale forever.
+    if settings.search_cache_enabled and triggered_by == "manual":
+        cached = find_cached_search(niche, city, area, country, provider.name, lat, lng, radius_m)
+        if cached:
+            result = _serve_from_cache(search_id, cached, user_id, niche, city, area, country)
+            _running.pop(search_id, None)
+            return result
+
     stats = {"results_found": 0, "new_leads": 0, "duplicates_skipped": 0,
              "hot_count": 0, "warm_count": 0, "cold_count": 0, "api_calls": 0}
     new_ids: list[int] = []
@@ -289,6 +442,9 @@ def run_search(
     if status == "COMPLETED" and user_id:
         from .subscription import count_search
         count_search(user_id)
+    if status == "COMPLETED":
+        record_cache(search_id, niche, city, area, country, provider.name,
+                     stats["results_found"], lat=lat, lng=lng, radius_m=radius_m)
     _update_coverage(niche, city, area, country, stats["results_found"], stats["new_leads"])
 
     if status == "COMPLETED":

@@ -97,6 +97,14 @@ class Settings:
     quota_warn_pct = _int("QUOTA_WARN_PCT", 80)
     enterprise_fetch_min_score = _int("ENTERPRISE_FETCH_MIN_SCORE", 5)
 
+    # search-result cache: an identical manual query re-uses the leads a previous
+    # search already pulled, instead of calling the provider again. Gated on the
+    # search content (niche/city/area/country/provider/point) so "changes
+    # anything" = cache miss. Automated/target runs always scrape fresh, so the
+    # cache is refreshed by the daily sweep instead of going stale forever.
+    search_cache_enabled = _bool("SEARCH_CACHE_ENABLED", True)
+    search_cache_ttl_days = _int("SEARCH_CACHE_TTL_DAYS", 7)
+
     # enrichment
     http_timeout = _int("HTTP_TIMEOUT", 8)
     website_cache_days = _int("WEBSITE_CACHE_DAYS", 30)

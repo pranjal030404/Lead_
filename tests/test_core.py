@@ -18,7 +18,8 @@ from app.db import init_db, query, query_one, scalar, utcnow  # noqa: E402
 from app.dedup import find_duplicate, normalise_name, similarity  # noqa: E402
 from app.outreach import is_suppressed, render_template, suppress  # noqa: E402
 from app.scoring import score_lead  # noqa: E402
-from app.search_service import get_coverage, run_search  # noqa: E402
+from app.search_service import (find_cached_search, get_coverage, run_search,
+                                search_fingerprint)  # noqa: E402
 from app.validation import data_quality_score, normalise_phone, validate_email  # noqa: E402
 
 init_db()
@@ -147,10 +148,13 @@ def test_search_creates_leads_and_coverage():
 
 
 def test_rerunning_the_same_search_creates_no_duplicates():
-    """Part 7.7 - search the same tiny area twice, confirm zero new leads."""
+    """Part 7.7 - search the same tiny area twice, confirm zero new leads.
+    Uses an automated (non-manual) trigger so it always scrapes fresh - a second
+    manual run of the same query would be served from the search cache instead
+    of exercising the dedup path (see the cache tests below)."""
     before = scalar("SELECT COUNT(*) FROM leads WHERE city = 'Testville'")
     result = run_search(niche="restaurants", city="Testville", max_results=10,
-                        provider_name="mock", enrich=False)
+                        provider_name="mock", enrich=False, triggered_by="target")
     after = scalar("SELECT COUNT(*) FROM leads WHERE city = 'Testville'")
 
     assert result["new_leads"] == 0
@@ -161,7 +165,7 @@ def test_rerunning_the_same_search_creates_no_duplicates():
 def test_coverage_goes_exhausted_after_three_barren_runs():
     for _ in range(3):
         run_search(niche="restaurants", city="Testville", max_results=10,
-                   provider_name="mock", enrich=False)
+                   provider_name="mock", enrich=False, triggered_by="target")
     assert get_coverage("restaurants", "Testville")["status"] == "EXHAUSTED"
 
 
@@ -173,6 +177,78 @@ def test_permanently_closed_businesses_are_not_stored():
         "AND business_status = 'CLOSED_PERMANENTLY'"
     )
     assert closed == []
+
+
+# --------------------------------------------------------- shared search cache --
+
+def test_identical_manual_search_is_served_from_cache_with_zero_api_calls():
+    first = run_search(niche="restaurants", city="Cachelia", max_results=10,
+                       provider_name="mock", enrich=False)
+    assert first["status"] == "COMPLETED" and first["new_leads"] > 0
+
+    second = run_search(niche="restaurants", city="Cachelia", max_results=10,
+                        provider_name="mock", enrich=False)
+    assert second["from_cache"] is True
+    assert second["api_calls"] == 0
+    assert second["cached_from"] == first["search_id"]
+
+    cached = find_cached_search("restaurants", "Cachelia", provider_name="mock")
+    assert cached and cached["search_id"] == first["search_id"]
+
+    cached_row = query_one("SELECT cached_from FROM searches WHERE id = ?", (second["search_id"],))
+    assert cached_row["cached_from"] == first["search_id"]
+    original_leads = scalar("SELECT COUNT(*) FROM leads WHERE search_id = ?",
+                            (first["search_id"],))
+    assert original_leads > 0
+
+
+def test_changed_query_is_a_cache_miss():
+    run_search(niche="restaurants", city="Cachelia", max_results=10,
+               provider_name="mock", enrich=False)
+    changed = run_search(niche="restaurants", city="Cachelia", area="Model Town",
+                         max_results=10, provider_name="mock", enrich=False)
+    assert changed.get("from_cache", False) is False
+
+
+def test_automated_searches_bypass_the_cache():
+    run_search(niche="restaurants", city="Cachelia", max_results=10,
+               provider_name="mock", enrich=False)
+    sweep = run_search(niche="restaurants", city="Cachelia", max_results=10,
+                       provider_name="mock", enrich=False, triggered_by="automation")
+    assert sweep.get("from_cache", False) is False
+    assert sweep["duplicates_skipped"] > 0, "a fresh scrape must re-check the DB"
+
+
+def test_fingerprint_is_case_and_space_insensitive():
+    base = search_fingerprint("Restaurants ", "Delhi", " Sector 15 ", "INDIA", "google")
+    assert base == search_fingerprint("restaurants", "delhi", "Sector 15", "india", "google")
+    assert base != search_fingerprint("restaurants", "Mumbai", "Sector 15", "india", "google")
+    assert base != search_fingerprint("cafes", "Delhi", "Sector 15", "india", "google")
+
+
+def test_cache_expires_after_ttl_then_scrapes_fresh():
+    from app.db import execute
+
+    first = run_search(niche="hotels", city="Ancientville", max_results=10,
+                       provider_name="mock", enrich=False)
+    assert first["status"] == "COMPLETED"
+
+    execute(
+        "UPDATE search_cache SET created_at = '2000-01-01T00:00:00+00:00' "
+        "WHERE fingerprint = ?",
+        (search_fingerprint("hotels", "Ancientville", provider_name="mock"),),
+    )
+    assert find_cached_search("hotels", "Ancientville", provider_name="mock") is None, \
+        "an expired snapshot must not be served"
+
+    refreshed = run_search(niche="hotels", city="Ancientville", max_results=10,
+                           provider_name="mock", enrich=False)
+    assert refreshed.get("from_cache", False) is False, "expired cache must scrape fresh"
+    assert refreshed["search_id"] != first["search_id"]
+
+    recovered = find_cached_search("hotels", "Ancientville", provider_name="mock")
+    assert recovered and recovered["search_id"] == refreshed["search_id"], \
+        "the fresh scrape must reset the TTL so the cache serves again"
 
 
 # ------------------------------------------------------------- suppression --

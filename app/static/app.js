@@ -271,7 +271,7 @@ routes['/search'] = async () => {
       <td class="num">${run.results_found}</td>
       <td class="num" style="color:var(--ok)">${run.new_leads}</td>
       <td class="num faint">${run.duplicates_skipped}</td>
-      <td>${pill(run.status)}</td>
+      <td>${pill(run.status)}${run.from_cache ? '<span style="color:var(--info);font-size:11px"> cached</span>' : ''}</td>
       <td class="faint nowrap">${date(run.started_at, true)}</td></tr>`);
 
   view.innerHTML = `
@@ -431,12 +431,16 @@ async function pollSearch(searchId) {
       <td class="faint">${lead.website_url ? esc(lead.website_url).slice(0, 40) : 'no website'}</td>
     </tr>`);
 
-  box.innerHTML = `<div class="banner info">Search #${searchId} done —
-      <b>${run.new_leads} new leads</b>, ${run.duplicates_skipped} duplicates skipped,
-      ${run.results_found} results seen.
-      ${run.hot_count ? `<b style="color:var(--hot)">${run.hot_count} HOT</b>.` : ''}</div>
-    ${table(['Score', 'Business', 'Priority', 'Phone', 'Website'], leads,
-      'No new leads - everything found was already in your database.')}`;
+  box.innerHTML = (run.from_cache
+    ? `<div class="banner info">Search #${searchId} served from cache
+        ${run.cache_source_search_id ? `(search #${run.cache_source_search_id})` : ''} —
+        <b>${(run.leads || []).length} results</b> reused, <b>0 API calls</b> made.</div>`
+    : `<div class="banner info">Search #${searchId} done —
+        <b>${run.new_leads} new leads</b>, ${run.duplicates_skipped} duplicates skipped,
+        ${run.results_found} results seen.
+        ${run.hot_count ? `<b style="color:var(--hot)">${run.hot_count} HOT</b>.` : ''}</div>`)
+    + table(['Score', 'Business', 'Priority', 'Phone', 'Website'], leads,
+      run.from_cache ? 'No cached results.' : 'No new leads - everything found was already in your database.');
   refreshBadges();
 }
 

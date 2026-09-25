@@ -43,7 +43,7 @@ os.environ.setdefault("MYSQL_DATABASE", "leadgen_test")
 import pytest  # noqa: E402
 
 TABLES = [
-    "leads", "interactions", "searches", "search_coverage", "targets",
+    "leads", "interactions", "searches", "search_coverage", "search_cache", "targets",
     "templates", "pipeline_stages", "suppression_list", "approval_queue",
     "api_usage", "failed_jobs", "automation_log", "app_settings",
     "scheduler_lease", "alerts_sent", "users", "plans", "user_subscriptions",

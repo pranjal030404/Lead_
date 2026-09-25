@@ -175,6 +175,33 @@ CREATE_TABLES = [
         KEY idx_searches_started (started_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     """,
+    # Snapshot of the leads a completed search produced. Serving an identical
+    # manual query from here means zero provider (API) calls for the second,
+    # third... user. fingerprint is a hash of the exact query that defines the
+    # result set; a cache entry whose params differ has a different key and is
+    # never reused. A refresh replaces search_id/result_count and resets
+    # created_at, which is what the TTL is measured from.
+    """
+    CREATE TABLE IF NOT EXISTS search_cache (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        fingerprint     VARCHAR(64) NOT NULL,
+        niche           VARCHAR(128),
+        city            VARCHAR(128),
+        area            VARCHAR(128),
+        country         VARCHAR(128),
+        provider        VARCHAR(32),
+        max_results     INT,
+        lat             DOUBLE,
+        lng             DOUBLE,
+        radius_m        INT,
+        search_id       INT,
+        result_count    INT DEFAULT 0,
+        created_at      VARCHAR(40),
+        updated_at      VARCHAR(40),
+        UNIQUE KEY uq_cache_fingerprint (fingerprint),
+        KEY idx_cache_search (search_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    """,
     """
     CREATE TABLE IF NOT EXISTS search_coverage (
         id                  INT AUTO_INCREMENT PRIMARY KEY,
@@ -534,6 +561,21 @@ def _ensure_searches_user_id(conn: Conn) -> None:
             cur.execute("ALTER TABLE searches ADD KEY idx_search_user (user_id)")
 
 
+def _ensure_searches_cached_from(conn: Conn) -> None:
+    """Apply schema drift: searches.cached_from (added with the search cache).
+    A search served from the cache stores the id of the search whose leads it
+    reused; the status endpoint then lists leads for that original run. NULL for
+    searches that called the provider normally. Idempotent."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT COUNT(*) AS n FROM information_schema.columns
+               WHERE table_schema = DATABASE() AND table_name = 'searches'
+                 AND column_name = 'cached_from'"""
+        )
+        if cur.fetchone()["n"] == 0:
+            cur.execute("ALTER TABLE searches ADD COLUMN cached_from INT NULL AFTER user_id")
+
+
 def init_db() -> None:
     """Create tables if missing and seed defaults. Safe to call every boot."""
     with get_conn() as conn:
@@ -541,6 +583,7 @@ def init_db() -> None:
             for statement in CREATE_TABLES:
                 cur.execute(statement)
             _ensure_searches_user_id(conn)
+            _ensure_searches_cached_from(conn)
 
     for name, pos, color, days in PIPELINE_STAGES:
         execute(

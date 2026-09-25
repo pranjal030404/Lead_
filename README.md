@@ -123,6 +123,16 @@ Start on `osm` to prove the pipeline works on your target city, then switch to
 coverage map tracks which combos are FRESH / STALE / EXHAUSTED / NEVER, so you
 always know where to look next.
 
+**Shared search cache** — the exact query is hashed (niche + city + area +
+country + provider + point/radius) and the results are snapshotted to the DB.
+An identical manual search from *any user or any project pointed at the same
+database* is served straight from that snapshot: **zero provider/API calls**.
+Change any of those parameters and it's a cache miss — a fresh search runs. The
+snapshot refreshes automatically because scheduled/target searches always scrape
+fresh, and a cached query older than `SEARCH_CACHE_TTL_DAYS` (default 7) is
+re-scraped on the next manual run. Cache hits still count against the searching
+user's subscription, and the search history marks them `cached`.
+
 **Search near me** — hit *Search near me* and the browser's coordinates drive the
 search directly, with a radius you pick (1–25km). You don't type a city: the
 server reverse-geocodes the point and fills in the city and area itself, so the
