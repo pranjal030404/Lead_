@@ -14,7 +14,7 @@ from .db import init_db, query_one
 from .routers import auth, automation, leads, outreach, plans, search, stats, users
 from .security import (SESSION_COOKIE, client_ip, load_user, rate_limit, verify_token)
 
-PUBLIC_PATHS = {"/login", "/health", "/api/auth/login", "/favicon.ico"}
+PUBLIC_PATHS = {"/landing", "/login", "/health", "/api/auth/login", "/favicon.ico"}
 PUBLIC_PREFIXES = ("/static/",)
 
 
@@ -89,7 +89,9 @@ async def auth_and_rate_limit(request: Request, call_next):
     if not user:
         if path.startswith("/api/"):
             return JSONResponse({"detail": "Not authenticated"}, status_code=401)
-        return RedirectResponse("/login", status_code=302)
+        # The marketing landing page is the public front door; every other
+        # page funnels to the sign-in form.
+        return RedirectResponse("/landing" if path == "/" else "/login", status_code=302)
 
     request.state.user = user
     return await call_next(request)
@@ -120,6 +122,11 @@ def health():
 @app.get("/login")
 def login_page():
     return FileResponse(settings.static_dir / "login.html")
+
+
+@app.get("/landing")
+def landing_page():
+    return FileResponse(settings.static_dir / "landing.html")
 
 
 @app.get("/")

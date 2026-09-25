@@ -31,7 +31,8 @@ provide the database (next section) and run:
 .venv/bin/python run.py
 ```
 
-Open http://127.0.0.1:8000 and sign in with `ADMIN_USER`/`ADMIN_PASSWORD`
+Open http://127.0.0.1:8000 - you'll land on the marketing page, then sign in via
+**Sign in** (or `/login` directly) with `ADMIN_USER`/`ADMIN_PASSWORD`
 (seeded as the `superadmin` on first boot). Generate a secret key with:
 
 ```bash

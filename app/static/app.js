@@ -106,6 +106,10 @@ function configureNav() {
     const name = [user.full_name, user.username].filter(Boolean).join(' · ');
     document.getElementById('meName').textContent =
       `${name} (${(user.role || 'user').replace(/_/g, ' ')})`;
+    const avatar = document.getElementById('meAvatar');
+    if (avatar) {
+      avatar.textContent = (user.full_name || user.username || '?').trim().charAt(0).toUpperCase();
+    }
     document.getElementById('sidebarFoot').style.display = '';
   }
 }
@@ -129,7 +133,16 @@ function navigate() {
   });
 
   const render = routes[path] || routes['/dashboard'];
-  view.innerHTML = '<div class="loading">Loading...</div>';
+  view.innerHTML = `
+    <div class="page-head"><div>
+      <div class="sk sk-title"></div><div class="sk sk-sub"></div>
+    </div></div>
+    <div class="grid cols-5">${Array(5).fill(`
+      <div class="card sk-card"><div class="sk sk-line w40"></div><div class="sk sk-big"></div></div>`).join('')}
+    </div>
+    <div class="grid cols-2" style="margin-top:16px">${Array(2).fill(`
+      <div class="card sk-card"><div class="sk sk-line w60"></div><div class="sk sk-block"></div></div>`).join('')}
+    </div>`;
   Promise.resolve(render(params)).catch((error) => {
     view.innerHTML = `<div class="banner err">${esc(error.message)}</div>`;
   });
