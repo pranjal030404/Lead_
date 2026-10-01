@@ -576,6 +576,20 @@ def _ensure_searches_cached_from(conn: Conn) -> None:
             cur.execute("ALTER TABLE searches ADD COLUMN cached_from INT NULL AFTER user_id")
 
 
+def _ensure_app_settings_updated_at(conn: Conn) -> None:
+    """Apply schema drift: app_settings.updated_at (added with white-label
+    branding, which timestamps brand edits). Databases created before that
+    would fail every branding write. Idempotent."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT COUNT(*) AS n FROM information_schema.columns
+               WHERE table_schema = DATABASE() AND table_name = 'app_settings'
+                 AND column_name = 'updated_at'"""
+        )
+        if cur.fetchone()["n"] == 0:
+            cur.execute("ALTER TABLE app_settings ADD COLUMN updated_at VARCHAR(40) NULL")
+
+
 def init_db() -> None:
     """Create tables if missing and seed defaults. Safe to call every boot."""
     with get_conn() as conn:
@@ -584,6 +598,7 @@ def init_db() -> None:
                 cur.execute(statement)
             _ensure_searches_user_id(conn)
             _ensure_searches_cached_from(conn)
+            _ensure_app_settings_updated_at(conn)
 
     for name, pos, color, days in PIPELINE_STAGES:
         execute(

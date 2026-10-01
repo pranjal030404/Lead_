@@ -145,6 +145,22 @@ class Settings:
     rclone_path = _str("RCLONE_PATH", "rclone")
     backup_sync_timeout = _int("BACKUP_SYNC_TIMEOUT", 300)
 
+    # white-label branding. Everything the customer sees - product name, tagline,
+    # support address, colours, logo - resolves from app_settings first (editable
+    # in the admin UI) and falls back to these env values. Rebranding an install
+    # should never require touching the source tree.
+    brand_name = _str("BRAND_NAME", "Arthvex LeadGen")
+    brand_short_name = _str("BRAND_SHORT_NAME", "")
+    brand_tagline = _str("BRAND_TAGLINE", "Lead generation workspace")
+    brand_landing_title = _str("BRAND_LANDING_TITLE", "")
+    brand_landing_subtitle = _str("BRAND_LANDING_SUBTITLE", "")
+    brand_footer = _str("BRAND_FOOTER", "")
+    brand_support_email = _str("BRAND_SUPPORT_EMAIL", "")
+    brand_company_name = _str("BRAND_COMPANY_NAME", "")
+    brand_accent = _str("BRAND_ACCENT", "#f0b429")
+    brand_accent_2 = _str("BRAND_ACCENT_2", "#ffdf8e")
+    brand_background = _str("BRAND_BACKGROUND", "#0b0b0d")
+
     # server
     host = _str("HOST", "127.0.0.1")
     port = _int("PORT", 8000)

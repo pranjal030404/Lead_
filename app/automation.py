@@ -199,8 +199,11 @@ def build_digest() -> str:
         "SELECT created_at FROM automation_log WHERE job = 'backup' ORDER BY id DESC LIMIT 1"
     )
 
+    from .branding import get_branding
+
+    brand = get_branding()
     lines = [
-        f"Arthvex LeadGen - daily digest {today()}",
+        f"{brand['brand_name']} - daily digest {today()}",
         "",
         f"  New leads (24h):        {new_leads}",
         f"  New HOT leads:          {hot}",

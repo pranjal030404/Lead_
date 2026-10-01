@@ -1,4 +1,5 @@
-/* Arthvex LeadGen - single-page UI, no build step, no dependencies. */
+/* Single-page UI, no build step, no dependencies. Branding is server-rendered
+   into the shell pages and overridable at /api/branding/theme.css. */
 
 const view = document.getElementById('view');
 const drawerRoot = document.getElementById('drawerRoot');
@@ -17,6 +18,7 @@ async function api(path, options = {}) {
 
 const post = (path, data) => api(path, { method: 'POST', body: JSON.stringify(data ?? {}) });
 const patch = (path, data) => api(path, { method: 'PATCH', body: JSON.stringify(data) });
+const put = (path, data) => api(path, { method: 'PUT', body: JSON.stringify(data) });
 const del = (path) => api(path, { method: 'DELETE' });
 
 function esc(value) {
@@ -1879,10 +1881,12 @@ async function togglePayment(enabled) {
 
 // ------------------------------------------------------------ settings ---
 routes['/settings'] = async () => {
-  const [identity, quota, providers, suppression, backups, payment] = await Promise.all([
+  const [identity, quota, providers, suppression, backups, payment, brandingData] = await Promise.all([
     api('/api/identity'), api('/api/quota'), api('/api/providers'),
     api('/api/suppression'), api('/api/automation/backups'), api('/api/settings/payment'),
+    api('/api/branding'),
   ]);
+  window.__branding = brandingData.brand;
 
   view.innerHTML = `
     <div class="page-head"><div><h1>Settings</h1>
@@ -1891,6 +1895,58 @@ routes['/settings'] = async () => {
       <button onclick="logout()">Sign out</button></div>
 
     <div class="grid cols-2">
+
+      <div class="card">
+        <h3>White-label branding</h3>
+        <div class="subtitle" style="margin-bottom:10px">Rename the product, recolour it and
+          swap the logo — applied everywhere instantly, no redeploy.</div>
+        <div class="field"><label>Product name</label>
+          <input id="bName" value="${esc(brandingData.brand.brand_name)}"></div>
+        <div class="row">
+          <div class="field"><label>Wordmark suffix (the dimmed part)</label>
+            <input id="bShort" value="${esc(brandingData.brand.brand_short_name)}" placeholder="auto"></div>
+          <div class="field"><label>Tagline</label>
+            <input id="bTagline" value="${esc(brandingData.brand.brand_tagline)}"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Accent colour</label>
+            <input id="bAccent" type="color" value="${esc(brandingData.brand.brand_accent)}"></div>
+          <div class="field"><label>Accent highlight</label>
+            <input id="bAccent2" type="color" value="${esc(brandingData.brand.brand_accent_2)}"></div>
+          <div class="field"><label>Background</label>
+            <input id="bBackground" type="color" value="${esc(brandingData.brand.brand_background)}"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Logo (png/jpg/webp/svg, ≤1 MB)</label>
+            <input id="bLogoFile" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml"></div>
+          <div class="field"><label>Favicon</label>
+            <input id="bFaviconFile" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml"></div>
+        </div>
+        <div class="flex wrap" style="margin-top:4px">
+          <button class="primary" onclick="saveBranding()">Save branding</button>
+          <button onclick="uploadLogo(false)">Upload logo</button>
+          <button onclick="uploadLogo(true)">Upload favicon</button>
+          <button class="danger" onclick="resetBranding()">Reset to default</button>
+        </div>
+        ${brandingData.brand.brand_logo ? `<div class="faint" style="margin-top:8px">Custom logo active: <span class="mono">${esc(brandingData.brand.brand_logo)}</span></div>` : ''}
+      </div>
+
+      <div class="card">
+        <h3>Landing page &amp; contact copy</h3>
+        <div class="field"><label>Landing headline</label>
+          <input id="bLandingTitle" value="${esc(brandingData.brand.brand_landing_title)}" placeholder="Find businesses that need a website"></div>
+        <div class="field"><label>Landing sub-headline</label>
+          <textarea id="bLandingSub" style="min-height:64px" placeholder="Auto-generated from the product name if left blank">${esc(brandingData.brand.brand_landing_subtitle)}</textarea></div>
+        <div class="row">
+          <div class="field"><label>Company name (email footer)</label>
+            <input id="bCompany" value="${esc(brandingData.brand.brand_company_name)}" placeholder="= product name"></div>
+          <div class="field"><label>Support email (sign-in page)</label>
+            <input id="bSupport" value="${esc(brandingData.brand.brand_support_email)}" placeholder="you@yourdomain.com"></div>
+        </div>
+        <div class="field"><label>Footer line (landing + sign-in)</label>
+          <input id="bFooter" value="${esc(brandingData.brand.brand_footer)}" placeholder="Blank = © + company name"></div>
+        <button class="primary" onclick="saveBrandingCopy()">Save copy</button>
+      </div>
       <div class="card">
         <h3>Your identity in outreach</h3>
         <div class="field"><label>Company name</label>
@@ -1970,6 +2026,52 @@ async function saveIdentity() {
     portfolio_url: document.getElementById('sPortfolio').value,
   });
   toast('Saved', 'ok');
+}
+
+// ---------------------------------------------------------- white-label ---
+async function saveBranding() {
+  await put('/api/branding', {
+    brand_name: document.getElementById('bName').value,
+    brand_short_name: document.getElementById('bShort').value,
+    brand_tagline: document.getElementById('bTagline').value,
+    brand_accent: document.getElementById('bAccent').value,
+    brand_accent_2: document.getElementById('bAccent2').value,
+    brand_background: document.getElementById('bBackground').value,
+  });
+  toast('Branding saved — reloading', 'ok');
+  setTimeout(() => window.location.reload(), 600);
+}
+
+async function saveBrandingCopy() {
+  await put('/api/branding', {
+    brand_landing_title: document.getElementById('bLandingTitle').value,
+    brand_landing_subtitle: document.getElementById('bLandingSub').value,
+    brand_company_name: document.getElementById('bCompany').value,
+    brand_support_email: document.getElementById('bSupport').value,
+    brand_footer: document.getElementById('bFooter').value,
+  });
+  toast('Landing copy saved — reloading', 'ok');
+  setTimeout(() => window.location.reload(), 600);
+}
+
+async function uploadLogo(favicon) {
+  const input = document.getElementById(favicon ? 'bFaviconFile' : 'bLogoFile');
+  const file = input.files && input.files[0];
+  if (!file) { toast('Choose an image first', 'err'); return; }
+  const body = new FormData();
+  body.append('file', file);
+  const response = await fetch(`/api/branding/logo?favicon=${favicon}`, { method: 'POST', body });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) { toast(data.detail || 'Upload failed', 'err'); return; }
+  toast('Uploaded — reloading', 'ok');
+  setTimeout(() => window.location.reload(), 600);
+}
+
+async function resetBranding() {
+  if (!confirm('Reset every brand setting, colour and uploaded logo to the default?')) return;
+  await post('/api/branding/reset');
+  toast('Branding reset — reloading', 'ok');
+  setTimeout(() => window.location.reload(), 600);
 }
 
 async function addSuppression() {

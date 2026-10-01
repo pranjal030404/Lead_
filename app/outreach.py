@@ -84,9 +84,9 @@ def merge_context(lead: dict) -> dict:
         "website_url": lead.get("website_url") or "",
         "observation": observation_for(lead),
         "website_issue": website_issue_for(lead),
-        "portfolio_url": settings_value("portfolio_url", "https://arthvex.co.in/work"),
+        "portfolio_url": settings_value("portfolio_url", "https://example.com/work"),
         "sender_name": settings.mail_from_name or "Me",
-        "sender_company": settings_value("company_name", "Arthvex"),
+        "sender_company": settings_value("company_name", "") or brand_company_name(),
     }
 
 
@@ -94,6 +94,18 @@ def settings_value(key: str, default: str) -> str:
     from .db import get_setting
 
     return get_setting(key) or default
+
+
+def brand_company_name() -> str:
+    """The company identity used in outreach footers and email signatures.
+
+    Precedence: operator-set company_name, then the white-label brand config,
+    so a rebranded install signs its outreach correctly without touching the
+    legacy identity setting."""
+    from .branding import get_branding
+
+    brand = get_branding()
+    return brand["brand_company_name"] or brand["brand_name"]
 
 
 def render(text: str | None, context: dict) -> str:
@@ -229,7 +241,7 @@ def _footer() -> str:
         return ""
     return (
         "\n\n---\n"
-        f"{settings.mail_from_name or ''} - {settings_value('company_name', 'Arthvex')}\n"
+        f"{settings.mail_from_name or ''} - {brand_company_name()}\n"
         f"Don't want to hear from me again? Reply STOP or email {address} "
         "and I'll remove you immediately."
     )

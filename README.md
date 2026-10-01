@@ -4,11 +4,46 @@ Self-hosted lead generation for a web studio. Finds local businesses that need
 websites, enriches them, scores them, tracks every interaction, and never
 searches the same place twice.
 
+**Fully white-label**: the product name, tagline, landing copy, support email,
+colour scheme and logo/favicon are runtime configuration, not source code —
+rebrand an install in minutes, per customer, with no forks and no redeploys.
+See [White-labelling](#white-labelling) below.
+
 Built from the v3.1 blueprint. FastAPI + MySQL + vanilla JS — no build step, no
 paid API required to start. It runs on a $4/month VPS, multi-user, with
 subscription plans gating lead searches.
 
 ---
+
+## White-labelling
+
+Every customer-facing surface resolves through `app/branding.py`:
+
+| Surface | Where it comes from |
+|---|---|
+| Sidebar, sign-in, tab title, startup banner | `BRAND_NAME` / `BRAND_SHORT_NAME` |
+| Wordmark suffix (the dimmed second word) | `BRAND_SHORT_NAME`, default = last word of the name |
+| Sign-in tagline | `BRAND_TAGLINE` |
+| Landing headline + sub-headline | `BRAND_LANDING_TITLE` / `BRAND_LANDING_SUBTITLE` |
+| Footer line, support contact | `BRAND_FOOTER` / `BRAND_SUPPORT_EMAIL` |
+| Outreach email footer/signature | `BRAND_COMPANY_NAME` (or the legacy `company_name` setting) |
+| Colours everywhere | `BRAND_ACCENT`, `BRAND_ACCENT_2`, `BRAND_BACKGROUND` |
+| Logo + favicon | Upload in the admin Settings page (stored under `data/uploads/`) |
+
+Two ways to rebrand:
+
+1. **UI (no restart):** sign in as an admin → **Settings → White-label
+   branding**. Set the name, pick colours with the pickers, upload a logo.
+   Saved into the `app_settings` table; wins over `.env` until you press
+   *Reset to default*.
+2. **Env:** set the `BRAND_*` variables in `.env` before first boot (useful for
+   scripted per-customer deploys). A light background (e.g. `#f7f7f4`)
+   automatically flips the text ramp so the UI stays readable.
+
+Everything is scoped per database: point a second deploy at a second MySQL
+schema and you have a second independently-branded product from the same image.
+Digest emails, hot-lead alerts and the HTTP User-Agent all follow the brand
+automatically.
 
 ## Quick start
 
@@ -34,6 +69,18 @@ provide the database (next section) and run:
 Open http://127.0.0.1:8000 - you'll land on the marketing page, then sign in via
 **Sign in** (or `/login` directly) with `ADMIN_USER`/`ADMIN_PASSWORD`
 (seeded as the `superadmin` on first boot). Generate a secret key with:
+
+### Admin console
+
+Administrators have a dedicated door at **`/admin`** — its own branded sign-in
+page backed by a role-gated endpoint (`POST /api/auth/admin/login`) that only
+accepts `admin` and `superadmin` accounts. A regular user's correct credentials
+are rejected there with the same 401 as a wrong password, so the endpoint leaks
+nothing about which usernames exist. Sessions themselves are role-agnostic;
+what any signed-in user may do is enforced per request by `require_role`, and
+the API-level admin surface (Users, Plans, Branding) already checks roles
+server-side. The page is intentionally not linked from the user login — point
+administrators at `/admin` directly.
 
 ```bash
 python3 -c "import secrets;print(secrets.token_hex(32))"

@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Administrator sign-in - {{BRAND_NAME}}</title>
+  <link rel="icon" href="{{FAVICON_URL}}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Sora:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/api/branding/theme.css">
+  <style>
+    /* Admin door variant: same design language, distinct silhouette so an
+       operator always knows which door they walked through. */
+    .login-wrap { grid-template-columns: 1fr 1.1fr; }
+    .login-hero { order: 2; border-right: none; border-left: 1px solid var(--line-soft); }
+    .login-pane { order: 1; }
+    .admin-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 14px; border-radius: 100px; margin-bottom: 14px;
+      border: 1px solid rgb(var(--accent-rgb) / 0.4);
+      background: rgb(var(--accent-rgb) / 0.1);
+      color: var(--accent); font-size: 11px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 1.4px;
+    }
+    .login-title b { color: var(--accent); }
+    @media (max-width: 900px) {
+      .login-wrap { grid-template-columns: 1fr; }
+      .login-hero { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <main class="login-pane">
+      <form class="card login-card" id="form">
+        <div class="brand">
+          {{LOGO_HTML_17}}
+          <div>{{BRAND_NAME}}</div>
+        </div>
+        <div style="text-align:center"><span class="admin-badge">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4.5 6v5c0 5 3.2 9.4 7.5 11 4.3-1.6 7.5-6 7.5-11V6L12 2Z"/><path d="m9 12 2 2 4-4"/></svg>
+          Administrator access</span></div>
+        <div class="login-title">Console <b>sign-in</b></div>
+        <div class="login-sub">Admin accounts only. User accounts sign in at the standard door.</div>
+
+        <div class="field">
+          <label for="username">Admin username</label>
+          <input id="username" name="username" autocomplete="username" autofocus required>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="primary" type="submit">Sign in to console</button>
+        <p id="error" class="banner err login-error" style="display:none; margin:14px 0 0"></p>
+        <span class="faint">
+          This page is for administrators. <a href="/login">User sign-in</a>.
+        </span>
+      </form>
+    </main>
+
+    <aside class="login-hero">
+      <div class="orb a"></div>
+      <div class="orb b"></div>
+      <div class="login-hero-grid"></div>
+
+      <a href="/landing" style="text-decoration:none;color:inherit">
+        <div class="brand">
+          {{LOGO_HTML}}
+          <div>{{BRAND_NAME}}<small>Administration console</small></div>
+        </div>
+      </a>
+
+      <div class="login-points">
+        <div class="login-point">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/></svg></span>
+          <div><b>Manage users &amp; plans</b>
+            <span>Create accounts, assign subscriptions, control self-serve ordering.</span></div>
+        </div>
+        <div class="login-point">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3"/><circle cx="14" cy="4" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="14" cy="20" r="2"/></svg></span>
+          <div><b>Control automation</b>
+            <span>Job switches, kill switch, failure triage and backup management.</span></div>
+        </div>
+        <div class="login-point">
+          <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1"/></svg></span>
+          <div><b>White-label the product</b>
+            <span>Rebrand name, colours and logo for this deployment - no redeploy.</span></div>
+        </div>
+      </div>
+
+      <div class="faint" style="font-size:11.5px">{{BRAND_FOOTER}}</div>
+    </aside>
+  </div>
+
+  <script>
+    const form = document.getElementById('form');
+    const error = document.getElementById('error');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      error.style.display = 'none';
+      const button = form.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/auth/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: form.username.value,
+            password: form.password.value,
+          }),
+        });
+        if (response.ok) {
+          window.location.href = '/';
+          return;
+        }
+        const data = await response.json().catch(() => ({}));
+        error.textContent = data.detail || 'Sign in failed';
+        error.style.display = 'block';
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

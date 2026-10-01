@@ -177,12 +177,17 @@ class IdentityPayload(BaseModel):
 
 @router.get("/identity")
 def get_identity():
+    from ..branding import get_branding
+    from ..outreach import brand_company_name
+
+    brand = get_branding()
     return {
-        "company_name": get_setting("company_name", "Arthvex"),
-        "portfolio_url": get_setting("portfolio_url", "https://arthvex.co.in/work"),
+        "company_name": get_setting("company_name", "") or brand_company_name(),
+        "portfolio_url": get_setting("portfolio_url", "https://example.com/work"),
         "sender_name": settings.mail_from_name,
         "sender_email": settings.mail_from,
         "dry_run": settings.dry_run,
+        "brand_name": brand["brand_name"],
     }
 
 

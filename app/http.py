@@ -15,7 +15,21 @@ import httpx
 
 from .config import settings
 
-USER_AGENT = "ArthvexLeadGen/1.0 (self-hosted lead research tool)"
+def _user_agent() -> str:
+    """Outbound User-Agent, derived from the white-label brand name.
+
+    Deliberately a function, not a constant: branding is read from the database,
+    which is not ready at import time. Nominatim's policy requires a UA that
+    identifies the tool, so a blank brand falls back to a generic-but-honest
+    product string."""
+    try:
+        from .branding import get_branding
+
+        name = get_branding()["brand_name"]
+    except Exception:  # noqa: BLE001 - DB not up yet (first boot, tests)
+        name = ""
+    slug = "".join(c for c in name if c.isalnum()) or "LeadGenSelfHosted"
+    return f"{slug}/1.0 (self-hosted lead research tool)"
 
 MAX_ATTEMPTS = 5
 BREAKER_THRESHOLD = 5
@@ -49,7 +63,7 @@ def client() -> httpx.Client:
                         max_connections=settings.http_pool_size,
                         max_keepalive_connections=settings.http_pool_size // 2,
                     ),
-                    headers={"User-Agent": USER_AGENT},
+                    headers={"User-Agent": _user_agent()},
                 )
     return _client
 
@@ -117,7 +131,7 @@ def request(
     """Request with backoff on 429/5xx, capped attempts, and a circuit breaker."""
     breaker_check(breaker)
     timeout = timeout or settings.http_timeout
-    headers = {"User-Agent": USER_AGENT, **kwargs.pop("headers", {})}
+    headers = {"User-Agent": _user_agent(), **kwargs.pop("headers", {})}
     last_error: Exception | None = None
 
     for attempt in range(retries):

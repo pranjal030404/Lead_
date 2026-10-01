@@ -201,7 +201,9 @@ def send_digest(body: str) -> dict:
         return {"skipped": "alerts disabled"}
     if not recipient() or not settings.resend_api_key:
         return {"skipped": "email not configured"}
-    return _send(f"LeadGen digest {today()}", body)
+    from .branding import get_branding
+
+    return _send(f"{get_branding()['brand_name']} digest {today()}", body)
 
 
 def prune(days: int = 90) -> int:
