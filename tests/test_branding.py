@@ -217,6 +217,31 @@ def test_branding_api_requires_admin():
         assert client.get("/api/branding").status_code == 401
 
 
+def test_branding_api_returns_brand_and_overridden_keys_for_admin():
+    """The authenticated GET must return 200, not 500.
+
+    Regression: the handler's `overridden` lookup runs a parameterless
+    `LIKE 'brand_%'`. While the query helpers defaulted `params` to `()`, the
+    DB driver tried to interpolate that literal `%` and raised
+    `TypeError: not enough arguments for format string`, which reached the
+    client as a 500 and broke the whole Settings page. The 401 test above never
+    caught it: the role dependency rejects first, so the query never runs.
+    """
+    _cleanup()
+    set_branding({"brand_name": "Beacon Leads"})
+    with _client() as client:
+        client.post("/api/auth/login", json={"username": config.settings.admin_user,
+                                             "password": config.settings.admin_password})
+        response = client.get("/api/branding")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["brand"]["brand_name"] == "Beacon Leads"
+        # Only keys actually stored in app_settings count as overridden.
+        assert "brand_name" in body["overridden"]
+        assert "brand_accent_2" not in body["overridden"]
+        assert body["uploads_dir"].endswith("uploads")
+
+
 def test_pages_serve_the_brand_without_a_session():
     _cleanup()
     set_branding({"brand_name": "Rivet CRM"})

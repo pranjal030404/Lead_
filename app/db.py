@@ -7,9 +7,17 @@ removes that entirely, and request threads, scheduler threads and the
 enrichment pool are all bounded and reused, so the number of live connections
 stays small.
 
-Raw SQL, no ORM - keeps the dependency list tiny and the queries obvious.
-The application writes `?` placeholders everywhere; `TranslateCursor` rewrites
+Raw SQL, no ORM - keeps the dependency list tiny and the queries obvious. The
+application writes `?` placeholders everywhere; `TranslateCursor` rewrites
 them to `%s` at execution time so PyMySQL never sees a raw `?`.
+
+The query helpers below default `params` to `None`, never `()`, and that is
+load-bearing. PyMySQL runs `query % args` whenever `args` is not None, so an
+empty tuple still interpolates - which turns a literal `%` in a
+parameterless query (`LIKE 'brand_%'`, `DATE_FORMAT(d, '%Y')`) into a format
+specifier and raises `TypeError: not enough arguments for format string` from
+inside the DB driver, surfacing as a bare 500. None tells PyMySQL there is
+nothing to bind, so literal `%` in the SQL stays literal.
 """
 
 from __future__ import annotations
@@ -484,14 +492,14 @@ def close_conn() -> None:
             _local.conn = None
 
 
-def query(sql: str, params: tuple | dict = ()) -> list[dict]:
+def query(sql: str, params: tuple | dict | None = None) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return [dict(r) for r in cur.fetchall()]
 
 
-def query_one(sql: str, params: tuple | dict = ()) -> dict | None:
+def query_one(sql: str, params: tuple | dict | None = None) -> dict | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -499,14 +507,14 @@ def query_one(sql: str, params: tuple | dict = ()) -> dict | None:
             return dict(row) if row else None
 
 
-def execute(sql: str, params: tuple | dict = ()) -> int:
+def execute(sql: str, params: tuple | dict | None = None) -> int:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.lastrowid or cur.rowcount
 
 
-def scalar(sql: str, params: tuple | dict = (), default: Any = 0) -> Any:
+def scalar(sql: str, params: tuple | dict | None = None, default: Any = 0) -> Any:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
