@@ -99,7 +99,15 @@ async def auth_and_rate_limit(request: Request, call_next):
         return RedirectResponse("/landing" if path == "/" else "/login", status_code=302)
 
     request.state.user = user
-    return await call_next(request)
+    response = await call_next(request)
+    # The rendered HTML bakes in operator config - the Google Maps JS key lands
+    # in a meta tag - and branding.render_page reads it per request. Without a
+    # cache directive the browser heuristically caches the page, so a .env edit
+    # plus restart still shows the old (empty) key until a hard refresh. Same
+    # reasoning as the /static/ branch above, applied to the page itself.
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 app.include_router(auth.router)
