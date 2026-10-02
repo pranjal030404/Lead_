@@ -375,6 +375,13 @@ def render_page(template_name: str, brand: dict[str, str] | None = None) -> str:
         "BRAND_SHORT_NAMELower": re.sub(r"[^a-z0-9]", "", brand["brand_short_name"].lower()) or "app",
         "ACCENT_ON_COLOR": html.escape(_readable_on(brand["brand_accent"])),
         "BRAND_COMPANY_NAME": html.escape(brand["brand_company_name"] or brand["brand_name"]),
+        # Not brand fields - operator config that index.html hands to the map
+        # loader. Google Maps keys are browser-public by design, which is why
+        # this is a separate key from the server-side GOOGLE_API_KEY. Escaped
+        # because they land in a meta content attribute, and an unconfigured
+        # install renders empty so the page can say which variable to set.
+        "GOOGLE_MAPS_JS_KEY": html.escape(settings.google_maps_js_key),
+        "GOOGLE_MAPS_MAP_ID": html.escape(settings.google_maps_map_id),
     }
 
     text = (settings.static_dir / template_name).read_text(encoding="utf-8")

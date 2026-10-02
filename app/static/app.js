@@ -135,6 +135,9 @@ function navigate() {
   });
 
   const render = routes[path] || routes['/dashboard'];
+  // The map holds a live canvas and listeners against a DOM node that the
+  // innerHTML swap below is about to throw away, so it goes first.
+  disposeMap();
   view.innerHTML = `
     <div class="page-head"><div>
       <div class="sk sk-title"></div><div class="sk sk-sub"></div>
@@ -993,26 +996,116 @@ async function snoozeFollowUp(leadId, days) {
 
 // ----------------------------------------------------------------- map ---
 
-let leafletReady = null;
+let googleMapsReady = null;
 
-// Leaflet is ~150KB and only this one page needs it, so it loads on first
-// visit rather than on every page load. Vendored locally, not from a CDN: the
-// tool is meant to run on your own box without depending on someone else's.
-function loadLeaflet() {
-  if (leafletReady) return leafletReady;
-  leafletReady = new Promise((resolve, reject) => {
+// Google Maps is loaded on first visit to this page rather than on every page
+// load: the rest of the app doesn't need it and it is ~150KB. Unlike the
+// Leaflet build that lived here before, this one is fetched from Google's CDN -
+// the Maps JS API is only served there - so the map page now needs a network
+// round trip to googleapis.com and a correctly configured key. Everything else
+// in the app still runs with no internet and no key.
+function loadGoogleMaps() {
+  if (window.google && window.google.maps) return Promise.resolve(window.google.maps);
+  if (googleMapsReady) return googleMapsReady;
+
+  const key = (document.querySelector('meta[name="google-maps-key"]')?.content || '').trim();
+  if (!key) {
+    return Promise.reject(new Error(
+      'No Google Maps key configured - set GOOGLE_MAPS_JS_KEY in .env and restart'));
+  }
+
+  const load = new Promise((resolve, reject) => {
+    let timer;
+    const done = (fn, value) => {
+      clearTimeout(timer);
+      delete window.__googleMapsReady;
+      fn(value);
+    };
+    // loading=async keeps the library off the critical path, which means
+    // onload only says the bootstrap file arrived, not that google.maps is
+    // usable yet - the callback is the signal we actually want.
+    window.__googleMapsReady = () => done(resolve, window.google.maps);
+    // A silently hung script leaves a blank box and a spinner that never
+    // resolves; fail loudly instead so the page can say what went wrong.
+    timer = setTimeout(() => done(reject, new Error('Google Maps did not load in time')),
+      15000);
     const s = document.createElement('script');
-    s.src = '/static/vendor/leaflet.js';
-    s.onload = () => resolve(window.L);
-    s.onerror = () => reject(new Error('Could not load the map library'));
+    s.async = true;
+    s.onerror = () => done(reject, new Error('Could not reach Google Maps'));
+    s.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(key)
+      + '&v=weekly&loading=async&callback=__googleMapsReady';
     document.head.appendChild(s);
   });
-  return leafletReady;
+
+  // A failed load is deliberately not cached: coming back to the page should
+  // retry after a network hiccup, not replay a rejection from ten minutes ago.
+  googleMapsReady = load.catch((err) => { googleMapsReady = null; throw err; });
+  return googleMapsReady;
 }
 
 const PRIORITY_COLOUR = { HOT: '#f85149', WARM: '#d29922', COLD: '#6e7681' };
 
+// Google's own dark styling needs a cloud-based map ID to apply. With one
+// configured we ask for colorScheme instead; without one the map falls back to
+// raster tiles and these legacy styles are the only way to keep it dark. The two
+// are mutually exclusive - passing both throws - so exactly one is ever set.
+const GOOGLE_DARK_STYLES = [
+  { elementType: 'geometry', stylers: [{ color: '#212121' }] },
+  { elementType: 'labels.text.stroke', stylers: [{ color: '#212121' }] },
+  { elementType: 'labels.text.fill', stylers: [{ color: '#9e9e9e' }] },
+  { elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
+  { featureType: 'administrative', elementType: 'geometry.stroke', stylers: [{ color: '#4b4b4b' }] },
+  { featureType: 'administrative.land_parcel', stylers: [{ visibility: 'off' }] },
+  { featureType: 'poi', stylers: [{ visibility: 'off' }] },
+  { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#3a3a3a' }] },
+  { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#2b2b2b' }] },
+  { featureType: 'road', elementType: 'labels.text.fill', stylers: [{ color: '#8a8a8a' }] },
+  { featureType: 'road.highway', elementType: 'geometry', stylers: [{ color: '#4a4a4a' }] },
+  { featureType: 'transit', stylers: [{ visibility: 'off' }] },
+  { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#111318' }] },
+  { featureType: 'water', elementType: 'labels.text.fill', stylers: [{ color: '#5f6b7a' }] },
+];
+
 let mapInstance = null;
+let infoWindow = null;
+let mapMarkers = [];
+let youAreHere = null;
+
+function clearMapMarkers() {
+  mapMarkers.forEach((marker) => marker.setMap(null));
+  mapMarkers = [];
+  if (youAreHere) { youAreHere.setMap(null); youAreHere = null; }
+}
+
+// Navigating away replaces the container div underneath a live map. Tearing
+// the map down first stops the canvas, its listeners and its markers outliving
+// the page that owned them.
+function disposeMap() {
+  if (!mapInstance) return;
+  if (infoWindow) infoWindow.close();
+  clearMapMarkers();
+  window.google.maps.event.clearInstanceListeners(mapInstance);
+  mapInstance.unbindAll();
+  mapInstance = null;
+}
+
+function popupHtml(lead, colour) {
+  return `
+    <div class="map-popup">
+      <b>${esc(lead.business_name)}</b><br>
+      <span style="color:${colour}">${esc(lead.lead_priority)} &middot;
+        ${lead.lead_score}/10</span>
+      <span style="color:var(--text-dim)"> &middot; ${esc(lead.status || '')}</span><br>
+      <span style="color:var(--text-dim)">${esc([lead.area, lead.city].filter(Boolean).join(', '))}</span><br>
+      ${lead.phone ? `<span style="color:var(--text-dim)">${esc(lead.phone)}</span><br>` : ''}
+      ${lead.has_website ? '' : '<b style="color:#f85149">No website</b><br>'}
+      <a href="#" onclick="closeMapPopupAndOpen(${lead.id});return false">Open lead</a>
+      &nbsp;|&nbsp;
+      <a target="_blank" rel="noopener"
+         href="https://www.google.com/maps/search/?api=1&query=${lead.lat},${lead.lng}">
+         Google Maps</a>
+    </div>`;
+}
 
 routes['/map'] = async () => {
   view.innerHTML = `
@@ -1039,69 +1132,91 @@ routes['/map'] = async () => {
       <span class="faint">Bigger dot = higher score. Click a dot for the lead.</span>
     </div>`;
 
-  let L;
+  let maps;
   try {
-    L = await loadLeaflet();
+    maps = await loadGoogleMaps();
   } catch (err) {
+    document.getElementById('mapCount').textContent = 'Map unavailable';
     document.getElementById('mapCanvas').innerHTML =
-      `<div class="empty">${esc(err.message)}. Check that
-       /static/vendor/leaflet.js is present.</div>`;
+      `<div class="empty">${esc(err.message)}.</div>`;
     return;
   }
 
-  mapInstance = L.map('mapCanvas', { scrollWheelZoom: true })
-    .setView([22.5, 78.9], 4);
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '&copy; OpenStreetMap contributors',
-  }).addTo(mapInstance);
-
-  const layer = L.layerGroup().addTo(mapInstance);
+  const mapId = (document.querySelector('meta[name="google-maps-map-id"]')?.content || '').trim();
+  mapInstance = new maps.Map(document.getElementById('mapCanvas'), {
+    center: { lat: 22.5, lng: 78.9 },
+    zoom: 4,
+    // Matches the scroll-zoom the Leaflet build had, so a wheel over the map
+    // still zooms instead of scrolling the page behind it.
+    gestureHandling: 'greedy',
+    ...(mapId
+      ? { mapId, colorScheme: maps.ColorScheme.DARK }
+      : { styles: GOOGLE_DARK_STYLES }),
+  });
+  // One InfoWindow reused for every pin: fewer objects than one each, and it
+  // makes close-on-navigate a single call.
+  infoWindow = new maps.InfoWindow({ maxWidth: 260, minWidth: 200 });
 
   async function draw() {
     const priority = document.getElementById('mapPriority').value;
     const data = await api(`/api/geo/map${priority ? `?priority=${priority}` : ''}`);
-    layer.clearLayers();
+    clearMapMarkers();
 
-    const points = [];
+    const bounds = new maps.LatLngBounds();
     data.leads.forEach((lead) => {
       const colour = PRIORITY_COLOUR[lead.lead_priority] || PRIORITY_COLOUR.COLD;
-      const marker = L.circleMarker([lead.lat, lead.lng], {
-        radius: 5 + (lead.lead_score || 0) * 0.6,
-        color: colour, fillColor: colour, fillOpacity: 0.65, weight: 1.5,
+      const position = { lat: lead.lat, lng: lead.lng };
+      const marker = new maps.Marker({
+        map: mapInstance,
+        position,
+        title: lead.business_name,
+        // A scaled circle, so dot size can carry the score exactly the way the
+        // old circleMarker radius did.
+        icon: {
+          path: maps.SymbolPath.CIRCLE,
+          scale: 5 + (lead.lead_score || 0) * 0.6,
+          fillColor: colour, fillOpacity: 0.65,
+          strokeColor: colour, strokeWeight: 1.5,
+        },
       });
-      marker.bindPopup(`
-        <div style="min-width:190px">
-          <b>${esc(lead.business_name)}</b><br>
-          <span style="color:${colour}">${esc(lead.lead_priority)} &middot;
-            ${lead.lead_score}/10</span>
-          <span style="color:#666"> &middot; ${esc(lead.status || '')}</span><br>
-          <span style="color:#666">${esc([lead.area, lead.city].filter(Boolean).join(', '))}</span><br>
-          ${lead.phone ? `<span style="color:#666">${esc(lead.phone)}</span><br>` : ''}
-          ${lead.has_website ? '' : '<b style="color:#c0392b">No website</b><br>'}
-          <a href="#" onclick="closeMapPopupAndOpen(${lead.id});return false">Open lead</a>
-          &nbsp;|&nbsp;
-          <a target="_blank" rel="noopener"
-             href="https://www.google.com/maps/search/?api=1&query=${lead.lat},${lead.lng}">
-             Google Maps</a>
-        </div>`);
-      marker.addTo(layer);
-      points.push([lead.lat, lead.lng]);
+      marker.addListener('click', () => {
+        infoWindow.setContent(popupHtml(lead, colour));
+        infoWindow.open({ map: mapInstance, anchor: marker });
+      });
+      mapMarkers.push(marker);
+      bounds.extend(position);
     });
 
     document.getElementById('mapCount').textContent =
       `${data.count} lead${data.count === 1 ? '' : 's'} with coordinates`;
-    if (points.length) mapInstance.fitBounds(points, { padding: [40, 40], maxZoom: 15 });
+    // fitBounds chooses whatever zoom fits the points; clamp to the same
+    // ceiling the Leaflet build used so one lead doesn't zoom to street level.
+    if (data.leads.length) {
+      mapInstance.fitBounds(bounds, 40);
+      if (mapInstance.getZoom() > 15) mapInstance.setZoom(15);
+    }
   }
 
   document.getElementById('mapPriority').onchange = draw;
   document.getElementById('mapLocate').onclick = async () => {
     try {
       const { lat, lng } = await currentPosition();
-      mapInstance.setView([lat, lng], 14);
-      L.circleMarker([lat, lng], {
-        radius: 9, color: '#58a6ff', fillColor: '#58a6ff', fillOpacity: 0.35, weight: 2,
-      }).addTo(mapInstance).bindPopup('You are here').openPopup();
+      mapInstance.setCenter({ lat, lng });
+      mapInstance.setZoom(14);
+      youAreHere = new maps.Marker({
+        map: mapInstance,
+        position: { lat, lng },
+        title: 'You are here',
+        zIndex: 7,
+        icon: {
+          path: maps.SymbolPath.CIRCLE,
+          scale: 9,
+          fillColor: '#58a6ff', fillOpacity: 0.35,
+          strokeColor: '#58a6ff', strokeWeight: 2,
+        },
+      });
+      infoWindow.setContent('You are here');
+      infoWindow.open({ map: mapInstance, anchor: youAreHere });
     } catch (err) {
       toast(err.message, 'err');
     }
@@ -1111,7 +1226,7 @@ routes['/map'] = async () => {
 };
 
 function closeMapPopupAndOpen(leadId) {
-  if (mapInstance) mapInstance.closePopup();
+  if (infoWindow) infoWindow.close();
   openLead(leadId);
 }
 

@@ -189,8 +189,13 @@ Nominatim by default; set `GEOCODER=google` to use Google's geocoder instead.
 
 **Map** — every lead with coordinates, plotted. Colour is priority, dot size is
 score, and each pin opens the lead or jumps to it in Google Maps. *Find me*
-centres the map on where you are. Leaflet is vendored into `static/vendor/`, not
-pulled from a CDN — the tool runs on your box without depending on someone else's.
+centres the map on where you are. The map is the **Google Maps JavaScript
+API**, loaded lazily on first visit to the page. That makes it the one part of
+the UI that can't be vendored — Google's API is only served from their CDN — so
+it needs `GOOGLE_MAPS_JS_KEY` set, billing enabled on that Google Cloud project,
+and a referrer restriction on the key. Everything else in the app still runs
+with no internet and no keys; without one, the map page says so instead of
+rendering a blank box.
 
 **Deduplication** — four checks in order: `place_id`, phone, exact name+city,
 then fuzzy name match (80%+). A duplicate never creates a second lead; it fills
@@ -559,7 +564,6 @@ app/
   providers/           osm, google_places, mock
   routers/             the HTTP API
   static/              the whole UI (no build step)
-  static/vendor/       Leaflet, vendored so the map needs no CDN
 deploy/
   Caddyfile            reverse proxy + automatic HTTPS
   leadgen-apache.conf  Apache vhost: TLS + reverse proxy to 127.0.0.1:8000

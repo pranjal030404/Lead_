@@ -88,6 +88,16 @@ class Settings:
 
     # location: "osm" (free Nominatim) or "google" (bills per call, needs a key)
     geocoder = _str("GEOCODER", "osm").lower()
+
+    # Google Maps JavaScript API, for the /map page. Deliberately a *separate*
+    # key from GOOGLE_API_KEY: that one is a server-side Places/geocoding key
+    # and should stay off the wire to the browser. This one is public the moment
+    # a page loads, so restrict it by HTTP referrer to the install's own domain.
+    google_maps_js_key = _str("GOOGLE_MAPS_JS_KEY")
+    # Optional. Cloud-based map ID, which is what makes colorScheme=DARK apply.
+    # Blank renders Google's raster map, so the frontend falls back to a legacy
+    # dark styles array instead.
+    google_maps_map_id = _str("GOOGLE_MAPS_MAP_ID")
     nearby_radius_m = _int("NEARBY_RADIUS_M", 3000)
     max_nearby_radius_m = _int("MAX_NEARBY_RADIUS_M", 50000)
 

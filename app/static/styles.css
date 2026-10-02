@@ -545,27 +545,28 @@ ul.reasons li::before { content: "✓"; color: var(--ok); }
 .dot-key { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
   margin-right: 6px; vertical-align: middle; }
 
-/* Leaflet ships a light-theme control set. These pull it into the dark shell
-   without touching the vendored file, so upgrading Leaflet is still a drop-in. */
-.leaflet-container { background: var(--bg); font: inherit; border-radius: var(--radius); }
-.leaflet-control-zoom a {
-  background: var(--bg-raise); color: var(--text); border-color: var(--line);
-}
-.leaflet-control-zoom a:hover { background: var(--bg-hover); color: var(--text); }
-.leaflet-control-attribution {
-  background: rgba(11, 11, 13, 0.8); color: var(--text-faint); font-size: 10px;
-}
-.leaflet-control-attribution a { color: var(--text-dim); }
-.leaflet-popup-content-wrapper, .leaflet-popup-tip {
-  background: var(--bg-raise); color: var(--text); border: 1px solid var(--line);
-}
-.leaflet-popup-content { margin: 11px 13px; font-size: 12.5px; line-height: 1.5; }
-.leaflet-popup-content a { color: var(--info); }
-.leaflet-popup-close-button { color: var(--text-faint) !important; }
+/* Google ships its own controls, which are theme-aware, so only the InfoWindow
+   bubble needs pulling into the dark shell. Google's class names are internal
+   and unversioned - if a release renames them the popup falls back to the
+   stock white bubble, which is ugly but not broken. */
+.map-popup { font-size: 12.5px; line-height: 1.5; }
+.map-popup a { color: var(--info); }
 
-/* OSM tiles are bright next to a dark UI; take the edge off without washing out
-   the markers drawn on top of them. */
-.leaflet-tile-pane { filter: brightness(0.62) saturate(0.8) contrast(1.06); }
+.gm-style-iw { background: transparent !important; padding: 0 !important; }
+.gm-style-iw-c {
+  background: var(--bg-raise) !important;
+  border: 1px solid var(--line) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow-1) !important;
+  padding: 11px 13px !important;
+}
+.gm-style-iw-d { overflow: hidden !important; border-radius: var(--radius) !important; }
+.gm-style-iw-close-button {
+  color: var(--text-faint) !important;
+  right: 4px !important;
+  top: 2px !important;
+}
+.gm-style-iw-close-button:hover { background: transparent !important; color: var(--text) !important; }
 
 /* ========================================================== responsive --- */
 @media (max-width: 900px) {

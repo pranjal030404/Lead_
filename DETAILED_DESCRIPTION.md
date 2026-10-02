@@ -108,9 +108,9 @@ already looked.
 | HTTP client | httpx 0.28.1 | one pooled, keep-alive `Client` for the process |
 | Config | python-dotenv 1.0.1 | `.env` at repo root |
 | Frontend | Vanilla JS, ~2,000-line single `app.js` | **no build step, no framework, no bundler** |
-| Maps | Leaflet, **vendored** into `static/vendor/` | deliberately not a CDN |
+| Maps | Google Maps JavaScript API, `loading=async` | the one thing that can't be vendored — needs `GOOGLE_MAPS_JS_KEY` |
 | Icons | inline SVG | no icon font |
-| Fonts | Google Fonts (Inter, Sora) | the only CDN dependency in the app |
+| Fonts | Google Fonts (Inter, Sora) | CDN, cached at the edge |
 | Tests | pytest, 48 tests | no network, no API key, runs against `leadgen_test` |
 
 **Dependencies: seven packages.** That is the whole list. There is no ORM, no
@@ -158,13 +158,12 @@ app/
     users.py          121  user CRUD, role guardrails
     plans.py          278  plans, subscriptions, ordering, payment toggle
   static/
-    index.html         86  app shell + sidebar nav
-    app.js           2,012  hash router + all 16 page renderers
-    styles.css        589  app styling (CSS custom properties, dark theme)
+    index.html         90  app shell + sidebar nav
+    app.js           2,230  hash router + all 16 page renderers
+    styles.css        594  app styling (CSS custom properties, dark theme)
     landing.html      326  public marketing page
     landing.css       394  marketing page styling
     login.html        105  sign-in form
-    vendor/                Leaflet (js + css), vendored
 tests/
   test_core.py        624  48 tests
   conftest.py          90  forces MYSQL_DATABASE=leadgen_test, refuses otherwise
@@ -594,20 +593,38 @@ mobile-friendly — no viewport tag, so it won't scale on a phone".
 
 ### 7.6 The map
 
-- Every lead with coordinates, plotted with Leaflet.
+- Every lead with coordinates, plotted on **Google Maps JavaScript API**.
 - **Colour = priority** (HOT `#f85149`, WARM `#d29922`, COLD `#6e7681`).
-- **Dot size = score** — `radius: 5 + lead_score * 0.6`.
+- **Dot size = score** — `scale: 5 + lead_score * 0.6` on a `SymbolPath.CIRCLE`
+  icon, which is the exact equivalent of the `circleMarker` radius this used to
+  use. Markers are `google.maps.Marker`, not `AdvancedMarkerElement`: the latter
+  is the non-deprecated API but requires the `marker` library *and* a cloud-based
+  Map ID, and for a plain coloured dot it buys nothing.
 - Filter dropdown for priority.
-- Popup shows name, priority, score, status, area/city, phone, a bold red
+- InfoWindow shows name, priority, score, status, area/city, phone, a bold red
   "No website" flag when applicable, plus **Open lead** (opens the drawer) and a
-  **Google Maps** deep link.
+  **Google Maps** deep link. One InfoWindow is reused for every pin.
 - **Find me** centres the map on the browser's position and drops a "You are
   here" marker.
-- Auto-fits bounds to all plotted leads.
-- **Leaflet loads lazily** on first visit to this page (it's ~150KB and only
-  this page needs it) and is **vendored** at `/static/vendor/leaflet.js` — the
-  tool is meant to run on your own box without depending on someone else's CDN.
-  A friendly error is shown if the file is missing.
+- Auto-fits bounds to all plotted leads, clamped to zoom 15 so a single lead
+  doesn't zoom to street level.
+- **Loaded lazily** on first visit to this page (it's ~150KB and only this page
+  needs it) with `loading=async`, and the `callback=` signal is what marks it
+  ready — `onload` only says the bootstrap file arrived.
+- **This is the app's one unavoidable CDN dependency.** The Maps JS API is only
+  served from `maps.googleapis.com`, so unlike the Leaflet build it replaced, it
+  cannot be vendored and it needs a key. That key is public the moment a page
+  loads — the HTTP-referrer restriction is the only thing protecting the bill,
+  and it is why `GOOGLE_MAPS_JS_KEY` is deliberately **not** the same key as the
+  server-side `GOOGLE_API_KEY` used for Places and geocoding.
+- Missing key, blocked network, or a script that never calls back all resolve to
+  the same in-page message naming the variable to set. A failed load is not
+  cached, so returning to the page retries.
+- Dark styling: a configured `GOOGLE_MAPS_MAP_ID` gets `colorScheme: DARK`;
+  without one Google serves raster tiles and a legacy `styles` array is applied
+  instead. The two are mutually exclusive and exactly one is ever passed.
+- `navigate()` calls `disposeMap()` before swapping the page's HTML, so the map's
+  canvas, markers and listeners don't outlive the container they were drawn into.
 - The endpoint `/api/geo/map` returns only the 13 columns a marker needs,
   not 56.
 
@@ -1060,6 +1077,9 @@ is a config change and a restart, not a code change.
 `MYSQL_CONNECT_TIMEOUT` (10), `MYSQLDUMP_PATH`
 
 **Provider** — `PROVIDER` (`osm`), `GOOGLE_API_KEY`
+
+**Map** — `GOOGLE_MAPS_JS_KEY` (browser-public, referrer-restricted),
+`GOOGLE_MAPS_MAP_ID` (optional, cloud dark styling)
 
 **Location** — `GEOCODER` (`osm`), `NEARBY_RADIUS_M` (3000),
 `MAX_NEARBY_RADIUS_M` (50000)
