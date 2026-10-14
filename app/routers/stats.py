@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter
 
-from ..db import query, query_one, scalar, today
+from ..db import current_ws, query, query_one, scalar, today
 from ..quota import usage_summary
 
 router = APIRouter(prefix="/api", tags=["stats"])
@@ -20,31 +20,41 @@ def _days_ago(days: int) -> str:
 
 @router.get("/stats")
 def dashboard_stats():
-    total = scalar("SELECT COUNT(*) FROM leads")
-    hot = scalar("SELECT COUNT(*) FROM leads WHERE lead_priority = 'HOT'")
-    warm = scalar("SELECT COUNT(*) FROM leads WHERE lead_priority = 'WARM'")
+    ws = current_ws()
+    total = scalar("SELECT COUNT(*) FROM leads WHERE workspace_id = ?", (ws,))
+    hot = scalar("SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND lead_priority = 'HOT'",
+                (ws,))
+    warm = scalar("SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND lead_priority = 'WARM'",
+                 (ws,))
     # Fall back to the listed URL when the site hasn't been checked yet -
     # otherwise every un-enriched lead is miscounted as having no website.
     no_site = scalar(
-        "SELECT COUNT(*) FROM leads WHERE "
-        "COALESCE(has_website, CASE WHEN COALESCE(website_url,'') = '' THEN 0 ELSE 1 END) = 0"
+        "SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND "
+        "COALESCE(has_website, CASE WHEN COALESCE(website_url,'') = '' THEN 0 ELSE 1 END) = 0",
+        (ws,),
     )
-    contacted = scalar("SELECT COUNT(*) FROM leads WHERE total_touchpoints > 0")
-    won = scalar("SELECT COUNT(*) FROM leads WHERE status = 'WON'")
+    contacted = scalar("SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND total_touchpoints > 0",
+                     (ws,))
+    won = scalar("SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND status = 'WON'", (ws,))
     won_this_month = scalar(
-        "SELECT COUNT(*) FROM leads WHERE status = 'WON' AND updated_at >= ?",
-        (datetime.now(timezone.utc).replace(day=1).isoformat(timespec="seconds"),),
+        "SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND status = 'WON' "
+        "AND updated_at >= ?",
+        (ws, datetime.now(timezone.utc).replace(day=1).isoformat(timespec="seconds")),
     )
     due_today = scalar(
-        "SELECT COUNT(*) FROM leads WHERE follow_up_date IS NOT NULL AND follow_up_date <= ?"
-        " AND status NOT IN ('WON','LOST')", (today(),)
+        "SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND follow_up_date IS NOT NULL "
+        "AND follow_up_date <= ? AND status NOT IN ('WON','LOST')", (ws, today())
     )
-    pending_approval = scalar("SELECT COUNT(*) FROM approval_queue WHERE status = 'PENDING'")
-    new_this_week = scalar("SELECT COUNT(*) FROM leads WHERE created_at >= ?", (_days_ago(7),))
+    pending_approval = scalar(
+        "SELECT COUNT(*) FROM approval_queue WHERE workspace_id = ? AND status = 'PENDING'", (ws,))
+    new_this_week = scalar("SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND created_at >= ?",
+                         (ws, _days_ago(7)))
     pending_enrichment = scalar(
-        "SELECT COUNT(*) FROM leads WHERE enrichment_status IN ('pending','partial')"
+        "SELECT COUNT(*) FROM leads WHERE workspace_id = ? "
+        "AND enrichment_status IN ('pending','partial')", (ws,)
     )
-    unresolved_failures = scalar("SELECT COUNT(*) FROM failed_jobs WHERE resolved = 0")
+    unresolved_failures = scalar(
+        "SELECT COUNT(*) FROM failed_jobs WHERE resolved = 0 AND workspace_id = ?", (ws,))
 
     return {
         "total_leads": total,
@@ -60,16 +70,20 @@ def dashboard_stats():
         "pending_enrichment": pending_enrichment,
         "unresolved_failures": unresolved_failures,
         "by_priority": query(
-            "SELECT lead_priority AS priority, COUNT(*) AS n FROM leads GROUP BY lead_priority"
+            "SELECT lead_priority AS priority, COUNT(*) AS n FROM leads "
+            "WHERE workspace_id = ? GROUP BY lead_priority", (ws,)
         ),
-        "by_status": query("SELECT status, COUNT(*) AS n FROM leads GROUP BY status"),
+        "by_status": query("SELECT status, COUNT(*) AS n FROM leads WHERE workspace_id = ? "
+                           "GROUP BY status", (ws,)),
         "by_niche": query(
             "SELECT niche, COUNT(*) AS n, SUM(CASE WHEN lead_priority='HOT' THEN 1 ELSE 0 END) "
-            "AS hot FROM leads WHERE niche IS NOT NULL GROUP BY niche ORDER BY n DESC LIMIT 12"
+            "AS hot FROM leads WHERE workspace_id = ? AND niche IS NOT NULL "
+            "GROUP BY niche ORDER BY n DESC LIMIT 12", (ws,)
         ),
         "by_city": query(
             "SELECT city, COUNT(*) AS n, SUM(CASE WHEN lead_priority='HOT' THEN 1 ELSE 0 END) "
-            "AS hot FROM leads WHERE city IS NOT NULL GROUP BY city ORDER BY n DESC LIMIT 12"
+            "AS hot FROM leads WHERE workspace_id = ? AND city IS NOT NULL "
+            "GROUP BY city ORDER BY n DESC LIMIT 12", (ws,)
         ),
         "quota": usage_summary(),
     }
@@ -78,15 +92,17 @@ def dashboard_stats():
 @router.get("/pipeline")
 def pipeline():
     stages = query("SELECT * FROM pipeline_stages ORDER BY position")
+    ws = current_ws()
     counts = {r["status"]: r["n"] for r in
-              query("SELECT status, COUNT(*) AS n FROM leads GROUP BY status")}
+              query("SELECT status, COUNT(*) AS n FROM leads WHERE workspace_id = ? "
+                    "GROUP BY status", (ws,))}
     result = []
     for stage in stages:
         leads = query(
             "SELECT id, business_name, city, lead_score, lead_priority, phone, email, "
-            "last_contacted_date, follow_up_date FROM leads WHERE status = ? "
-            "ORDER BY lead_score DESC LIMIT 25",
-            (stage["name"],),
+            "last_contacted_date, follow_up_date FROM leads WHERE workspace_id = ? "
+            "AND status = ? ORDER BY lead_score DESC LIMIT 25",
+            (ws, stage["name"]),
         )
         result.append({**stage, "count": counts.get(stage["name"], 0), "leads": leads})
     return result
@@ -96,7 +112,8 @@ def pipeline():
 def conversions():
     """Funnel rates. A lead's current status implies it passed every earlier
     stage; LOST leads count as contacted if they have any touchpoint logged."""
-    leads = query("SELECT status, total_touchpoints FROM leads")
+    ws = current_ws()
+    leads = query("SELECT status, total_touchpoints FROM leads WHERE workspace_id = ?", (ws,))
     reached = {stage: 0 for stage in STAGE_ORDER}
     for lead in leads:
         rank = STAGE_RANK.get(lead["status"])
@@ -115,8 +132,9 @@ def conversions():
             "rate": round(reached[target] / base * 100, 1) if base else 0.0,
         })
 
-    searched = scalar("SELECT COALESCE(SUM(results_found), 0) FROM searches")
-    total_leads = scalar("SELECT COUNT(*) FROM leads")
+    searched = scalar("SELECT COALESCE(SUM(results_found), 0) FROM searches "
+                      "WHERE workspace_id = ?", (ws,))
+    total_leads = scalar("SELECT COUNT(*) FROM leads WHERE workspace_id = ?", (ws,))
     return {
         "reached": reached,
         "steps": steps,
@@ -128,38 +146,47 @@ def conversions():
 
 @router.get("/stats/weekly")
 def weekly_report():
+    ws = current_ws()
     since = _days_ago(7)
     interactions = query(
-        "SELECT type, COUNT(*) AS n FROM interactions WHERE date >= ? GROUP BY type", (since,)
+        "SELECT type, COUNT(*) AS n FROM interactions WHERE workspace_id = ? AND date >= ? "
+        "GROUP BY type", (ws, since)
     )
     return {
         "period_start": since[:10],
         "period_end": today(),
-        "leads_found": scalar("SELECT COUNT(*) FROM leads WHERE created_at >= ?", (since,)),
+        "leads_found": scalar("SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND created_at >= ?",
+                             (ws, since)),
         "hot_found": scalar(
-            "SELECT COUNT(*) FROM leads WHERE created_at >= ? AND lead_priority = 'HOT'", (since,)
+            "SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND created_at >= ? "
+            "AND lead_priority = 'HOT'", (ws, since)
         ),
-        "searches_run": scalar("SELECT COUNT(*) FROM searches WHERE started_at >= ?", (since,)),
+        "searches_run": scalar("SELECT COUNT(*) FROM searches WHERE workspace_id = ? "
+                               "AND started_at >= ?", (ws, since)),
         "outreach": {r["type"]: r["n"] for r in interactions},
         "total_touchpoints": sum(r["n"] for r in interactions),
         "meetings_set": scalar(
-            "SELECT COUNT(*) FROM leads WHERE status = 'MEETING_SET' AND updated_at >= ?", (since,)
+            "SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND status = 'MEETING_SET' "
+            "AND updated_at >= ?", (ws, since)
         ),
         "deals_won": scalar(
-            "SELECT COUNT(*) FROM leads WHERE status = 'WON' AND updated_at >= ?", (since,)
+            "SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND status = 'WON' "
+            "AND updated_at >= ?", (ws, since)
         ),
         "by_niche": query(
             """SELECT niche,
                       COUNT(*) AS leads,
                       SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END) AS won,
                       SUM(CASE WHEN total_touchpoints > 0 THEN 1 ELSE 0 END) AS contacted
-               FROM leads WHERE niche IS NOT NULL GROUP BY niche ORDER BY leads DESC"""
+               FROM leads WHERE workspace_id = ? AND niche IS NOT NULL
+               GROUP BY niche ORDER BY leads DESC""", (ws,)
         ),
         "by_city": query(
             """SELECT city,
                       COUNT(*) AS leads,
                       SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END) AS won
-               FROM leads WHERE city IS NOT NULL GROUP BY city ORDER BY leads DESC"""
+               FROM leads WHERE workspace_id = ? AND city IS NOT NULL
+               GROUP BY city ORDER BY leads DESC""", (ws,)
         ),
         "cost_per_hot_lead": cost_per_hot_lead(),
     }
@@ -173,8 +200,9 @@ def cost_per_hot_lead() -> dict:
         "AND day >= ?", (month_start,)
     )
     hot = scalar(
-        "SELECT COUNT(*) FROM leads WHERE lead_priority = 'HOT' AND created_at >= ?",
-        (month_start,)
+        "SELECT COUNT(*) FROM leads WHERE workspace_id = ? AND lead_priority = 'HOT' "
+        "AND created_at >= ?",
+        (current_ws(), month_start)
     )
     return {
         "api_calls_this_month": calls,
@@ -191,10 +219,10 @@ def follow_ups_today():
         """SELECT id, business_name, city, phone, email, whatsapp, status, lead_score,
                   lead_priority, last_contacted_date, follow_up_date, total_touchpoints
            FROM leads
-           WHERE follow_up_date IS NOT NULL AND follow_up_date <= ?
+           WHERE workspace_id = ? AND follow_up_date IS NOT NULL AND follow_up_date <= ?
              AND status NOT IN ('WON','LOST')
            ORDER BY lead_score DESC""",
-        (today(),),
+        (current_ws(), today()),
     )
 
 
@@ -204,10 +232,10 @@ def follow_ups_overdue():
         """SELECT id, business_name, city, phone, email, status, lead_score, lead_priority,
                   last_contacted_date, follow_up_date
            FROM leads
-           WHERE follow_up_date IS NOT NULL AND follow_up_date < ?
+           WHERE workspace_id = ? AND follow_up_date IS NOT NULL AND follow_up_date < ?
              AND status NOT IN ('WON','LOST')
            ORDER BY follow_up_date ASC""",
-        (today(),),
+        (current_ws(), today()),
     )
 
 
@@ -218,9 +246,9 @@ def follow_ups_upcoming(days: int = 7):
         """SELECT id, business_name, city, phone, email, status, lead_score, lead_priority,
                   follow_up_date
            FROM leads
-           WHERE follow_up_date > ? AND follow_up_date <= ? AND status NOT IN ('WON','LOST')
+           WHERE workspace_id = ? AND follow_up_date > ? AND follow_up_date <= ? AND status NOT IN ('WON','LOST')
            ORDER BY follow_up_date ASC""",
-        (today(), horizon),
+        (current_ws(), today(), horizon),
     )
 
 
@@ -232,8 +260,9 @@ def follow_ups_suggested():
         """SELECT id, business_name, city, phone, email, whatsapp, status, lead_score,
                   lead_priority, last_contacted_date, total_touchpoints
            FROM leads
-           WHERE status = 'CONTACTED' AND last_contacted_date IS NOT NULL
-           ORDER BY last_contacted_date ASC"""
+           WHERE workspace_id = ? AND status = 'CONTACTED' AND last_contacted_date IS NOT NULL
+           ORDER BY last_contacted_date ASC""",
+        (current_ws(),),
     )
     now = datetime.now(timezone.utc)
     out = []

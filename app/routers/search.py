@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from .. import geo
 from ..config import settings
-from ..db import execute, query, query_one, utcnow
+from ..db import current_ws, execute, query, query_one, utcnow
 from ..fastjson import rows_response
 from ..providers import available_providers
 from ..quota import usage_summary
@@ -104,8 +104,8 @@ def geo_map(limit: int = Query(1000, ge=1, le=5000), priority: str | None = None
     Deliberately not the full lead row - a thousand complete records is a lot of
     payload to hand a map that only draws a dot and a label.
     """
-    where = ["lat IS NOT NULL", "lng IS NOT NULL"]
-    params: list = []
+    where = ["workspace_id = ?", "lat IS NOT NULL", "lng IS NOT NULL"]
+    params: list = [current_ws()]
     for column, value in (("lead_priority", priority), ("city", city), ("status", status)):
         if value:
             where.append(f"{column} = ?")
@@ -121,7 +121,8 @@ def geo_map(limit: int = Query(1000, ge=1, le=5000), priority: str | None = None
 
 @router.get("/search/history")
 def history(limit: int = Query(30, le=200)):
-    rows = query("SELECT * FROM searches ORDER BY id DESC LIMIT ?", (limit,))
+    rows = query("SELECT * FROM searches WHERE workspace_id = ? ORDER BY id DESC LIMIT ?",
+                 (current_ws(), limit))
     for row in rows:
         row["from_cache"] = bool(row.get("cached_from"))
     return rows
@@ -146,7 +147,8 @@ def preview(niche: str, city: str, area: str = "", country: str = ""):
 
 @router.get("/search/{search_id}/status")
 def status(search_id: int):
-    row = query_one("SELECT * FROM searches WHERE id = ?", (search_id,))
+    row = query_one("SELECT * FROM searches WHERE id = ? AND workspace_id = ?",
+                    (search_id, current_ws()))
     if not row:
         raise HTTPException(404, "Search not found")
     # A cache hit reused a previous search's leads; list those, not (there would
@@ -155,8 +157,8 @@ def status(search_id: int):
     if row["status"] == "COMPLETED":
         row["leads"] = query(
             "SELECT id, business_name, phone, website_url, lead_score, lead_priority, city "
-            "FROM leads WHERE search_id = ? ORDER BY lead_score DESC",
-            (effective_id,),
+            "FROM leads WHERE workspace_id = ? AND search_id = ? ORDER BY lead_score DESC",
+            (current_ws(), effective_id),
         )
     row["from_cache"] = bool(row.get("cached_from"))
     row["cache_source_search_id"] = row.get("cached_from")
@@ -170,10 +172,10 @@ def cancel(search_id: int):
 
 @router.get("/coverage")
 def coverage(country: str | None = None):
-    where, params = ("", ())
+    where, params = " WHERE workspace_id = ?", [current_ws()]
     if country:
-        where, params = " WHERE country = ?", (country,)
-    rows = query(f"SELECT * FROM search_coverage{where} ORDER BY city, niche", params)
+        where, params = " WHERE workspace_id = ? AND country = ?", [current_ws(), country]
+    rows = query(f"SELECT * FROM search_coverage{where} ORDER BY city, niche", tuple(params))
     for row in rows:
         row["status"] = coverage_status(row)
     cities = sorted({r["city"] for r in rows})
@@ -183,7 +185,8 @@ def coverage(country: str | None = None):
 
 @router.get("/coverage/{city}")
 def coverage_for_city(city: str):
-    rows = query("SELECT * FROM search_coverage WHERE city = ? ORDER BY niche", (city,))
+    rows = query("SELECT * FROM search_coverage WHERE workspace_id = ? AND city = ? "
+                 "ORDER BY niche", (current_ws(), city))
     for row in rows:
         row["status"] = coverage_status(row)
     return rows
@@ -212,7 +215,8 @@ class TargetPayload(BaseModel):
 
 @router.get("/targets")
 def list_targets():
-    rows = query("SELECT * FROM targets ORDER BY is_active DESC, city, niche")
+    rows = query("SELECT * FROM targets WHERE workspace_id = ? ORDER BY is_active DESC, "
+                 "city, niche", (current_ws(),))
     for row in rows:
         row["coverage"] = get_coverage(row["niche"], row["city"], row["area"], row["country"])
     return rows
@@ -224,34 +228,41 @@ def add_target(payload: TargetPayload):
         raise HTTPException(400, "auto_search must be daily, weekly, monthly or manual")
     execute(
         """INSERT IGNORE INTO targets
-           (niche, city, area, country, max_results, is_active, auto_search,
+           (workspace_id, niche, city, area, country, max_results, is_active, auto_search,
             next_search_date, created_at)
-           VALUES(?,?,?,?,?,1,?,CURDATE(),?)""",
-        (payload.niche.strip(), payload.city.strip(), payload.area.strip(),
+           VALUES(?,?,?,?,?,?,1,?,CURDATE(),?)""",
+        (current_ws(), payload.niche.strip(), payload.city.strip(), payload.area.strip(),
          payload.country.strip(), payload.max_results, payload.auto_search, utcnow()),
     )
     return query_one(
-        "SELECT * FROM targets WHERE niche = ? AND city = ? AND area = ? AND country = ?",
-        (payload.niche.strip(), payload.city.strip(), payload.area.strip(),
+        "SELECT * FROM targets WHERE workspace_id = ? AND niche = ? AND city = ? "
+        "AND area = ? AND country = ?",
+        (current_ws(), payload.niche.strip(), payload.city.strip(), payload.area.strip(),
          payload.country.strip()),
     )
 
 
 @router.patch("/targets/{target_id}")
 def toggle_target(target_id: int, is_active: bool):
-    execute("UPDATE targets SET is_active = ? WHERE id = ?", (1 if is_active else 0, target_id))
-    return query_one("SELECT * FROM targets WHERE id = ?", (target_id,))
+    execute("UPDATE targets SET is_active = ? WHERE id = ? AND workspace_id = ?",
+            (1 if is_active else 0, target_id, current_ws()))
+    row = query_one("SELECT * FROM targets WHERE id = ? AND workspace_id = ?",
+                    (target_id, current_ws()))
+    if not row:
+        raise HTTPException(404, "Target not found")
+    return row
 
 
 @router.delete("/targets/{target_id}")
 def delete_target(target_id: int):
-    execute("DELETE FROM targets WHERE id = ?", (target_id,))
+    execute("DELETE FROM targets WHERE id = ? AND workspace_id = ?", (target_id, current_ws()))
     return {"deleted": target_id}
 
 
 @router.post("/targets/{target_id}/search-now")
 def search_now(target_id: int, request: Request):
-    target = query_one("SELECT * FROM targets WHERE id = ?", (target_id,))
+    target = query_one("SELECT * FROM targets WHERE id = ? AND workspace_id = ?",
+                       (target_id, current_ws()))
     if not target:
         raise HTTPException(404, "Target not found")
     user = getattr(request.state, "user", None)
@@ -265,5 +276,6 @@ def search_now(target_id: int, request: Request):
         country=target["country"] or "", max_results=max_results_for(user, target["max_results"]),
         triggered_by="target", user_id=user["id"],
     )
-    execute("UPDATE targets SET last_searched = ? WHERE id = ?", (utcnow(), target_id))
+    execute("UPDATE targets SET last_searched = ? WHERE id = ? AND workspace_id = ?",
+            (utcnow(), target_id, current_ws()))
     return {"search_id": search_id}

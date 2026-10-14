@@ -154,12 +154,18 @@ kickoff checklist today.
 
 
 def seed_templates() -> None:
+    """Seed the built-in templates into the current workspace."""
+    from .db import current_ws
+
+    workspace_id = current_ws()
     for tpl in TEMPLATES:
         execute(
             """INSERT IGNORE INTO templates
-               (name, type, stage, subject, body, language, target_market, created_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
+               (workspace_id, name, type, stage, subject, body, language, target_market,
+                created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
             (
+                workspace_id,
                 tpl["name"],
                 tpl["type"],
                 tpl["stage"],

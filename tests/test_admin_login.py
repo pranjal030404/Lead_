@@ -1,10 +1,11 @@
 """Admin door tests: the dedicated /admin login page and its role-gated
 endpoint.
 
-Covers: page is public and served, admin login accepts admins only (regular
-users get the same 401 as a bad password), admin-minted tokens resolve on
+Covers: page is public and served, admin login accepts admins only (a regular
+user's correct credentials get a 403 pointing at /login, while a wrong password
+is indistinguishable from an unknown user), admin-minted tokens resolve on
 /admin paths while user-minted tokens do not, and signed-in regular users are
-redirected away from /admin.
+redirected from /admin to /login.
 
 Environment and the isolated MySQL test database are set up in
 tests/conftest.py.
@@ -77,6 +78,28 @@ def test_admin_page_redirects_signed_in_admin_to_app():
         assert response.headers["location"] == "/"
 
 
+def test_login_page_sends_signed_in_admin_to_admin_console():
+    with _client() as client:
+        client.post("/api/auth/admin/login", json={
+            "username": config.settings.admin_user,
+            "password": config.settings.admin_password,
+        })
+        response = client.get("/login", follow_redirects=False)
+        assert response.status_code == 302
+        assert response.headers["location"] == "/admin"
+
+
+def test_login_page_sends_signed_in_regular_user_to_app():
+    _make_user("everyday", "day-pass", "user")
+    with _client() as client:
+        client.post("/api/auth/login", json={
+            "username": "everyday", "password": "day-pass",
+        })
+        response = client.get("/login", follow_redirects=False)
+        assert response.status_code == 302
+        assert response.headers["location"] == "/"
+
+
 # -------------------------------------------------------------- endpoint --
 
 
@@ -99,19 +122,25 @@ def test_admin_login_accepts_admin():
         assert response.status_code == 200
 
 
-def test_admin_login_rejects_regular_user_indistinguishably():
-    """A regular user's CORRECT credentials must fail exactly like a wrong
-    password - the endpoint must not confirm which usernames exist."""
+def test_admin_login_rejects_regular_user_as_wrong_password():
+    """A regular user's CORRECT credentials must not open the admin console, and
+    a wrong password must be indistinguishable from an unknown user."""
     _make_user("peon", "correct-horse", "user")
     with _client() as client:
         wrong_pw = client.post("/api/auth/admin/login", json={
             "username": "peon", "password": "wrong",
         })
+        unknown = client.post("/api/auth/admin/login", json={
+            "username": "ghost", "password": "whatever",
+        })
+        assert wrong_pw.status_code == unknown.status_code == 401
+        assert wrong_pw.json() == unknown.json()
+
         right_pw = client.post("/api/auth/admin/login", json={
             "username": "peon", "password": "correct-horse",
         })
-        assert wrong_pw.status_code == right_pw.status_code == 401
-        assert wrong_pw.json() == right_pw.json()
+        assert right_pw.status_code == 403
+        assert "/login" in right_pw.json()["detail"]
 
 
 def test_regular_login_still_works_for_every_role():
@@ -144,7 +173,7 @@ def test_tokens_are_role_agnostic_by_design():
     assert verify_token(token) == "someuser"
 
 
-def test_admin_console_blocks_signed_in_regular_users():
+def test_admin_console_sends_signed_in_regular_users_to_login():
     _make_user("sneaky", "sneak-pass", "user")
     with _client() as client:
         client.post("/api/auth/login", json={
@@ -152,7 +181,7 @@ def test_admin_console_blocks_signed_in_regular_users():
         })
         response = client.get("/admin", follow_redirects=False)
         assert response.status_code == 302
-        assert response.headers["location"] == "/"
+        assert response.headers["location"] == "/login"
 
 
 def test_existing_session_survives_after_admin_login_adds_nothing():

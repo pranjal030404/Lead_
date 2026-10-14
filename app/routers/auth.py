@@ -4,8 +4,8 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from ..config import settings
-from ..security import (SESSION_COOKIE, authenticate_user, client_ip, issue_token,
-                        rate_limit)
+from ..security import (SESSION_COOKIE, account_status, authenticate_user, client_ip,
+                        issue_token, normalize_username, rate_limit)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -40,17 +40,34 @@ def _login_with_role_floor(payload: LoginPayload, request: Request,
             f"Too many login attempts. Wait {settings.login_rate_window // 60} minutes.",
         )
 
-    user = authenticate_user(payload.username, payload.password)
+    username = normalize_username(payload.username)
+    user = authenticate_user(username, payload.password)
     if not user:
+        # A wrong password/deactivated account gets the same 401 as an unknown
+        # user, so neither door lets an attacker enumerate accounts. The public
+        # sign-in door is allowed to be helpful about a deactivated account: it
+        # is the usual reason a just-created login appears to "not work", and the
+        # generic message sends people chasing a password they never got wrong.
+        if role_floor is None and account_status(username) == "inactive":
+            raise HTTPException(
+                403,
+                "This account has been deactivated. Ask an administrator to re-enable it.",
+            )
         raise HTTPException(401, "Invalid username or password")
 
     if role_floor:
         level = {"user": 0, "admin": 1, "superadmin": 2}.get(user.get("role"), 0)
         floor = {"admin": 1, "superadmin": 2}.get(role_floor, 0)
         if level < floor:
-            # Deliberately the same message as a bad password: the endpoint
-            # must not reveal whether the account exists or what role it has.
-            raise HTTPException(401, "Invalid username or password")
+            # The credentials are correct - this is the account's own owner - so
+            # telling them which door to use leaks nothing an attacker could not
+            # already learn by guessing a password. Without it, a plain user
+            # handed the /admin URL sees "Invalid username or password" and
+            # concludes their freshly created account doesn't work.
+            raise HTTPException(
+                403,
+                "This page is for administrators. Please sign in at /login.",
+            )
 
     _set_session_cookie(response, issue_token(user["username"]))
     return {"ok": True, "user": user}
@@ -65,8 +82,9 @@ def login(payload: LoginPayload, request: Request, response: Response):
 @router.post("/admin/login")
 def admin_login(payload: LoginPayload, request: Request, response: Response):
     """Sign-in for the /admin console. Accepts admin and superadmin accounts
-    only - a regular user's correct credentials are rejected with the same
-    401 as a wrong password, so the endpoint leaks nothing."""
+    only. Wrong credentials get the same 401 as anywhere else; a regular user's
+    *correct* credentials get a 403 pointing them at /login, because telling the
+    account's own owner which door to use leaks nothing."""
     return _login_with_role_floor(payload, request, response, role_floor="admin")
 
 

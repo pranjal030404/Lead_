@@ -14,10 +14,10 @@ import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from . import http
+from . import emailintel, http
 from .config import settings
-from .db import (execute, log_automation, log_failure, query, query_one, scalar,
-                 utcnow)
+from .db import (current_ws, execute, log_automation, log_failure, query, query_one,
+                 scalar, utcnow, workspace_context)
 from .scoring import observation_for, website_issue_for
 
 RESEND_URL = "https://api.resend.com/emails"
@@ -36,22 +36,24 @@ def is_suppressed(value: str | None, kind: str = "email") -> bool:
     if not value:
         return False
     return bool(query_one(
-        "SELECT 1 AS x FROM suppression_list WHERE LOWER(value) = LOWER(?) AND kind = ?",
-        (value.strip(), kind),
+        "SELECT 1 AS x FROM suppression_list WHERE workspace_id = ? "
+        "AND LOWER(value) = LOWER(?) AND kind = ?",
+        (current_ws(), value.strip(), kind),
     ))
 
 
 def suppress(value: str, kind: str = "email", reason: str = "manual") -> None:
     execute(
-        "INSERT IGNORE INTO suppression_list(value, kind, reason, created_at) "
-        "VALUES(?,?,?,?)",
-        (value.strip(), kind, reason, utcnow()),
+        "INSERT IGNORE INTO suppression_list(workspace_id, value, kind, reason, created_at) "
+        "VALUES(?,?,?,?,?)",
+        (current_ws(), value.strip(), kind, reason, utcnow()),
     )
     log_automation("suppression", f"Suppressed {kind} {value} ({reason})")
 
 
 def unsuppress(value: str, kind: str = "email") -> None:
-    execute("DELETE FROM suppression_list WHERE value = ? AND kind = ?", (value, kind))
+    execute("DELETE FROM suppression_list WHERE workspace_id = ? AND value = ? AND kind = ?",
+            (current_ws(), value, kind))
 
 
 # --------------------------------------------------------------- templates --
@@ -91,8 +93,10 @@ def merge_context(lead: dict) -> dict:
 
 
 def settings_value(key: str, default: str) -> str:
-    from .db import get_setting
+    from .db import current_ws_or_none, get_ws_setting, get_setting
 
+    if current_ws_or_none() is not None:
+        return get_ws_setting(key) or default
     return get_setting(key) or default
 
 
@@ -115,7 +119,8 @@ def render(text: str | None, context: dict) -> str:
 
 
 def render_template(template_name: str, lead: dict) -> dict:
-    template = query_one("SELECT * FROM templates WHERE name = ?", (template_name,))
+    template = query_one("SELECT * FROM templates WHERE workspace_id = ? AND name = ?",
+                         (current_ws(), template_name))
     if not template:
         raise ValueError(f"Template '{template_name}' not found")
     context = merge_context(lead)
@@ -141,24 +146,29 @@ def whatsapp_link(lead: dict, message: str) -> str | None:
 # ---------------------------------------------------------- approval queue --
 
 def queue_message(lead: dict, template_name: str, step: str, channel: str = "email") -> int | None:
+    if lead.get("workspace_id") != current_ws():
+        raise PermissionError("lead belongs to a different workspace")
     rendered = render_template(template_name, lead)
     to_address = lead.get("email") if channel == "email" else lead.get("whatsapp")
     if channel == "email" and (not to_address or is_suppressed(to_address)):
         return None
+    if channel == "email" and emailintel.email_blocked(lead["id"], to_address):
+        return None
 
     existing = query_one(
-        "SELECT id FROM approval_queue WHERE lead_id = ? AND step = ? AND status IN "
-        "('PENDING','APPROVED','SENT')",
-        (lead["id"], step),
+        "SELECT id FROM approval_queue WHERE workspace_id = ? AND lead_id = ? AND step = ? "
+        "AND status IN ('PENDING','APPROVED','SENT')",
+        (current_ws(), lead["id"], step),
     )
     if existing:
         return None
 
     return execute(
         """INSERT INTO approval_queue
-           (lead_id, channel, template_name, step, to_address, subject, body, status, created_at)
-           VALUES(?,?,?,?,?,?,?,'PENDING',?)""",
-        (lead["id"], channel, template_name, step, to_address,
+           (workspace_id, lead_id, channel, template_name, step, to_address, subject, body,
+            status, created_at)
+           VALUES(?,?,?,?,?,?,?,?,'PENDING',?)""",
+        (current_ws(), lead["id"], channel, template_name, step, to_address,
          rendered["subject"], rendered["body"], utcnow()),
     )
 
@@ -176,9 +186,10 @@ def _days_since(value: str | None) -> int | None:
 
 
 def generate_followups() -> dict:
-    """Generation only - never sends. Part 8.5."""
+    """Generation only - never sends. Part 8.5. Acts on the current workspace."""
     generated, lost = 0, 0
-    leads = query("SELECT * FROM leads WHERE status = 'CONTACTED' AND last_contacted_date IS NOT NULL")
+    leads = query("SELECT * FROM leads WHERE workspace_id = ? AND status = 'CONTACTED' "
+                  "AND last_contacted_date IS NOT NULL", (current_ws(),))
 
     for lead in leads:
         days = _days_since(lead["last_contacted_date"])
@@ -189,8 +200,9 @@ def generate_followups() -> dict:
             execute(
                 "UPDATE leads SET status = 'LOST', "
                 "notes = CONCAT(COALESCE(notes,''), ?), updated_at = ? "
-                "WHERE id = ?",
-                (f"\n[auto] No response after {GIVE_UP_DAYS} days.", utcnow(), lead["id"]),
+                "WHERE id = ? AND workspace_id = ?",
+                (f"\n[auto] No response after {GIVE_UP_DAYS} days.", utcnow(), lead["id"],
+                 current_ws()),
             )
             lost += 1
             continue
@@ -221,14 +233,16 @@ def generate_followups() -> dict:
 
 def set_approval_status(queue_id: int, status: str) -> None:
     execute(
-        "UPDATE approval_queue SET status = ?, reviewed_at = ? WHERE id = ?",
-        (status, utcnow(), queue_id),
+        "UPDATE approval_queue SET status = ?, reviewed_at = ? WHERE id = ? AND workspace_id = ?",
+        (status, utcnow(), queue_id, current_ws()),
     )
 
 
 # ------------------------------------------------------------------ sending --
 
 def sent_last_hour() -> int:
+    """Emails sent in the last hour across ALL workspaces, on purpose: the cap
+    protects the shared sending domain/API key, which every tenant draws on."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
     return int(scalar(
         "SELECT COUNT(*) FROM approval_queue WHERE status = 'SENT' AND sent_at >= ?", (cutoff,)
@@ -301,9 +315,10 @@ def log_interaction(lead_id: int, kind: str, subject: str, content: str,
     now = utcnow()
     execute(
         """INSERT INTO interactions
-           (lead_id, type, direction, date, subject, content, outcome, automated, created_at)
-           VALUES(?,?,'out',?,?,?,?,?,?)""",
-        (lead_id, kind, now, subject, content, outcome, 1 if automated else 0, now),
+           (workspace_id, lead_id, type, direction, date, subject, content, outcome,
+            automated, created_at)
+           VALUES(?,?,?,'out',?,?,?,?,?,?)""",
+        (current_ws(), lead_id, kind, now, subject, content, outcome, 1 if automated else 0, now),
     )
     execute(
         """UPDATE leads SET
@@ -313,13 +328,18 @@ def log_interaction(lead_id: int, kind: str, subject: str, content: str,
              total_touchpoints = total_touchpoints + 1,
              contact_method = ?,
              updated_at = ?
-           WHERE id = ?""",
-        (now, now, kind, now, lead_id),
+           WHERE id = ? AND workspace_id = ?""",
+        (now, now, kind, now, lead_id, current_ws()),
     )
 
 
-def send_approved(limit: int | None = None) -> dict:
-    """Send APPROVED email rows, respecting the hourly cap."""
+def send_approved(limit: int | None = None, workspace_id: int | None = None) -> dict:
+    """Send APPROVED email rows, respecting the (shared) hourly cap.
+
+    `workspace_id` limits sending to one tenant (the API passes the caller's).
+    None means every workspace - only the scheduler uses that. Each row is sent
+    inside its own workspace so suppression and logging use that tenant's data.
+    """
     budget = settings.max_emails_per_hour - sent_last_hour()
     if budget <= 0:
         return {"sent": 0, "failed": 0, "skipped": 0,
@@ -327,40 +347,25 @@ def send_approved(limit: int | None = None) -> dict:
     if limit:
         budget = min(budget, limit)
 
+    scope, params = "", [budget]
+    if workspace_id is not None:
+        scope, params = " AND workspace_id = ?", [workspace_id, budget]
     rows = query(
-        "SELECT * FROM approval_queue WHERE status = 'APPROVED' AND channel = 'email' "
-        "ORDER BY id LIMIT ?",
-        (budget,),
+        "SELECT * FROM approval_queue WHERE status = 'APPROVED' AND channel = 'email'"
+        f"{scope} ORDER BY id LIMIT ?",
+        tuple(params),
     )
     sent = failed = skipped = 0
 
     for row in rows:
-        if is_suppressed(row["to_address"]):
-            execute(
-                "UPDATE approval_queue SET status = 'SKIPPED', error_message = ? WHERE id = ?",
-                ("recipient suppressed at send time", row["id"]),
-            )
-            skipped += 1
-            continue
-
-        result = send_email(row["to_address"], row["subject"], row["body"])
-        if result.get("ok"):
-            execute(
-                "UPDATE approval_queue SET status = 'SENT', sent_at = ? WHERE id = ?",
-                (utcnow(), row["id"]),
-            )
-            log_interaction(
-                row["lead_id"], "email", row["subject"], row["body"],
-                outcome="dry-run" if result.get("dry_run") else "sent",
-            )
+        with workspace_context(row["workspace_id"]):
+            outcome = _send_row(row)
+        if outcome == "sent":
             sent += 1
-        else:
-            execute(
-                "UPDATE approval_queue SET status = 'FAILED', error_message = ? WHERE id = ?",
-                (result.get("error"), row["id"]),
-            )
-            log_failure("outreach.send", result.get("error", "unknown"), row["lead_id"])
+        elif outcome == "failed":
             failed += 1
+        else:
+            skipped += 1
 
     if sent:
         log_automation(
@@ -368,3 +373,44 @@ def send_approved(limit: int | None = None) -> dict:
             f"Sent {sent} approved message(s)" + (" (dry run)" if settings.dry_run else ""),
         )
     return {"sent": sent, "failed": failed, "skipped": skipped, "dry_run": settings.dry_run}
+
+
+def _send_row(row: dict) -> str:
+    """Send one approved row. Caller has entered the row's workspace."""
+    wid = row["workspace_id"]
+    if is_suppressed(row["to_address"]):
+        execute(
+            "UPDATE approval_queue SET status = 'SKIPPED', error_message = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            ("recipient suppressed at send time", row["id"], wid),
+        )
+        return "skipped"
+
+    blocked = emailintel.email_blocked(row["lead_id"], row["to_address"])
+    if blocked:
+        execute(
+            "UPDATE approval_queue SET status = 'SKIPPED', error_message = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (f"recipient blocked at send time: {blocked}", row["id"], wid),
+        )
+        return "skipped"
+
+    result = send_email(row["to_address"], row["subject"], row["body"])
+    if result.get("ok"):
+        execute(
+            "UPDATE approval_queue SET status = 'SENT', sent_at = ? "
+            "WHERE id = ? AND workspace_id = ?",
+            (utcnow(), row["id"], wid),
+        )
+        log_interaction(
+            row["lead_id"], "email", row["subject"], row["body"],
+            outcome="dry-run" if result.get("dry_run") else "sent",
+        )
+        return "sent"
+    execute(
+        "UPDATE approval_queue SET status = 'FAILED', error_message = ? "
+        "WHERE id = ? AND workspace_id = ?",
+        (result.get("error"), row["id"], wid),
+    )
+    log_failure("outreach.send", result.get("error", "unknown"), row["lead_id"])
+    return "failed"

@@ -121,6 +121,19 @@ class Settings:
     hunter_api_key = _str("HUNTER_API_KEY")
     max_hunter_calls_per_month = _int("MAX_HUNTER_CALLS_PER_MONTH", 25)
 
+    # deep website audit (Phase 4). Cheapest-first: only leads that already look
+    # worth pitching (score >= min) get the multi-request audit, and a recent
+    # audit is reused for `website_cache_days`.
+    deep_audit_enabled = _bool("DEEP_AUDIT_ENABLED", True)
+    deep_audit_min_score = _int("DEEP_AUDIT_MIN_SCORE", 5)
+    audit_max_link_checks = _int("AUDIT_MAX_LINK_CHECKS", 8)
+    audit_rate_limit = _int("AUDIT_RATE_LIMIT", 20)       # manual audits per window
+    audit_rate_window = _int("AUDIT_RATE_WINDOW", 600)
+    # Optional Google PageSpeed Insights key: the only source of real LCP / CLS /
+    # TBT lab data. Without it those checks report "unavailable", never a guess.
+    pagespeed_api_key = _str("PAGESPEED_API_KEY")
+    max_pagespeed_calls_per_day = _int("MAX_PAGESPEED_CALLS_PER_DAY", 100)
+
     # outreach
     dry_run = _bool("DRY_RUN", True)
     resend_api_key = _str("RESEND_API_KEY")

@@ -4,7 +4,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..config import settings
-from ..db import execute, get_setting, query, query_one, set_setting, utcnow
+from ..db import (current_ws, execute, get_ws_setting, query, query_one, set_ws_setting,
+                  utcnow)
 from ..outreach import (generate_followups, queue_message, send_approved,
                         set_approval_status, suppress, unsuppress)
 
@@ -26,45 +27,59 @@ class TemplatePayload(BaseModel):
 @router.get("/templates")
 def list_templates(type: str | None = None):
     if type:
-        return query("SELECT * FROM templates WHERE type = ? ORDER BY name", (type,))
-    return query("SELECT * FROM templates ORDER BY type, name")
+        return query("SELECT * FROM templates WHERE workspace_id = ? AND type = ? ORDER BY name",
+                     (current_ws(), type))
+    return query("SELECT * FROM templates WHERE workspace_id = ? ORDER BY type, name",
+                 (current_ws(),))
 
 
 @router.post("/templates")
 def upsert_template(payload: TemplatePayload):
-    existing = query_one("SELECT id FROM templates WHERE name = ?", (payload.name,))
+    existing = query_one("SELECT id FROM templates WHERE workspace_id = ? AND name = ?",
+                         (current_ws(), payload.name))
     if existing:
         execute(
             "UPDATE templates SET type = ?, stage = ?, subject = ?, body = ?, "
-            "target_market = ?, language = ? WHERE id = ?",
+            "target_market = ?, language = ? WHERE id = ? AND workspace_id = ?",
             (payload.type, payload.stage, payload.subject, payload.body,
-             payload.target_market, payload.language, existing["id"]),
+             payload.target_market, payload.language, existing["id"], current_ws()),
         )
     else:
         execute(
-            """INSERT INTO templates(name, type, stage, subject, body, language,
-               target_market, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-            (payload.name, payload.type, payload.stage, payload.subject, payload.body,
+            """INSERT INTO templates(workspace_id, name, type, stage, subject, body, language,
+               target_market, created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (current_ws(), payload.name, payload.type, payload.stage, payload.subject, payload.body,
              payload.language, payload.target_market, utcnow()),
         )
-    return query_one("SELECT * FROM templates WHERE name = ?", (payload.name,))
+    return query_one("SELECT * FROM templates WHERE workspace_id = ? AND name = ?",
+                     (current_ws(), payload.name))
 
 
 @router.delete("/templates/{template_id}")
 def delete_template(template_id: int):
-    execute("DELETE FROM templates WHERE id = ?", (template_id,))
+    execute("DELETE FROM templates WHERE id = ? AND workspace_id = ?",
+            (template_id, current_ws()))
     return {"deleted": template_id}
 
 
 # ---------------------------------------------------------- approval queue --
+
+def _own_queue(queue_id: int) -> dict:
+    row = query_one("SELECT * FROM approval_queue WHERE id = ? AND workspace_id = ?",
+                    (queue_id, current_ws()))
+    if not row:
+        raise HTTPException(404, "Queued message not found")
+    return row
+
 
 @router.get("/approvals")
 def list_approvals(status: str = "PENDING", limit: int = Query(100, le=500)):
     return query(
         """SELECT q.*, l.business_name, l.city, l.lead_priority, l.lead_score, l.phone
            FROM approval_queue q JOIN leads l ON l.id = q.lead_id
-           WHERE q.status = ? ORDER BY l.lead_score DESC, q.id ASC LIMIT ?""",
-        (status, limit),
+           WHERE q.workspace_id = ? AND q.status = ?
+           ORDER BY l.lead_score DESC, q.id ASC LIMIT ?""",
+        (current_ws(), status, limit),
     )
 
 
@@ -75,27 +90,27 @@ class ApprovalEdit(BaseModel):
 
 @router.patch("/approvals/{queue_id}")
 def edit_approval(queue_id: int, payload: ApprovalEdit):
-    row = query_one("SELECT * FROM approval_queue WHERE id = ?", (queue_id,))
-    if not row:
-        raise HTTPException(404, "Queued message not found")
+    row = _own_queue(queue_id)
     if row["status"] not in ("PENDING", "APPROVED"):
         raise HTTPException(400, f"Cannot edit a message that is already {row['status']}")
     execute(
         "UPDATE approval_queue SET subject = COALESCE(?, subject), body = COALESCE(?, body) "
-        "WHERE id = ?",
-        (payload.subject, payload.body, queue_id),
+        "WHERE id = ? AND workspace_id = ?",
+        (payload.subject, payload.body, queue_id, current_ws()),
     )
-    return query_one("SELECT * FROM approval_queue WHERE id = ?", (queue_id,))
+    return _own_queue(queue_id)
 
 
 @router.post("/approvals/{queue_id}/approve")
 def approve(queue_id: int):
+    _own_queue(queue_id)
     set_approval_status(queue_id, "APPROVED")
     return {"id": queue_id, "status": "APPROVED"}
 
 
 @router.post("/approvals/{queue_id}/skip")
 def skip(queue_id: int):
+    _own_queue(queue_id)
     set_approval_status(queue_id, "SKIPPED")
     return {"id": queue_id, "status": "SKIPPED"}
 
@@ -120,7 +135,8 @@ class QueuePayload(BaseModel):
 
 @router.post("/approvals/queue")
 def queue_one(payload: QueuePayload):
-    lead = query_one("SELECT * FROM leads WHERE id = ?", (payload.lead_id,))
+    lead = query_one("SELECT * FROM leads WHERE id = ? AND workspace_id = ?",
+                     (payload.lead_id, current_ws()))
     if not lead:
         raise HTTPException(404, "Lead not found")
     queue_id = queue_message(lead, payload.template, payload.step, payload.channel)
@@ -140,7 +156,7 @@ def generate_now():
 
 @router.post("/approvals/send")
 def send_now(limit: int | None = None):
-    return send_approved(limit)
+    return send_approved(limit, workspace_id=current_ws())
 
 
 # ------------------------------------------------------------- suppression --
@@ -153,7 +169,8 @@ class SuppressPayload(BaseModel):
 
 @router.get("/suppression")
 def list_suppression():
-    return query("SELECT * FROM suppression_list ORDER BY id DESC")
+    return query("SELECT * FROM suppression_list WHERE workspace_id = ? ORDER BY id DESC",
+                 (current_ws(),))
 
 
 @router.post("/suppression")
@@ -182,8 +199,8 @@ def get_identity():
 
     brand = get_branding()
     return {
-        "company_name": get_setting("company_name", "") or brand_company_name(),
-        "portfolio_url": get_setting("portfolio_url", "https://example.com/work"),
+        "company_name": get_ws_setting("company_name", "") or brand_company_name(),
+        "portfolio_url": get_ws_setting("portfolio_url", "https://example.com/work"),
         "sender_name": settings.mail_from_name,
         "sender_email": settings.mail_from,
         "dry_run": settings.dry_run,
@@ -194,7 +211,7 @@ def get_identity():
 @router.post("/identity")
 def save_identity(payload: IdentityPayload):
     if payload.company_name:
-        set_setting("company_name", payload.company_name)
+        set_ws_setting("company_name", payload.company_name)
     if payload.portfolio_url:
-        set_setting("portfolio_url", payload.portfolio_url)
+        set_ws_setting("portfolio_url", payload.portfolio_url)
     return get_identity()

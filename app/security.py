@@ -40,23 +40,49 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(hash_password(password, salt), stored)
 
 
+def normalize_username(username: str | None) -> str:
+    """The canonical form of a username, as stored by the users API.
+
+    Creation trims the username before it is written, so login must trim too:
+    otherwise an account created as "john" can never be reached by signing in
+    with " john " - a stray space (easy to pick up from an autofilled or pasted
+    value) silently fails as "Invalid username or password".
+    """
+    return (username or "").strip()
+
+
 def load_user(username: str) -> dict | None:
     """Full safe user row (password hash stripped) for this login."""
     user = query_one(
         "SELECT id, username, full_name, email, role, is_active FROM users WHERE username = ?",
-        (username,),
+        (normalize_username(username),),
     )
     return user if user else None
 
 
 def authenticate_user(username: str, password: str) -> dict | None:
     """Check a login against the users table. Returns the safe row, or None."""
+    normalized = normalize_username(username)
     user = query_one(
-        "SELECT * FROM users WHERE username = ? AND is_active = 1", (username or "",)
+        "SELECT * FROM users WHERE username = ? AND is_active = 1", (normalized,)
     )
     if not user or not verify_password(password or "", user["password_hash"]):
         return None
-    return load_user(username)
+    return load_user(normalized)
+
+
+def account_status(username: str) -> str | None:
+    """Why a username can't sign in, for a clearer message than a wrong password.
+
+    Returns "active", "inactive" or None (no such account). The standard login
+    uses this to tell a deactivated account apart from a bad password - which is
+    what a freshly created, accidentally-inactive account otherwise looks like."""
+    row = query_one(
+        "SELECT is_active FROM users WHERE username = ?", (normalize_username(username),)
+    )
+    if not row:
+        return None
+    return "active" if row["is_active"] else "inactive"
 
 
 def require_role(*roles: str):

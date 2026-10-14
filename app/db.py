@@ -22,6 +22,7 @@ nothing to bind, so literal `%` in the SQL stays literal.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import threading
 import re
@@ -435,6 +436,39 @@ def today() -> str:
 
 _local = threading.local()
 
+# ------------------------------------------------------------ tenant scope --
+# The active workspace for the current request / job. Set by the auth middleware
+# for HTTP requests and by `workspace_context` for background work. Reading it
+# when unset raises NoWorkspace rather than returning a default: a code path that
+# forgot to establish a tenant must fail, never fall back to someone's data.
+# Note: plain threads do NOT inherit contextvars - background code must pass the
+# workspace id explicitly and enter `workspace_context` itself.
+_ws_var: contextvars.ContextVar[int | None] = contextvars.ContextVar("workspace_id", default=None)
+
+
+class NoWorkspace(RuntimeError):
+    """A tenant-scoped operation ran with no workspace established."""
+
+
+def current_ws() -> int:
+    wid = _ws_var.get()
+    if wid is None:
+        raise NoWorkspace("No workspace selected for this operation")
+    return wid
+
+
+def current_ws_or_none() -> int | None:
+    return _ws_var.get()
+
+
+@contextmanager
+def workspace_context(workspace_id: int) -> Iterator[int]:
+    token = _ws_var.set(int(workspace_id))
+    try:
+        yield int(workspace_id)
+    finally:
+        _ws_var.reset(token)
+
 
 class Conn(pymysql.connections.Connection):
     """PyMySQL connection that speaks the sqlite3 connection API too.
@@ -540,17 +574,32 @@ def set_setting(key: str, value: str) -> None:
     )
 
 
+def get_ws_setting(key: str, default: str | None = None) -> str | None:
+    """Per-workspace setting, falling back to the install-wide value."""
+    row = query_one("SELECT value FROM app_settings WHERE setting_key = ?",
+                    (f"ws:{current_ws()}:{key}",))
+    return row["value"] if row else get_setting(key, default)
+
+
+def set_ws_setting(key: str, value: str) -> None:
+    set_setting(f"ws:{current_ws()}:{key}", value)
+
+
 def log_automation(job: str, message: str, level: str = "info") -> None:
+    """workspace_id is NULL for system-level entries (backups, scheduler)."""
     execute(
-        "INSERT INTO automation_log(job, message, level, created_at) VALUES(?,?,?,?)",
-        (job, message, level, utcnow()),
+        "INSERT INTO automation_log(job, message, level, created_at, workspace_id) "
+        "VALUES(?,?,?,?,?)",
+        (job, message, level, utcnow(), current_ws_or_none()),
     )
 
 
 def log_failure(job: str, error: str, ref_id: int | None = None, payload: Any = None) -> None:
     execute(
-        "INSERT INTO failed_jobs(job, ref_id, error, payload, created_at) VALUES(?,?,?,?,?)",
-        (job, ref_id, str(error)[:2000], json.dumps(payload) if payload else None, utcnow()),
+        "INSERT INTO failed_jobs(job, ref_id, error, payload, created_at, workspace_id) "
+        "VALUES(?,?,?,?,?,?)",
+        (job, ref_id, str(error)[:2000], json.dumps(payload) if payload else None, utcnow(),
+         current_ws_or_none()),
     )
 
 
@@ -598,15 +647,537 @@ def _ensure_app_settings_updated_at(conn: Conn) -> None:
             cur.execute("ALTER TABLE app_settings ADD COLUMN updated_at VARCHAR(40) NULL")
 
 
+# ----------------------------------------------------- tenancy migrations --
+
+def _col_exists(cur, table: str, column: str) -> bool:
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+        (table, column),
+    )
+    return cur.fetchone()["n"] > 0
+
+
+def _index_exists(cur, table: str, name: str) -> bool:
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.statistics "
+        "WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?",
+        (table, name),
+    )
+    return cur.fetchone()["n"] > 0
+
+
+def _fk_exists(cur, table: str, name: str) -> bool:
+    cur.execute(
+        "SELECT COUNT(*) AS n FROM information_schema.table_constraints "
+        "WHERE table_schema = DATABASE() AND table_name = ? AND constraint_name = ? "
+        "AND constraint_type = 'FOREIGN KEY'",
+        (table, name),
+    )
+    return cur.fetchone()["n"] > 0
+
+
+def _create_tenancy_tables(conn: Conn) -> None:
+    """organizations / workspaces / workspace_members, plus a default org and
+    workspace that adopts every pre-existing user and row.
+
+    Rollback: DROP TABLE workspace_members, workspaces, organizations (after
+    running the rollback for migration 5, which depends on these)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS organizations (
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                name       VARCHAR(255) NOT NULL,
+                slug       VARCHAR(100) NOT NULL,
+                is_active  INT DEFAULT 1,
+                created_at VARCHAR(40),
+                UNIQUE KEY uq_org_slug (slug)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS workspaces (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                organization_id INT NOT NULL,
+                name            VARCHAR(255) NOT NULL,
+                slug            VARCHAR(100) NOT NULL,
+                is_active       INT DEFAULT 1,
+                created_at      VARCHAR(40),
+                UNIQUE KEY uq_ws_slug (organization_id, slug),
+                CONSTRAINT fk_ws_org FOREIGN KEY (organization_id)
+                    REFERENCES organizations(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
+        # `role` is the member's role *inside* the workspace (owner/admin/member).
+        # users.role stays the authority for what a person may do until the
+        # permission system lands.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS workspace_members (
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id INT NOT NULL,
+                user_id      INT NOT NULL,
+                role         VARCHAR(16) NOT NULL DEFAULT 'member',
+                created_at   VARCHAR(40),
+                UNIQUE KEY uq_ws_member (workspace_id, user_id),
+                KEY idx_member_user (user_id),
+                CONSTRAINT fk_member_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_member_user FOREIGN KEY (user_id)
+                    REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci""")
+        cur.execute("SELECT id FROM workspaces ORDER BY id LIMIT 1")
+        if cur.fetchone() is None:
+            now = utcnow()
+            cur.execute("INSERT INTO organizations(name, slug, created_at) VALUES(?,?,?)",
+                        ("Default Organization", "default", now))
+            org_id = cur.lastrowid
+            cur.execute(
+                "INSERT INTO workspaces(organization_id, name, slug, created_at) VALUES(?,?,?,?)",
+                (org_id, "Default Workspace", "default", now))
+        cur.execute("SELECT id FROM workspaces ORDER BY id LIMIT 1")
+        default_ws = cur.fetchone()["id"]
+        cur.execute(
+            """INSERT IGNORE INTO workspace_members(workspace_id, user_id, role, created_at)
+               SELECT ?, id, CASE role WHEN 'superadmin' THEN 'owner'
+                                       WHEN 'admin' THEN 'admin' ELSE 'member' END, ?
+               FROM users""",
+            (default_ws, utcnow()),
+        )
+
+
+# (table, old unique key to replace, new unique columns, derive workspace from
+#  the parent lead, nullable). Rows already in the database are adopted by the
+#  default workspace - the pre-tenancy behaviour was "everyone shares everything".
+_TENANT_TABLES = [
+    ("leads", "uq_leads_place_id", ("workspace_id", "place_id"), False, False),
+    ("interactions", None, None, True, False),
+    ("searches", None, None, False, False),
+    ("search_cache", "uq_cache_fingerprint", ("workspace_id", "fingerprint"), False, False),
+    ("search_coverage", "uq_coverage",
+     ("workspace_id", "city", "area", "niche", "country"), False, False),
+    ("targets", "uq_target", ("workspace_id", "niche", "city", "area", "country"), False, False),
+    ("templates", "uq_template_name", ("workspace_id", "name"), False, False),
+    ("suppression_list", "uq_suppression", ("workspace_id", "value", "kind"), False, False),
+    ("approval_queue", None, None, True, False),
+    ("failed_jobs", None, None, False, True),
+    ("automation_log", None, None, False, True),
+]
+
+
+def _add_workspace_scope(conn: Conn) -> None:
+    """Add workspace_id to every tenant table, backfill, tighten, re-key.
+
+    Idempotent and safe to re-run after a partial failure (MySQL DDL is not
+    transactional): each step checks current state first. Nothing is dropped
+    except the old unique key, and only after its replacement exists.
+
+    NOT NULL with *no default* is deliberate: an INSERT that forgets the tenant
+    errors instead of silently landing in workspace 1.
+
+    Rollback: for each table, drop FK fk_<table>_ws, the new unique key and
+    idx_<table>_ws, re-add the old unique key, then DROP COLUMN workspace_id.
+    (Rolling back after a second workspace holds data would merge tenants.)"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM workspaces ORDER BY id LIMIT 1")
+        default_ws = cur.fetchone()["id"]
+
+        for table, old_unique, new_cols, from_lead, nullable in _TENANT_TABLES:
+            if not _col_exists(cur, table, "workspace_id"):
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN workspace_id INT NULL")
+
+            if from_lead:
+                cur.execute(
+                    f"UPDATE {table} t JOIN leads l ON l.id = t.lead_id "
+                    "SET t.workspace_id = l.workspace_id WHERE t.workspace_id IS NULL"
+                )
+            if not nullable:
+                cur.execute(f"UPDATE {table} SET workspace_id = ? WHERE workspace_id IS NULL",
+                            (default_ws,))
+                cur.execute(f"ALTER TABLE {table} MODIFY workspace_id INT NOT NULL")
+
+            idx = f"idx_{table}_ws"
+            if not _index_exists(cur, table, idx):
+                cur.execute(f"ALTER TABLE {table} ADD KEY {idx} (workspace_id)")
+
+            if old_unique:
+                new_name = old_unique + "_ws"
+                if not _index_exists(cur, table, new_name):
+                    cols = ", ".join(new_cols)
+                    cur.execute(f"ALTER TABLE {table} ADD UNIQUE KEY {new_name} ({cols})")
+                if _index_exists(cur, table, old_unique):
+                    cur.execute(f"ALTER TABLE {table} DROP INDEX {old_unique}")
+
+            if not nullable:
+                fk = f"fk_{table}_ws"
+                if not _fk_exists(cur, table, fk):
+                    cur.execute(
+                        f"ALTER TABLE {table} ADD CONSTRAINT {fk} FOREIGN KEY (workspace_id) "
+                        "REFERENCES workspaces(id) ON DELETE CASCADE"
+                    )
+
+
+def _create_intel_tables(conn: Conn) -> None:
+    """Data-intelligence tables: field lineage, decision-maker contacts, email
+    addresses (with classification) and social profiles; plus freshness /
+    confidence columns on leads. All tenant-scoped, all cascade with the lead.
+
+    Rollback: DROP TABLE social_profiles, email_addresses, contacts,
+    field_sources; ALTER TABLE leads DROP COLUMN data_confidence_score,
+    freshness_status, last_verified_at, next_verification_at."""
+    ddl_tail = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    with conn.cursor() as cur:
+        # One row per (entity, field): where the *current* value came from.
+        # A new observation replaces the row and clears verified_at - a changed
+        # value is not verified just because the old one was.
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS field_sources (
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id INT NOT NULL,
+                entity_type  VARCHAR(16) NOT NULL DEFAULT 'lead',
+                entity_id    INT NOT NULL,
+                field        VARCHAR(48) NOT NULL,
+                source       VARCHAR(64) NOT NULL,
+                source_type  VARCHAR(24) NOT NULL,
+                confidence   DOUBLE NOT NULL,
+                observed_at  VARCHAR(40) NOT NULL,
+                verified_at  VARCHAR(40),
+                expires_at   VARCHAR(40),
+                UNIQUE KEY uq_field_source (workspace_id, entity_type, entity_id, field),
+                KEY idx_fs_entity (entity_type, entity_id),
+                CONSTRAINT fk_fs_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE
+            ) {ddl_tail}""")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS contacts (
+                id                         INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id               INT NOT NULL,
+                lead_id                    INT NOT NULL,
+                name                       VARCHAR(255) NOT NULL,
+                title                      VARCHAR(255),
+                role_category              VARCHAR(24) NOT NULL DEFAULT 'OTHER',
+                email                      VARCHAR(255),
+                phone                      VARCHAR(64),
+                linkedin_url               VARCHAR(512),
+                source                     VARCHAR(64) NOT NULL,
+                source_type                VARCHAR(24) NOT NULL,
+                confidence                 DOUBLE NOT NULL,
+                verified_at                VARCHAR(40),
+                decision_maker_probability DOUBLE NOT NULL DEFAULT 0,
+                notes                      TEXT,
+                created_at                 VARCHAR(40),
+                updated_at                 VARCHAR(40),
+                UNIQUE KEY uq_contact (workspace_id, lead_id, name),
+                KEY idx_contact_dm (workspace_id, decision_maker_probability),
+                CONSTRAINT fk_contact_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_contact_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE
+            ) {ddl_tail}""")
+        # email_type: PERSONAL | GENERIC | ROLE.
+        # status:     UNVERIFIED | VERIFIED | INFERRED | INVALID | DISPOSABLE.
+        # VERIFIED is only ever written by a verification provider.
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS email_addresses (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id     INT NOT NULL,
+                lead_id          INT NOT NULL,
+                contact_id       INT NULL,
+                email            VARCHAR(255) NOT NULL,
+                email_type       VARCHAR(16) NOT NULL,
+                status           VARCHAR(16) NOT NULL,
+                confidence       DOUBLE NOT NULL,
+                source           VARCHAR(64) NOT NULL,
+                source_type      VARCHAR(24) NOT NULL,
+                last_verified_at VARCHAR(40),
+                created_at       VARCHAR(40),
+                updated_at       VARCHAR(40),
+                UNIQUE KEY uq_email_lead (workspace_id, lead_id, email),
+                KEY idx_email_addr (workspace_id, email),
+                CONSTRAINT fk_email_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_email_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE,
+                CONSTRAINT fk_email_contact FOREIGN KEY (contact_id)
+                    REFERENCES contacts(id) ON DELETE SET NULL
+            ) {ddl_tail}""")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS social_profiles (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id     INT NOT NULL,
+                lead_id          INT NOT NULL,
+                platform         VARCHAR(24) NOT NULL,
+                url              VARCHAR(512) NOT NULL,
+                username         VARCHAR(191),
+                followers        INT NULL,
+                post_frequency   DOUBLE NULL,
+                last_activity    VARCHAR(40) NULL,
+                match_confidence DOUBLE NOT NULL,
+                source           VARCHAR(64) NOT NULL,
+                source_type      VARCHAR(24) NOT NULL,
+                created_at       VARCHAR(40),
+                updated_at       VARCHAR(40),
+                UNIQUE KEY uq_social (workspace_id, lead_id, platform),
+                CONSTRAINT fk_social_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_social_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE
+            ) {ddl_tail}""")
+        for column, ddl in (
+            ("data_confidence_score", "INT NULL"),
+            ("freshness_status", "VARCHAR(16) NULL"),
+            ("last_verified_at", "VARCHAR(40) NULL"),
+            ("next_verification_at", "VARCHAR(40) NULL"),
+        ):
+            if not _col_exists(cur, "leads", column):
+                cur.execute(f"ALTER TABLE leads ADD COLUMN {column} {ddl}")
+        if not _index_exists(cur, "leads", "idx_leads_freshness"):
+            cur.execute("ALTER TABLE leads ADD KEY idx_leads_freshness "
+                        "(workspace_id, freshness_status)")
+
+
+def _create_audit_tables(conn: Conn) -> None:
+    """Website audits (history kept) and detected opportunities, plus summary
+    columns on leads for filtering/sorting.
+
+    Rollback: DROP TABLE lead_opportunities, website_audits; ALTER TABLE leads
+    DROP COLUMN website_audit_score, website_audited_at, opportunity_count,
+    opportunity_value_est."""
+    tail = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS website_audits (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id    INT NOT NULL,
+                lead_id         INT NOT NULL,
+                url             VARCHAR(512) NOT NULL,
+                final_url       VARCHAR(512),
+                status          VARCHAR(16) NOT NULL,
+                audit_version   INT NOT NULL,
+                overall_score   INT NULL,
+                technical_score INT NULL,
+                seo_score       INT NULL,
+                performance_score INT NULL,
+                conversion_score INT NULL,
+                content_score   INT NULL,
+                findings        LONGTEXT,
+                pages_fetched   INT DEFAULT 0,
+                duration_ms     INT DEFAULT 0,
+                error           TEXT,
+                created_at      VARCHAR(40) NOT NULL,
+                KEY idx_audit_lead (workspace_id, lead_id, id),
+                CONSTRAINT fk_audit_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_audit_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE
+            ) {tail}""")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS lead_opportunities (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id     INT NOT NULL,
+                lead_id          INT NOT NULL,
+                audit_id         INT NULL,
+                opportunity_type VARCHAR(40) NOT NULL,
+                severity         VARCHAR(8) NOT NULL,
+                confidence       DOUBLE NOT NULL,
+                evidence         TEXT,
+                business_impact  TEXT,
+                recommended_solution TEXT,
+                est_value_min    INT,
+                est_value_max    INT,
+                currency         VARCHAR(8) DEFAULT 'INR',
+                status           VARCHAR(12) NOT NULL DEFAULT 'OPEN',
+                detected_at      VARCHAR(40),
+                updated_at       VARCHAR(40),
+                resolved_at      VARCHAR(40),
+                UNIQUE KEY uq_opportunity (workspace_id, lead_id, opportunity_type),
+                KEY idx_opp_ws_status (workspace_id, status, severity),
+                CONSTRAINT fk_opp_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_opp_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE
+            ) {tail}""")
+        for column, ddl in (
+            ("website_audit_score", "INT NULL"), ("website_audited_at", "VARCHAR(40) NULL"),
+            ("opportunity_count", "INT NOT NULL DEFAULT 0"),
+            ("opportunity_value_est", "INT NOT NULL DEFAULT 0"),
+        ):
+            if not _col_exists(cur, "leads", column):
+                cur.execute(f"ALTER TABLE leads ADD COLUMN {column} {ddl}")
+
+
+def _create_scoring_tables(conn: Conn) -> None:
+    """Multi-score model, intent signals, pinned competitors.
+
+    lead_scores holds the *current* scores and the full explanation (one row per
+    lead); lead_score_history keeps the trend. Rollback: DROP TABLE
+    lead_competitors, lead_signals, lead_score_history, lead_scores; drop the
+    five new `leads` columns."""
+    tail = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS lead_scores (
+                id               INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id     INT NOT NULL,
+                lead_id          INT NOT NULL,
+                scoring_version  INT NOT NULL,
+                rule_score       INT NULL,
+                lead_quality     INT NULL,
+                digital_gap      INT NULL,
+                contactability   INT NULL,
+                business_value   INT NULL,
+                buying_intent    INT NULL,
+                decision_maker   INT NULL,
+                outreach_fit     INT NULL,
+                data_confidence  INT NULL,
+                overall          INT NULL,
+                tier             VARCHAR(8),
+                confidence       INT NULL,
+                explanation      LONGTEXT,
+                computed_at      VARCHAR(40) NOT NULL,
+                UNIQUE KEY uq_lead_score (workspace_id, lead_id),
+                KEY idx_score_overall (workspace_id, overall),
+                CONSTRAINT fk_score_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_score_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE
+            ) {tail}""")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS lead_score_history (
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id INT NOT NULL,
+                lead_id      INT NOT NULL,
+                overall      INT NULL,
+                tier         VARCHAR(8),
+                buying_intent INT NULL,
+                created_at   VARCHAR(40) NOT NULL,
+                KEY idx_hist_lead (workspace_id, lead_id, id),
+                CONSTRAINT fk_hist_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_hist_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE
+            ) {tail}""")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS lead_signals (
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id INT NOT NULL,
+                lead_id      INT NOT NULL,
+                signal_type  VARCHAR(40) NOT NULL,
+                strength     DOUBLE NOT NULL,
+                confidence   DOUBLE NOT NULL,
+                evidence     TEXT,
+                source       VARCHAR(40) NOT NULL,
+                status       VARCHAR(10) NOT NULL DEFAULT 'ACTIVE',
+                detected_at  VARCHAR(40) NOT NULL,
+                expires_at   VARCHAR(40) NULL,
+                updated_at   VARCHAR(40),
+                UNIQUE KEY uq_signal (workspace_id, lead_id, signal_type),
+                KEY idx_signal_status (workspace_id, status),
+                CONSTRAINT fk_signal_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_signal_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE
+            ) {tail}""")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS lead_competitors (
+                id                 INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id       INT NOT NULL,
+                lead_id            INT NOT NULL,
+                competitor_lead_id INT NOT NULL,
+                created_at         VARCHAR(40),
+                UNIQUE KEY uq_competitor (workspace_id, lead_id, competitor_lead_id),
+                CONSTRAINT fk_comp_ws FOREIGN KEY (workspace_id)
+                    REFERENCES workspaces(id) ON DELETE CASCADE,
+                CONSTRAINT fk_comp_lead FOREIGN KEY (lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE,
+                CONSTRAINT fk_comp_other FOREIGN KEY (competitor_lead_id)
+                    REFERENCES leads(id) ON DELETE CASCADE
+            ) {tail}""")
+        for column, ddl in (
+            ("overall_score", "INT NULL"), ("opportunity_tier", "VARCHAR(8) NULL"),
+            ("score_confidence", "INT NULL"), ("intent_score", "INT NULL"),
+            ("scored_at", "VARCHAR(40) NULL"),
+        ):
+            if not _col_exists(cur, "leads", column):
+                cur.execute(f"ALTER TABLE leads ADD COLUMN {column} {ddl}")
+        if not _index_exists(cur, "leads", "idx_leads_overall"):
+            cur.execute("ALTER TABLE leads ADD KEY idx_leads_overall (workspace_id, overall_score)")
+
+
+# Fields whose provenance is tracked (kept in sync with app/lineage.TRACKED_FIELDS).
+_LINEAGE_BACKFILL_FIELDS = (
+    "phone", "email", "whatsapp", "website_url", "address", "owner_name",
+    "instagram_url", "facebook_url", "linkedin_url", "google_rating", "google_reviews",
+)
+
+
+def _backfill_lineage(conn: Conn) -> None:
+    """Give every pre-existing lead's populated fields a lineage row so nothing
+    is silently 'unknown'. Honest labels: source = the lead's recorded source (or
+    'unknown'), type 'legacy', confidence 0.5, observed = lead creation time.
+    INSERT IGNORE makes it safe to re-run and never overwrites real lineage."""
+    with conn.cursor() as cur:
+        for field in _LINEAGE_BACKFILL_FIELDS:
+            cur.execute(
+                f"""INSERT IGNORE INTO field_sources
+                    (workspace_id, entity_type, entity_id, field, source, source_type,
+                     confidence, observed_at)
+                    SELECT workspace_id, 'lead', id, '{field}',
+                           COALESCE(NULLIF(source, ''), 'unknown'), 'legacy', 0.5,
+                           COALESCE(created_at, ?)
+                    FROM leads WHERE {field} IS NOT NULL AND {field} != ''""",
+                (utcnow(),),
+            )
+
+
+# Ordered, append-only. Each step must be idempotent and non-destructive (no
+# DROP / column removal / data rewrite): a step is recorded in schema_migrations
+# once applied, and rollback guidance lives in its docstring. Never edit or
+# reorder an applied entry - add a new one.
+MIGRATIONS: list[tuple[int, str, Any]] = [
+    (1, "searches.user_id", _ensure_searches_user_id),
+    (2, "searches.cached_from", _ensure_searches_cached_from),
+    (3, "app_settings.updated_at", _ensure_app_settings_updated_at),
+    (4, "tenancy tables", _create_tenancy_tables),
+    (5, "workspace_id on tenant tables", _add_workspace_scope),
+    (6, "lineage / contacts / emails / socials", _create_intel_tables),
+    (7, "backfill field lineage for existing leads", _backfill_lineage),
+    (8, "website audits and opportunities", _create_audit_tables),
+    (9, "lead scores, signals, competitors", _create_scoring_tables),
+]
+
+CREATE_MIGRATIONS_TABLE = """
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        version    INT PRIMARY KEY,
+        name       VARCHAR(191) NOT NULL,
+        applied_at VARCHAR(40)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
+def run_migrations(conn: Conn) -> list[int]:
+    """Apply pending migrations in order; returns the versions applied now."""
+    applied_now: list[int] = []
+    with conn.cursor() as cur:
+        cur.execute(CREATE_MIGRATIONS_TABLE)
+        cur.execute("SELECT version FROM schema_migrations")
+        done = {row["version"] for row in cur.fetchall()}
+    for version, name, step in MIGRATIONS:
+        if version in done:
+            continue
+        step(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?,?,?)",
+                (version, name, utcnow()),
+            )
+        applied_now.append(version)
+    return applied_now
+
+
 def init_db() -> None:
     """Create tables if missing and seed defaults. Safe to call every boot."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             for statement in CREATE_TABLES:
                 cur.execute(statement)
-            _ensure_searches_user_id(conn)
-            _ensure_searches_cached_from(conn)
-            _ensure_app_settings_updated_at(conn)
+        run_migrations(conn)
 
     for name, pos, color, days in PIPELINE_STAGES:
         execute(
@@ -622,16 +1193,21 @@ def init_db() -> None:
 
     from .seed import seed_templates
 
-    seed_templates()
+    for ws in query("SELECT id FROM workspaces ORDER BY id"):
+        with workspace_context(ws["id"]):
+            seed_templates()
 
-    # Seed the superadmin from the .env credentials on the very first run.
+    # Seed the superadmin from the .env credentials on the very first run, as
+    # owner of the default workspace.
     if not query_one("SELECT id FROM users WHERE role = 'superadmin'"):
         from .security import hash_password
+        from .tenancy import add_member, default_workspace_id
 
         now = utcnow()
-        execute(
+        user_id = execute(
             """INSERT INTO users(username, password_hash, full_name, email, role,
                is_active, created_at, updated_at)
                VALUES(?,?,'Site Owner','','superadmin',1,?,?)""",
             (settings.admin_user, hash_password(settings.admin_password or ""), now, now),
         )
+        add_member(default_workspace_id(), user_id, "owner")

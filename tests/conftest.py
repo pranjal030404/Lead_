@@ -28,6 +28,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("PROVIDER", "mock")
+# Tests never make the multi-request audit implicitly; audit tests opt in.
+os.environ.setdefault("DEEP_AUDIT_ENABLED", "false")
 os.environ.setdefault("DRY_RUN", "true")
 os.environ.setdefault("ADMIN_USER", "admin")
 os.environ.setdefault("ADMIN_PASSWORD", "pytest-admin")
@@ -47,6 +49,10 @@ TABLES = [
     "templates", "pipeline_stages", "suppression_list", "approval_queue",
     "api_usage", "failed_jobs", "automation_log", "app_settings",
     "scheduler_lease", "alerts_sent", "users", "plans", "user_subscriptions",
+    "schema_migrations", "field_sources", "contacts", "email_addresses",
+    "social_profiles", "website_audits", "lead_opportunities", "lead_scores", "lead_score_history",
+    "lead_signals", "lead_competitors",
+    "workspace_members", "workspaces", "organizations",
 ]
 
 
@@ -89,3 +95,13 @@ def _mysql_test_db():
     init_db()
     yield
     close_conn()
+
+@pytest.fixture(autouse=True)
+def _default_workspace():
+    """Tests that call application internals directly (not through HTTP) run as
+    a member of the default workspace, exactly like a signed-in request would."""
+    from app.db import workspace_context
+    from app.tenancy import default_workspace_id
+
+    with workspace_context(default_workspace_id()):
+        yield

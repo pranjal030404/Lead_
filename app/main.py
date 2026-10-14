@@ -12,12 +12,13 @@ from fastapi.staticfiles import StaticFiles
 from . import branding
 from .automation import start_scheduler, stop_scheduler
 from .config import settings
-from .db import init_db, query_one
-from .routers import (auth, automation, branding as branding_router, leads, outreach,
-                      plans, search, stats, users)
+from .db import (MIGRATIONS, NoWorkspace, _ws_var, init_db, query, query_one)
+from .routers import (audits, auth, automation, intelligence, branding as branding_router, leads, outreach,
+                      plans, profile, search, stats, users, workspaces)
+from .tenancy import TenancyError, resolve_workspace
 from .security import (SESSION_COOKIE, client_ip, load_user, rate_limit, verify_token)
 
-PUBLIC_PATHS = {"/landing", "/login", "/admin", "/health", "/api/auth/login",
+PUBLIC_PATHS = {"/landing", "/login", "/admin", "/health", "/health/live", "/health/ready", "/api/auth/login",
                 "/api/auth/admin/login", "/favicon.ico"}
 PUBLIC_PREFIXES = ("/static/", "/api/uploads/", "/api/branding/theme.css")
 
@@ -98,8 +99,20 @@ async def auth_and_rate_limit(request: Request, call_next):
         # page funnels to the sign-in form.
         return RedirectResponse("/landing" if path == "/" else "/login", status_code=302)
 
+    # Tenant scope. A user with no active workspace gets no scope at all, so any
+    # tenant-scoped query fails with NoWorkspace (-> 403) instead of seeing data.
+    try:
+        membership = resolve_workspace(user["id"], request.headers.get("x-workspace-id"))
+    except TenancyError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+    user["workspace_id"] = membership["workspace_id"] if membership else None
+    user["workspace_role"] = membership["member_role"] if membership else None
     request.state.user = user
-    response = await call_next(request)
+    token = _ws_var.set(user["workspace_id"])
+    try:
+        response = await call_next(request)
+    finally:
+        _ws_var.reset(token)
     # The rendered HTML bakes in operator config - the Google Maps JS key lands
     # in a meta tag - and branding.render_page reads it per request. Without a
     # cache directive the browser heuristically caches the page, so a .env edit
@@ -108,6 +121,34 @@ async def auth_and_rate_limit(request: Request, call_next):
     if response.headers.get("content-type", "").startswith("text/html"):
         response.headers["Cache-Control"] = "no-cache"
     return response
+
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "geolocation=(self), camera=(), microphone=()",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Outermost middleware (registered last) so every response - including the
+    401/429 early returns from the auth middleware - carries the headers.
+    No CSP yet: the pages use inline scripts/styles and Google Maps, so a
+    meaningful CSP needs those refactored first (tracked in KNOWN_LIMITATIONS)."""
+    response = await call_next(request)
+    for key, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(key, value)
+    if settings.cookie_secure:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return response
+
+
+@app.exception_handler(NoWorkspace)
+async def no_workspace_handler(request: Request, exc: NoWorkspace):
+    return JSONResponse({"detail": "No workspace access - ask an administrator to add "
+                                   "you to a workspace"}, status_code=403)
 
 
 app.include_router(auth.router)
@@ -119,8 +160,36 @@ app.include_router(automation.router)
 app.include_router(users.router)
 app.include_router(plans.router)
 app.include_router(branding_router.router)
+app.include_router(workspaces.router)
+app.include_router(profile.router)
+app.include_router(audits.router)
+app.include_router(intelligence.router)
 
 app.mount("/static", StaticFiles(directory=settings.static_dir), name="static")
+
+
+@app.get("/health/live")
+def health_live():
+    """Process is up. Touches nothing external, so it never flaps on a DB blip."""
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def health_ready():
+    """Ready to serve: DB reachable and all migrations applied."""
+    checks: dict[str, str] = {}
+    try:
+        query_one("SELECT 1 AS ok")
+        checks["mysql"] = "ok"
+        applied = {r["version"] for r in query("SELECT version FROM schema_migrations")}
+        pending = [v for v, _, _ in MIGRATIONS if v not in applied]
+        checks["migrations"] = "ok" if not pending else f"pending: {pending}"
+    except Exception:  # noqa: BLE001 - detail stays in logs, not the public response
+        checks.setdefault("mysql", "error")
+        checks.setdefault("migrations", "unknown")
+    ok = all(v == "ok" for v in checks.values())
+    return JSONResponse({"status": "ok" if ok else "error", "checks": checks},
+                        status_code=200 if ok else 503)
 
 
 @app.get("/health")
@@ -129,24 +198,35 @@ def health():
     try:
         query_one("SELECT 1 AS ok")
         return {"status": "ok"}
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse({"status": "error", "detail": str(exc)}, status_code=503)
+    except Exception:  # noqa: BLE001 - don't leak driver errors publicly
+        return JSONResponse({"status": "error"}, status_code=503)
 
 
 @app.get("/login")
-def login_page():
+def login_page(request: Request):
+    """User sign-in. Admins are pointed at their own console so each role has a
+    single obvious door."""
+    user = load_user(verify_token(request.cookies.get(SESSION_COOKIE)))
+    if user:
+        return RedirectResponse(
+            "/admin" if user.get("role") in ("admin", "superadmin") else "/",
+            status_code=302,
+        )
     return Response(branding.render_page("login.html"), media_type="text/html")
 
 
 @app.get("/admin")
 def admin_login_page(request: Request):
     """Dedicated administrator door: its own page and its own role-gated login
-    endpoint. Any signed-in user (admin or not) is sent to the app - a regular
-    user could not log in through this door anyway, and an admin has nothing to
-    do on a login form. Anonymous visitors get the sign-in form."""
-    username = verify_token(request.cookies.get(SESSION_COOKIE))
-    if username and load_user(username):
-        return RedirectResponse("/", status_code=302)
+    endpoint. A signed-in admin is sent straight to the app; a signed-in regular
+    user is sent to the user sign-in page rather than the console they cannot
+    use. Anonymous visitors get the sign-in form."""
+    user = load_user(verify_token(request.cookies.get(SESSION_COOKIE)))
+    if user:
+        return RedirectResponse(
+            "/" if user.get("role") in ("admin", "superadmin") else "/login",
+            status_code=302,
+        )
     return Response(branding.render_page("admin.html"), media_type="text/html")
 
 

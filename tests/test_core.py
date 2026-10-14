@@ -312,19 +312,19 @@ def test_alert_claim_is_idempotent():
 
 def test_hot_lead_alert_fires_once_and_only_above_the_threshold():
     from app import notify
-    from app.db import execute
+    from app.db import current_ws, execute
 
     threshold = config.settings.hot_alert_min_score
     now = utcnow()
     hot = execute(
-        "INSERT INTO leads(business_name, city, lead_score, lead_priority, created_at) "
-        "VALUES(?,?,?,?,?)",
-        ("Alertable Cafe", "Testville", threshold, "HOT", now),
+        "INSERT INTO leads(workspace_id, business_name, city, lead_score, lead_priority, "
+        "created_at) VALUES(?,?,?,?,?,?)",
+        (current_ws(), "Alertable Cafe", "Testville", threshold, "HOT", now),
     )
     cold = execute(
-        "INSERT INTO leads(business_name, city, lead_score, lead_priority, created_at) "
-        "VALUES(?,?,?,?,?)",
-        ("Middling Gym", "Testville", threshold - 2, "WARM", now),
+        "INSERT INTO leads(workspace_id, business_name, city, lead_score, lead_priority, "
+        "created_at) VALUES(?,?,?,?,?,?)",
+        (current_ws(), "Middling Gym", "Testville", threshold - 2, "WARM", now),
     )
 
     first = notify.alert_new_hot_leads([hot, cold])

@@ -8,8 +8,9 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from .. import emailintel, leadscore, lineage, social
 from ..config import settings
-from ..db import execute, query, query_one, scalar, utcnow
+from ..db import current_ws, execute, query, query_one, scalar, utcnow
 from ..fastjson import rows_response
 from ..dedup import dedupe_existing_leads
 from ..enrich import enrich_lead, parse_issues
@@ -32,13 +33,28 @@ LIST_COLUMNS = [
     "id", "business_name", "area", "city", "phone", "status",
     "lead_score", "lead_priority", "data_quality_score",
     "website_url", "website_score", "created_at",
+    "overall_score", "opportunity_tier", "intent_score", "opportunity_count",
 ]
 
 SORTABLE = {
     "created_at": "created_at", "lead_score": "lead_score",
     "business_name": "business_name", "updated_at": "updated_at",
     "data_quality_score": "data_quality_score", "follow_up_date": "follow_up_date",
+    "overall_score": "overall_score", "intent_score": "intent_score",
+    "website_audit_score": "website_audit_score",
+    "opportunity_value_est": "opportunity_value_est",
 }
+
+
+def _own_lead(lead_id: int, columns: str = "*") -> dict:
+    """The lead, only if it belongs to the active workspace. A lead in another
+    workspace is indistinguishable from one that does not exist (404, never 403),
+    so ids can't be probed across tenants."""
+    lead = query_one(f"SELECT {columns} FROM leads WHERE id = ? AND workspace_id = ?",
+                     (lead_id, current_ws()))
+    if not lead:
+        raise HTTPException(404, "Lead not found")
+    return lead
 
 
 def _decorate(lead: dict) -> dict:
@@ -50,9 +66,9 @@ def _decorate(lead: dict) -> dict:
 
 def _build_filters(
     q, status, priority, city, niche, country, has_website, tag, min_quality,
-    enrichment_status, source,
+    enrichment_status, source, min_overall=None, tier=None, min_intent=None,
 ) -> tuple[str, list]:
-    clauses, params = [], []
+    clauses, params = ["workspace_id = ?"], [current_ws()]
     if q:
         clauses.append(
             "(business_name LIKE ? OR phone LIKE ? OR email LIKE ? OR address LIKE ?)"
@@ -75,8 +91,16 @@ def _build_filters(
     if min_quality is not None:
         clauses.append("data_quality_score >= ?")
         params.append(min_quality)
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    return where, params
+    if min_overall is not None:
+        clauses.append("overall_score >= ?")
+        params.append(min_overall)
+    if min_intent is not None:
+        clauses.append("intent_score >= ?")
+        params.append(min_intent)
+    if tier:
+        clauses.append("opportunity_tier = ?")
+        params.append(tier.upper())
+    return " WHERE " + " AND ".join(clauses), params
 
 
 @router.get("/leads")
@@ -92,6 +116,9 @@ def list_leads(
     tag: str | None = None,
     min_quality: int | None = None,
     enrichment_status: str | None = None,
+    min_overall: int | None = Query(None, ge=0, le=100),
+    min_intent: int | None = Query(None, ge=0, le=100),
+    tier: str | None = None,
     sort: str = "created_at",
     direction: str = "desc",
     limit: int = Query(50, ge=1),
@@ -102,7 +129,8 @@ def list_leads(
     # literal `le=` in the signature is baked in at import and can't be.
     limit = min(limit, settings.max_page_size)
     where, params = _build_filters(q, status, priority, city, niche, country,
-                                   has_website, tag, min_quality, enrichment_status, source)
+                                   has_website, tag, min_quality, enrichment_status, source,
+                                   min_overall, tier, min_intent)
     order_column = SORTABLE.get(sort, "created_at")
     order_dir = "ASC" if direction.lower() == "asc" else "DESC"
     total = scalar(f"SELECT COUNT(*) FROM leads{where}", tuple(params))
@@ -152,8 +180,9 @@ def facets():
     def distinct(column: str):
         return [
             r[column] for r in
-            query(f"SELECT DISTINCT {column} FROM leads WHERE {column} IS NOT NULL "
-                  f"AND {column} != '' ORDER BY {column}")
+            query(f"SELECT DISTINCT {column} FROM leads WHERE workspace_id = ? "
+                  f"AND {column} IS NOT NULL AND {column} != '' ORDER BY {column}",
+                  (current_ws(),))
         ]
     return {
         "cities": distinct("city"), "niches": distinct("niche"),
@@ -164,15 +193,15 @@ def facets():
 
 @router.get("/leads/{lead_id}")
 def get_lead(lead_id: int):
-    lead = query_one("SELECT * FROM leads WHERE id = ?", (lead_id,))
-    if not lead:
-        raise HTTPException(404, "Lead not found")
+    lead = _own_lead(lead_id)
     lead = _decorate(lead)
     lead["interactions"] = query(
-        "SELECT * FROM interactions WHERE lead_id = ? ORDER BY date DESC", (lead_id,)
+        "SELECT * FROM interactions WHERE lead_id = ? AND workspace_id = ? ORDER BY date DESC",
+        (lead_id, current_ws()),
     )
     lead["queued_messages"] = query(
-        "SELECT * FROM approval_queue WHERE lead_id = ? ORDER BY id DESC", (lead_id,)
+        "SELECT * FROM approval_queue WHERE lead_id = ? AND workspace_id = ? ORDER BY id DESC",
+        (lead_id, current_ws()),
     )
     return lead
 
@@ -183,32 +212,42 @@ class LeadPatch(BaseModel):
 
 @router.patch("/leads/{lead_id}")
 def update_lead(lead_id: int, patch: LeadPatch):
-    if not query_one("SELECT id FROM leads WHERE id = ?", (lead_id,)):
-        raise HTTPException(404, "Lead not found")
+    _own_lead(lead_id, "id")
     fields = {k: v for k, v in patch.model_dump().items() if k in EDITABLE_FIELDS}
     if not fields:
         raise HTTPException(400, f"No editable fields. Allowed: {sorted(EDITABLE_FIELDS)}")
     fields["updated_at"] = utcnow()
     assignments = ", ".join(f"{k} = ?" for k in fields)
-    execute(f"UPDATE leads SET {assignments} WHERE id = ?", (*fields.values(), lead_id))
-    return _decorate(query_one("SELECT * FROM leads WHERE id = ?", (lead_id,)))
+    execute(f"UPDATE leads SET {assignments} WHERE id = ? AND workspace_id = ?",
+            (*fields.values(), lead_id, current_ws()))
+    # A person typed these in: record that as the source (not as verification).
+    if lineage.record_many(lead_id, fields, "manual", "user"):
+        if fields.get("email"):
+            emailintel.register(lead_id, fields["email"], "manual", "user")
+        social.register_lead_columns(lead_id, fields, "manual", "user")
+        lineage.refresh_lead(lead_id)
+    leadscore.safe_recompute(lead_id)
+    return _decorate(_own_lead(lead_id))
 
 
 @router.delete("/leads/{lead_id}")
 def delete_lead(lead_id: int):
     """Hard delete, including interaction history - for GDPR / DPDP erasure
     requests (Part 7.1, 7.5). This is not recoverable outside a backup."""
-    lead = query_one("SELECT business_name, email FROM leads WHERE id = ?", (lead_id,))
-    if not lead:
-        raise HTTPException(404, "Lead not found")
-    execute("DELETE FROM interactions WHERE lead_id = ?", (lead_id,))
-    execute("DELETE FROM approval_queue WHERE lead_id = ?", (lead_id,))
-    execute("DELETE FROM leads WHERE id = ?", (lead_id,))
+    lead = _own_lead(lead_id, "business_name, email")
+    execute("DELETE FROM interactions WHERE lead_id = ? AND workspace_id = ?",
+            (lead_id, current_ws()))
+    execute("DELETE FROM approval_queue WHERE lead_id = ? AND workspace_id = ?",
+            (lead_id, current_ws()))
+    execute("DELETE FROM field_sources WHERE entity_type = 'lead' AND entity_id = ? "
+            "AND workspace_id = ?", (lead_id, current_ws()))
+    execute("DELETE FROM leads WHERE id = ? AND workspace_id = ?", (lead_id, current_ws()))
     return {"deleted": lead_id, "business_name": lead["business_name"]}
 
 
 @router.post("/leads/{lead_id}/enrich")
 def enrich(lead_id: int):
+    _own_lead(lead_id, "id")
     try:
         return _decorate(enrich_lead(lead_id))
     except ValueError as exc:
@@ -226,8 +265,9 @@ def bulk_status(payload: BulkStatus):
         raise HTTPException(400, "No lead ids given")
     placeholders = ",".join("?" for _ in payload.ids)
     execute(
-        f"UPDATE leads SET status = ?, updated_at = ? WHERE id IN ({placeholders})",
-        (payload.status, utcnow(), *payload.ids),
+        f"UPDATE leads SET status = ?, updated_at = ? WHERE workspace_id = ? "
+        f"AND id IN ({placeholders})",
+        (payload.status, utcnow(), current_ws(), *payload.ids),
     )
     return {"updated": len(payload.ids), "status": payload.status}
 
@@ -241,13 +281,14 @@ class BulkTag(BaseModel):
 def bulk_tag(payload: BulkTag):
     updated = 0
     for lead_id in payload.ids:
-        lead = query_one("SELECT tags FROM leads WHERE id = ?", (lead_id,))
+        lead = query_one("SELECT tags FROM leads WHERE id = ? AND workspace_id = ?",
+                         (lead_id, current_ws()))
         if not lead:
             continue
         tags = {t.strip() for t in (lead["tags"] or "").split(",") if t.strip()}
         tags.add(payload.tag.strip())
-        execute("UPDATE leads SET tags = ?, updated_at = ? WHERE id = ?",
-                (",".join(sorted(tags)), utcnow(), lead_id))
+        execute("UPDATE leads SET tags = ?, updated_at = ? WHERE id = ? AND workspace_id = ?",
+                (",".join(sorted(tags)), utcnow(), lead_id, current_ws()))
         updated += 1
     return {"updated": updated}
 
@@ -272,20 +313,22 @@ class InteractionPayload(BaseModel):
 
 @router.get("/leads/{lead_id}/interactions")
 def list_interactions(lead_id: int):
-    return query("SELECT * FROM interactions WHERE lead_id = ? ORDER BY date DESC", (lead_id,))
+    return query(
+        "SELECT * FROM interactions WHERE lead_id = ? AND workspace_id = ? ORDER BY date DESC",
+        (lead_id, current_ws()),
+    )
 
 
 @router.post("/leads/{lead_id}/interactions")
 def add_interaction(lead_id: int, payload: InteractionPayload):
-    if not query_one("SELECT id FROM leads WHERE id = ?", (lead_id,)):
-        raise HTTPException(404, "Lead not found")
+    _own_lead(lead_id, "id")
     now = utcnow()
     interaction_id = execute(
         """INSERT INTO interactions
-           (lead_id, type, direction, date, subject, content, outcome, next_step,
-            follow_up_date, automated, created_at)
-           VALUES(?,?,'out',?,?,?,?,?,?,0,?)""",
-        (lead_id, payload.type, now, payload.subject, payload.content, payload.outcome,
+           (workspace_id, lead_id, type, direction, date, subject, content, outcome,
+            next_step, follow_up_date, automated, created_at)
+           VALUES(?,?,?,'out',?,?,?,?,?,?,0,?)""",
+        (current_ws(), lead_id, payload.type, now, payload.subject, payload.content, payload.outcome,
          payload.next_step, payload.follow_up_date, now),
     )
     updates = {
@@ -302,19 +345,16 @@ def add_interaction(lead_id: int, payload: InteractionPayload):
              contact_method = ?,
              follow_up_date = COALESCE(?, follow_up_date),
              updated_at = ?
-           WHERE id = ?""",
+           WHERE id = ? AND workspace_id = ?""",
         (payload.new_status, payload.new_status, now, now, payload.type,
-         payload.follow_up_date, now, lead_id),
+         payload.follow_up_date, now, lead_id, current_ws()),
     )
-    return {"id": interaction_id, "lead": _decorate(query_one(
-        "SELECT * FROM leads WHERE id = ?", (lead_id,)))}
+    return {"id": interaction_id, "lead": _decorate(_own_lead(lead_id))}
 
 
 @router.post("/leads/{lead_id}/message")
 def generate_message(lead_id: int, template: str):
-    lead = query_one("SELECT * FROM leads WHERE id = ?", (lead_id,))
-    if not lead:
-        raise HTTPException(404, "Lead not found")
+    lead = _own_lead(lead_id)
     try:
         rendered = render_template(template, lead)
     except ValueError as exc:

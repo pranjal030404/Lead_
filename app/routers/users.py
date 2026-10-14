@@ -5,8 +5,9 @@ from pydantic import BaseModel
 
 from pymysql.err import IntegrityError
 
-from ..db import execute, query, query_one, utcnow
+from ..db import current_ws, execute, query, query_one, utcnow
 from ..security import hash_password, require_role
+from ..tenancy import add_member, can_manage_user, remove_member
 
 router = APIRouter(prefix="/api", tags=["users"])
 
@@ -27,21 +28,26 @@ def _safe(user: dict) -> dict:
 
 
 @router.get("/users")
-def list_users(_: dict = Depends(require_role("superadmin", "admin")),
+def list_users(actor: dict = Depends(require_role("superadmin", "admin")),
                q: str | None = None, page: int = Query(0, ge=0), per_page: int = Query(100, le=500)):
-    where = ""
-    params: tuple = ()
+    # The platform superadmin sees every account; a workspace admin only the
+    # members of their own workspace.
+    clauses: list[str] = []
+    params: list = []
+    if actor["role"] != "superadmin":
+        clauses.append("id IN (SELECT user_id FROM workspace_members WHERE workspace_id = ?)")
+        params.append(current_ws())
     if q:
-        where = "WHERE username LIKE ? OR full_name LIKE ?"
-        like = f"%{q}%"
-        params = (like, like)
+        clauses.append("(username LIKE ? OR full_name LIKE ?)")
+        params += [f"%{q}%", f"%{q}%"]
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = query(
         "SELECT id, username, full_name, email, role, is_active, created_at, updated_at "
         f"FROM users {where} ORDER BY id DESC LIMIT ? OFFSET ?",
         (*params, per_page, page * per_page),
     )
     return {"rows": rows, "page": page, "per_page": per_page,
-            "total": query_one("SELECT COUNT(*) AS n FROM users" + (f" {where}" if where else ""), params)["n"]}
+            "total": query_one(f"SELECT COUNT(*) AS n FROM users {where}", tuple(params))["n"]}
 
 
 @router.post("/users")
@@ -57,8 +63,9 @@ def create_user(payload: UserPayload,
         raise HTTPException(403, "Only the superadmin can grant privileged roles")
 
     now = utcnow()
+    workspace_id = current_ws()  # fails loudly (403) if the actor has no workspace
     try:
-        execute(
+        new_id = execute(
             """INSERT INTO users(username, password_hash, full_name, email, role,
                is_active, created_at, updated_at)
                VALUES(?,?,?,?,?,?,?,?)""",
@@ -67,6 +74,8 @@ def create_user(payload: UserPayload,
         )
     except IntegrityError as exc:
         raise HTTPException(409, "Username already taken") from exc
+    # New accounts join the creator's workspace.
+    add_member(workspace_id, new_id, "admin" if role in ("admin", "superadmin") else "member")
     return _safe(query_one("SELECT * FROM users WHERE username = ?", (username,)))
 
 
@@ -74,7 +83,7 @@ def create_user(payload: UserPayload,
 def update_user(user_id: int, payload: UserPayload,
                 actor: dict = Depends(require_role("superadmin", "admin"))):
     row = query_one("SELECT * FROM users WHERE id = ?", (user_id,))
-    if not row:
+    if not row or not can_manage_user(actor, user_id):
         raise HTTPException(404, "User not found")
 
     role = (payload.role or row["role"])
@@ -112,8 +121,20 @@ def delete_user(user_id: int, actor: dict = Depends(require_role("superadmin", "
     if actor["id"] == user_id:
         raise HTTPException(400, "You cannot delete your own account")
     row = query_one("SELECT id, role FROM users WHERE id = ?", (user_id,))
-    if not row:
+    if not row or not can_manage_user(actor, user_id):
         raise HTTPException(404, "User not found")
+    if actor["role"] != "superadmin":
+        # A workspace admin removes the person from their workspace; the account
+        # itself is only deleted once it belongs to no workspace at all.
+        if row["role"] == "superadmin":
+            raise HTTPException(403, "Only the superadmin can remove a superadmin")
+        try:
+            remove_member(current_ws(), user_id)
+        except Exception as exc:  # noqa: BLE001 - TenancyError: last owner
+            raise HTTPException(400, str(exc)) from exc
+        if not query_one("SELECT 1 AS x FROM workspace_members WHERE user_id = ?", (user_id,)):
+            execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return {"deleted": user_id}
     if row["role"] == "superadmin" and query_one(
         "SELECT COUNT(*) AS n FROM users WHERE role = 'superadmin' AND is_active = 1"
     )["n"] <= 1:

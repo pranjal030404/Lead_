@@ -22,8 +22,8 @@ from apscheduler.triggers.cron import CronTrigger
 from .backup import run_backup
 from .config import parse_hhmm, settings
 from .db import (execute, get_conn, get_setting, log_automation, log_failure, query,
-                 query_one, scalar, set_setting, today, utcnow)
-from . import notify
+                 query_one, scalar, set_setting, today, utcnow, workspace_context)
+from . import leadscore, lineage, notify
 from .enrich import enrich_pending
 from .outreach import generate_followups, send_approved
 from .quota import usage_summary
@@ -65,21 +65,45 @@ def _next_date(auto_search: str) -> str:
     return (datetime.now(timezone.utc) + timedelta(days=days)).date().isoformat()
 
 
-def job_discovery(force: bool = False) -> dict:
+def active_workspace_ids() -> list[int]:
+    return [r["id"] for r in query(
+        """SELECT w.id FROM workspaces w JOIN organizations o ON o.id = w.organization_id
+           WHERE w.is_active = 1 AND o.is_active = 1 ORDER BY w.id""")]
+
+
+def _targets(workspace_id: int | None) -> list[int]:
+    return [workspace_id] if workspace_id is not None else active_workspace_ids()
+
+
+def job_discovery(force: bool = False, workspace_id: int | None = None) -> dict:
     """`force` is set when you press Run now in the UI - an explicit operator
-    action shouldn't silently no-op just because the schedule is paused."""
+    action shouldn't silently no-op just because the schedule is paused.
+
+    Tenant job: `workspace_id` None (the scheduler) sweeps every active
+    workspace, each inside its own scope with its own targets and quota slice."""
     if not force and not job_on("discovery"):
         return {"skipped": "discovery switched off"}
+    total = {"ran": 0, "skipped": 0}
+    for wid in _targets(workspace_id):
+        with workspace_context(wid):
+            result = _discover_workspace(wid)
+        total["ran"] += result.get("ran", 0)
+        total["skipped"] += result.get("skipped", 0)
+        if result.get("quota_hit"):
+            break
+    return total
 
+
+def _discover_workspace(workspace_id: int) -> dict:
     from .search_service import get_coverage, run_search
 
     due = query(
         """SELECT * FROM targets
-           WHERE is_active = 1 AND auto_search != 'manual'
+           WHERE workspace_id = ? AND is_active = 1 AND auto_search != 'manual'
              AND (next_search_date IS NULL OR next_search_date <= ?)
            ORDER BY COALESCE(last_searched, '') ASC
            LIMIT ?""",
-        (today(), settings.targets_per_run),
+        (workspace_id, today(), settings.targets_per_run),
     )
     if not due:
         log_automation("discovery", "No targets due today")
@@ -91,7 +115,8 @@ def job_discovery(force: bool = False) -> dict:
                                 target["country"])
         if coverage["status"] == "EXHAUSTED":
             # Three barren runs in a row - stop burning quota here and say so.
-            execute("UPDATE targets SET is_active = 0 WHERE id = ?", (target["id"],))
+            execute("UPDATE targets SET is_active = 0 WHERE id = ? AND workspace_id = ?",
+                    (target["id"], workspace_id))
             log_automation(
                 "discovery",
                 f"Target '{target['niche']}' in {target['area'] or target['city']} is "
@@ -104,25 +129,26 @@ def job_discovery(force: bool = False) -> dict:
             result = run_search(
                 niche=target["niche"], city=target["city"], area=target["area"] or "",
                 country=target["country"] or "", max_results=target["max_results"],
-                triggered_by="automation",
+                triggered_by="automation", workspace_id=workspace_id,
             )
             ran += 1
             execute(
-                "UPDATE targets SET last_searched = ?, next_search_date = ? WHERE id = ?",
-                (utcnow(), _next_date(target["auto_search"]), target["id"]),
+                "UPDATE targets SET last_searched = ?, next_search_date = ? "
+                "WHERE id = ? AND workspace_id = ?",
+                (utcnow(), _next_date(target["auto_search"]), target["id"], workspace_id),
             )
             if result.get("quota_hit"):
                 log_automation("discovery", "Daily API cap reached - stopping for today", "warn")
-                break
+                return {"ran": ran, "skipped": skipped, "quota_hit": True}
         except Exception as exc:  # noqa: BLE001
             log_failure("automation.discovery", str(exc), target["id"])
     return {"ran": ran, "skipped": skipped}
 
 
-def job_enrichment(force: bool = False) -> dict:
+def job_enrichment(force: bool = False, workspace_id: int | None = None) -> dict:
     if not force and not job_on("enrichment"):
         return {"skipped": "enrichment switched off"}
-    result = enrich_pending(limit=100)
+    result = enrich_pending(limit=100, workspace_id=workspace_id)
     log_automation(
         "enrichment",
         f"Enriched {result['enriched']} lead(s), {result['failed']} failed, "
@@ -131,7 +157,7 @@ def job_enrichment(force: bool = False) -> dict:
     return result
 
 
-def job_scoring(force: bool = False) -> dict:
+def job_scoring(force: bool = False, workspace_id: int | None = None) -> dict:
     """Re-score anything enriched since the last pass (cheap, no API calls).
     Run now re-scores everything, which is what you want after a rules change."""
     if not force and not job_on("enrichment"):
@@ -139,38 +165,51 @@ def job_scoring(force: bool = False) -> dict:
     from .enrich import _update
     from .scoring import score_lead
 
+    scope, sp = ("", ()) if workspace_id is None else (" AND workspace_id = ?", (workspace_id,))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
+    cutoff_iso = cutoff
     if force:
-        leads = query("SELECT * FROM leads")
+        leads = query("SELECT * FROM leads WHERE 1 = 1" + scope, sp)
     else:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(timespec="seconds")
-        leads = query("SELECT * FROM leads WHERE updated_at >= ?", (cutoff,))
+        leads = query("SELECT * FROM leads WHERE updated_at >= ?" + scope, (cutoff, *sp))
     for lead in leads:
         _update(lead["id"], score_lead(lead))
-    log_automation("scoring", f"Re-scored {len(leads)} recently-updated lead(s)")
-    return {"scored": len(leads)}
+    refreshed = 0
+    for wid in _targets(workspace_id):
+        with workspace_context(wid):
+            refreshed += lineage.refresh_all(wid)
+            leadscore.recompute_workspace(None if force else cutoff_iso)
+    log_automation("scoring", f"Re-scored {len(leads)} recently-updated lead(s); "
+                              f"refreshed confidence/freshness on {refreshed}")
+    return {"scored": len(leads), "freshness_refreshed": refreshed}
 
 
-def job_followups(force: bool = False) -> dict:
+def job_followups(force: bool = False, workspace_id: int | None = None) -> dict:
     if not force and not job_on("followup_generation"):
         return {"skipped": "follow-up generation switched off"}
-    result = generate_followups()
-    log_automation(
-        "followup",
-        f"{result['generated']} follow-up(s) queued for approval, "
-        f"{result['marked_lost']} marked Lost - No Response",
-    )
+    result = {"generated": 0, "marked_lost": 0}
+    for wid in _targets(workspace_id):
+        with workspace_context(wid):
+            one = generate_followups()
+            result["generated"] += one["generated"]
+            result["marked_lost"] += one["marked_lost"]
+            log_automation(
+                "followup",
+                f"{one['generated']} follow-up(s) queued for approval, "
+                f"{one['marked_lost']} marked Lost - No Response",
+            )
     return result
 
 
-def job_sending(force: bool = False) -> dict:
+def job_sending(force: bool = False, workspace_id: int | None = None) -> dict:
     # Even forced, this only ever sends messages already marked APPROVED, and
     # still checks the suppression list and dry-run flag before each send.
     if not force and not job_on("sending"):
         return {"skipped": "sending switched off"}
-    return send_approved()
+    return send_approved(workspace_id=workspace_id)
 
 
-def job_backup(force: bool = False) -> dict:
+def job_backup(force: bool = False, workspace_id: int | None = None) -> dict:
     try:
         result = run_backup()
         notify.prune()
@@ -241,7 +280,7 @@ def build_digest() -> str:
     return "\n".join(lines)
 
 
-def job_digest(force: bool = False) -> dict:
+def job_digest(force: bool = False, workspace_id: int | None = None) -> dict:
     """Health check + daily digest (Part 7.6). Runs even when automation is off,
     so a silent morning genuinely means something is broken.
 
@@ -274,7 +313,14 @@ JOBS = {
 LONG_RUNNING = {"discovery", "enrichment", "scoring", "followups"}
 
 
-def run_job_now(name: str) -> dict:
+# Install-wide jobs: they touch the whole database / platform mailbox, so only
+# the superadmin may run them by hand (enforced in the router).
+SYSTEM_JOBS = {"digest", "backup"}
+
+
+def run_job_now(name: str, workspace_id: int | None = None) -> dict:
+    """Run a job on demand. `workspace_id` confines a tenant job to that
+    workspace; None (system / superadmin use) means every workspace."""
     job = JOBS.get(name)
     if not job:
         raise ValueError(f"Unknown job '{name}'")
@@ -283,7 +329,7 @@ def run_job_now(name: str) -> dict:
     if name in LONG_RUNNING:
         def runner() -> None:
             try:
-                job(force=True)
+                job(force=True, workspace_id=workspace_id)
             except Exception as exc:  # noqa: BLE001
                 log_failure(f"manual.{name}", str(exc))
                 log_automation(name, f"Manual run failed: {exc}", "error")
@@ -291,7 +337,7 @@ def run_job_now(name: str) -> dict:
         threading.Thread(target=runner, daemon=True).start()
         return {"started": True, "note": "running in the background - watch the activity feed"}
 
-    return job(force=True)
+    return job(force=True, workspace_id=workspace_id)
 
 
 # ------------------------------------------------------- leader election --

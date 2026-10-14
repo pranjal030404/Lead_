@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from . import http
+from . import http, netsafe, people
 from .config import settings
 
 PLATFORM_SIGNATURES = [
@@ -97,6 +97,7 @@ def check_website(url: str | None) -> dict:
         "website_issues": [],
         "socials": {},
         "emails": [],
+        "people": [],
         "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     if not url:
@@ -106,8 +107,11 @@ def check_website(url: str | None) -> dict:
     target = _normalise_url(url)
     started = time.perf_counter()
     try:
-        response = http.get(target, breaker="website_check", retries=2,
-                            timeout=settings.http_timeout)
+        response = netsafe.safe_get(target, breaker="website_check", retries=2,
+                                    timeout=settings.http_timeout)
+    except netsafe.UnsafeURL:
+        result["website_issues"] = ["Website address is not a public internet address"]
+        return result
     except Exception:  # noqa: BLE001 - unreachable is a finding, not a crash
         # Phrased to complete the sentence "your site ..." in outreach copy.
         result["website_issues"] = ["Doesn't load at all - the domain isn't responding"]
@@ -130,6 +134,7 @@ def check_website(url: str | None) -> dict:
     result["website_platform"] = _detect_platform(html)
     result["socials"] = _find_socials(html)
     result["emails"] = _find_emails(html)
+    result["people"] = people.extract_people(html)
 
     years = [int(y) for y in YEAR_RE.findall(html)]
     if years:
@@ -194,7 +199,8 @@ def find_contact_email(website_url: str | None) -> list[str]:
     found: list[str] = []
     for path in CONTACT_PATHS:
         try:
-            response = http.get(base + path, breaker="website_check", retries=1, timeout=6)
+            response = netsafe.safe_get(base + path, breaker="website_check", retries=1,
+                                        timeout=6)
         except Exception:  # noqa: BLE001
             continue
         if response.status_code < 400:

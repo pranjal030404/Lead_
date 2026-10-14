@@ -5,8 +5,9 @@ from pydantic import BaseModel
 
 from pymysql.err import IntegrityError
 
-from ..db import execute, query, query_one, utcnow
+from ..db import current_ws, execute, query, query_one, utcnow
 from ..security import require_role
+from ..tenancy import can_manage_user
 from ..subscription import (active_subscription, expire_previous_active,
                             payment_enabled, period_end_for, set_payment_enabled)
 
@@ -57,7 +58,7 @@ def list_plans(request: Request):
 
 @router.post("/plans")
 def create_plan(payload: PlanPayload,
-                _: dict = Depends(require_role("superadmin", "admin"))):
+                _: dict = Depends(require_role("superadmin"))):
     name = payload.name.strip()
     if not name:
         raise HTTPException(400, "name is required")
@@ -80,7 +81,7 @@ def create_plan(payload: PlanPayload,
 
 @router.patch("/plans/{plan_id}")
 def update_plan(plan_id: int, payload: PlanPayload,
-                _: dict = Depends(require_role("superadmin", "admin"))):
+                _: dict = Depends(require_role("superadmin"))):
     plan = _get_plan(plan_id)
     if payload.period_days <= 0 or payload.search_limit < 0:
         raise HTTPException(400, "period_days must be positive and search_limit non-negative")
@@ -100,7 +101,7 @@ def update_plan(plan_id: int, payload: PlanPayload,
 
 
 @router.delete("/plans/{plan_id}")
-def delete_plan(plan_id: int, _: dict = Depends(require_role("superadmin", "admin"))):
+def delete_plan(plan_id: int, _: dict = Depends(require_role("superadmin"))):
     _get_plan(plan_id)
     execute("DELETE FROM plans WHERE id = ?", (plan_id,))
     return {"deleted": plan_id}
@@ -109,7 +110,14 @@ def delete_plan(plan_id: int, _: dict = Depends(require_role("superadmin", "admi
 # ------------------------------------------------------------ subscriptions --
 
 @router.get("/subscriptions")
-def list_subscriptions(_: dict = Depends(require_role("superadmin", "admin"))):
+def list_subscriptions(actor: dict = Depends(require_role("superadmin", "admin"))):
+    """Superadmin sees every subscription; a workspace admin only those of the
+    members of their own workspace."""
+    scope, params = "", ()
+    if actor["role"] != "superadmin":
+        scope = ("WHERE us.user_id IN (SELECT user_id FROM workspace_members "
+                 "WHERE workspace_id = ?)")
+        params = (current_ws(),)
     return query(
         """SELECT us.id, us.user_id, us.plan_id, us.status, us.period_start,
                   us.period_end, us.searches_used, us.channel, us.payment_status,
@@ -118,7 +126,9 @@ def list_subscriptions(_: dict = Depends(require_role("superadmin", "admin"))):
            FROM user_subscriptions us
            JOIN users u ON u.id = us.user_id
            JOIN plans p ON p.id = us.plan_id
-           ORDER BY us.id DESC LIMIT 200"""
+           """ + scope + """
+           ORDER BY us.id DESC LIMIT 200""",
+        params,
     )
 
 
@@ -126,7 +136,7 @@ def list_subscriptions(_: dict = Depends(require_role("superadmin", "admin"))):
 def assign_subscription(user_id: int, payload: AssignPayload,
                         actor: dict = Depends(require_role("superadmin", "admin"))):
     target = query_one("SELECT id, username FROM users WHERE id = ?", (user_id,))
-    if not target:
+    if not target or not can_manage_user(actor, user_id):
         raise HTTPException(404, "User not found")
     plan = _get_plan(payload.plan_id)
     days = payload.period_days or plan["period_days"]
@@ -182,9 +192,9 @@ def order_subscription(payload: OrderPayload, request: Request):
 
 @router.post("/subscriptions/{sub_id}/approve")
 def approve_subscription(sub_id: int,
-                         _: dict = Depends(require_role("superadmin", "admin"))):
+                         actor: dict = Depends(require_role("superadmin", "admin"))):
     row = query_one("SELECT * FROM user_subscriptions WHERE id = ?", (sub_id,))
-    if not row:
+    if not row or not can_manage_user(actor, row["user_id"]):
         raise HTTPException(404, "Subscription not found")
     plan = _get_plan(row["plan_id"])
     expire_previous_active(row["user_id"], keep_sub_id=sub_id)
@@ -200,9 +210,9 @@ def approve_subscription(sub_id: int,
 
 @router.post("/subscriptions/{sub_id}/reject")
 def reject_subscription(sub_id: int,
-                        _: dict = Depends(require_role("superadmin", "admin"))):
+                        actor: dict = Depends(require_role("superadmin", "admin"))):
     row = query_one("SELECT * FROM user_subscriptions WHERE id = ?", (sub_id,))
-    if not row:
+    if not row or not can_manage_user(actor, row["user_id"]):
         raise HTTPException(404, "Subscription not found")
     execute(
         "UPDATE user_subscriptions SET status = 'rejected', updated_at = ? WHERE id = ?",
@@ -213,9 +223,9 @@ def reject_subscription(sub_id: int,
 
 @router.post("/subscriptions/{sub_id}/cancel")
 def cancel_subscription(sub_id: int,
-                        _: dict = Depends(require_role("superadmin", "admin"))):
+                        actor: dict = Depends(require_role("superadmin", "admin"))):
     row = query_one("SELECT * FROM user_subscriptions WHERE id = ?", (sub_id,))
-    if not row:
+    if not row or not can_manage_user(actor, row["user_id"]):
         raise HTTPException(404, "Subscription not found")
     execute(
         "UPDATE user_subscriptions SET status = 'cancelled', updated_at = ? WHERE id = ?",
@@ -261,18 +271,23 @@ def payment_mode(request: Request):
     if not user:
         raise HTTPException(401, "Not authenticated")
     enabled = payment_enabled()
+    member_scope = ("AND user_id IN (SELECT user_id FROM workspace_members "
+                    "WHERE workspace_id = ?)")
+    sp = (current_ws(),)
+    if user["role"] == "superadmin":
+        member_scope, sp = "", ()
     active_count = query_one(
-        "SELECT COUNT(*) AS n FROM user_subscriptions WHERE status = 'active'"
-    )["n"]
+        "SELECT COUNT(*) AS n FROM user_subscriptions WHERE status = 'active' " + member_scope,
+        sp)["n"]
     pending_count = query_one(
-        "SELECT COUNT(*) AS n FROM user_subscriptions WHERE status = 'pending'"
-    )["n"]
+        "SELECT COUNT(*) AS n FROM user_subscriptions WHERE status = 'pending' " + member_scope,
+        sp)["n"]
     return {"enabled": enabled, "active_subscriptions": active_count,
             "pending_orders": pending_count}
 
 
 @router.post("/settings/payment")
 def set_payment_mode(payload: StatusPayload,
-                     _: dict = Depends(require_role("superadmin", "admin"))):
+                     _: dict = Depends(require_role("superadmin"))):
     set_payment_enabled(payload.enabled)
     return {"enabled": bool(payload.enabled)}

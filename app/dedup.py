@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from difflib import SequenceMatcher
 
-from .db import get_conn, utcnow
+from .db import current_ws, get_conn, utcnow
 
 FUZZY_THRESHOLD = 0.80
 
@@ -59,14 +59,17 @@ def find_duplicate(conn, candidate: dict) -> tuple[dict | None, str | None]:
     """Return (existing_lead, reason) or (None, None)."""
     place_id = candidate.get("place_id")
     if place_id:
-        row = conn.execute("SELECT * FROM leads WHERE place_id = ?", (place_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM leads WHERE workspace_id = ? AND place_id = ?",
+            (current_ws(), place_id)).fetchone()
         if row:
             return dict(row), "place_id"
 
     phone = candidate.get("phone")
     if phone:
         row = conn.execute(
-            "SELECT * FROM leads WHERE phone = ? AND phone != ''", (phone,)
+            "SELECT * FROM leads WHERE workspace_id = ? AND phone = ? AND phone != ''",
+            (current_ws(), phone)
         ).fetchone()
         if row:
             return dict(row), "phone"
@@ -76,8 +79,9 @@ def find_duplicate(conn, candidate: dict) -> tuple[dict | None, str | None]:
         return None, None
 
     rows = conn.execute(
-        "SELECT * FROM leads WHERE LOWER(COALESCE(city,'')) = LOWER(COALESCE(?,''))",
-        (city,),
+        "SELECT * FROM leads WHERE workspace_id = ? "
+        "AND LOWER(COALESCE(city,'')) = LOWER(COALESCE(?,''))",
+        (current_ws(), city),
     ).fetchall()
     norm_candidate = normalise_name(name)
     best, best_score = None, 0.0
@@ -132,10 +136,11 @@ def merge_into_existing(conn, existing: dict, candidate: dict) -> list[str]:
 
 
 def dedupe_existing_leads() -> list[dict]:
-    """Sweep the whole table for duplicates that slipped in. Returns merge report."""
+    """Sweep the current workspace for duplicates that slipped in. Returns merge report."""
     merged = []
     with get_conn() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM leads ORDER BY id").fetchall()]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM leads WHERE workspace_id = ? ORDER BY id", (current_ws(),)).fetchall()]
         seen: list[dict] = []
         for lead in rows:
             match = None
@@ -157,6 +162,16 @@ def dedupe_existing_leads() -> list[dict]:
                 filled = merge_into_existing(conn, match, lead)
                 conn.execute("UPDATE interactions SET lead_id = ? WHERE lead_id = ?",
                              (match["id"], lead["id"]))
+                # Keep what we learned about the duplicate; IGNORE skips rows the
+                # survivor already has (the leftovers cascade away with the lead).
+                for table in ("contacts", "email_addresses", "social_profiles"):
+                    conn.execute(f"UPDATE IGNORE {table} SET lead_id = ? WHERE lead_id = ?",
+                                 (match["id"], lead["id"]))
+                conn.execute("UPDATE IGNORE field_sources SET entity_id = ? "
+                             "WHERE entity_type = 'lead' AND entity_id = ?",
+                             (match["id"], lead["id"]))
+                conn.execute("DELETE FROM field_sources WHERE entity_type = 'lead' "
+                             "AND entity_id = ?", (lead["id"],))
                 conn.execute("DELETE FROM leads WHERE id = ?", (lead["id"],))
                 merged.append({
                     "removed_id": lead["id"],

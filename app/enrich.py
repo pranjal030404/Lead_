@@ -16,7 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from . import http, website
+from . import (audit, emailintel, http, leadscore, lineage, opportunities, people, social,
+               website)
 from .config import settings
 from .db import execute, log_automation, log_failure, query_one, utcnow
 from .quota import QuotaExceeded, check_and_reserve
@@ -32,6 +33,27 @@ def _update(lead_id: int, fields: dict) -> None:
     fields["updated_at"] = utcnow()
     assignments = ", ".join(f"{k} = ?" for k in fields)
     execute(f"UPDATE leads SET {assignments} WHERE id = ?", (*fields.values(), lead_id))
+
+
+def _record_provenance(lead_id: int, fields: dict, source: str, source_type: str) -> None:
+    """Lineage + registry rows for the contact-relevant fields a stage just wrote."""
+    lineage.record_many(lead_id, fields, source, source_type)
+    if fields.get("email"):
+        emailintel.register(lead_id, fields["email"], source, source_type)
+    social.register_lead_columns(lead_id, fields, source, source_type)
+
+
+def _record_extras(lead_id: int, extras: dict, source: tuple | None) -> None:
+    """Secondary findings from a stage: other addresses on the page, and people
+    the source itself published. Stored with the stage's source, nothing more."""
+    src, src_type = source or ("unknown", "system")
+    for address in extras.get("emails") or []:
+        emailintel.register(lead_id, address, src, src_type)
+    for person in extras.get("people") or []:
+        people.add_contact(lead_id, person.get("name"), person.get("title"),
+                           email=person.get("email"), phone=person.get("phone"),
+                           linkedin_url=person.get("linkedin_url"), source=src,
+                           source_type=src_type)
 
 
 def _website_check_is_fresh(lead: dict) -> bool:
@@ -61,6 +83,9 @@ def stage_website(lead: dict) -> dict:
         email, valid, _ = validate_email(result["emails"][0])
         fields["email"] = email
         fields["email_valid"] = 1 if valid else 0
+    # Everything above was read off the business's own website.
+    fields["_source"] = ("website_scrape", "website")
+    fields["_extras"] = {"emails": result["emails"], "people": result["people"]}
     return fields
 
 
@@ -85,7 +110,7 @@ def stage_email(lead: dict) -> dict:
     for candidate in website.find_contact_email(lead.get("website_url")):
         email, valid, _ = validate_email(candidate)
         if valid:
-            return {"email": email, "email_valid": 1}
+            return {"email": email, "email_valid": 1, "_source": ("website_scrape", "website")}
 
     # Paid fallback, HOT leads only, hard-capped at the free tier.
     if not settings.hunter_api_key or (lead.get("lead_priority") != "HOT"):
@@ -110,15 +135,38 @@ def stage_email(lead: dict) -> dict:
         if not emails:
             return {}
         email, valid, _ = validate_email(emails[0].get("value"))
-        fields = {"email": email, "email_valid": 1 if valid else 0}
+        fields = {"email": email, "email_valid": 1 if valid else 0,
+                  "_source": ("hunter", "enrichment_api")}
         first = emails[0].get("first_name")
         last = emails[0].get("last_name")
         if first and not lead.get("owner_name"):
             fields["owner_name"] = " ".join(p for p in (first, last) if p)
+        if first and last:
+            fields["_extras"] = {"people": [{
+                "name": f"{first} {last}", "title": emails[0].get("position"),
+                "email": email, "phone": emails[0].get("phone_number"),
+                "linkedin_url": emails[0].get("linkedin")}]}
         return fields
     except Exception as exc:  # noqa: BLE001
         log_failure("enrich.email", str(exc), lead["id"])
         return {}
+
+
+def stage_audit(lead: dict) -> None:
+    """Stage 6 - deep website audit + opportunities (cheapest-first gated).
+
+    The multi-request audit only runs for leads that already look worth pitching
+    (score >= DEEP_AUDIT_MIN_SCORE), with a live site, and not audited recently.
+    Opportunity detection itself is free, so it always runs (that is what turns
+    "no website" into a sellable opportunity)."""
+    lead_id = lead["id"]
+    if (settings.deep_audit_enabled and lead.get("website_url")
+            and lead.get("has_website") != 0
+            and (lead.get("lead_score") or 0) >= settings.deep_audit_min_score
+            and not audit.audit_is_fresh(lead_id)):
+        audit.run_audit(lead_id)
+        return
+    opportunities.refresh_for_lead(lead_id)
 
 
 def stage_validate(lead: dict) -> dict:
@@ -146,10 +194,22 @@ def stage_score(lead: dict) -> dict:
 
 
 def enrich_lead(lead_id: int) -> dict:
-    """Run the full pipeline for one lead. Returns the final lead row."""
+    """Run the full pipeline for one lead. Returns the final lead row.
+
+    Runs on pool threads that carry no request context, so the workspace comes
+    from the lead itself: failures logged here are filed under the right tenant.
+    Callers exposed to users must check lead ownership first (the router does).
+    """
+    from .db import workspace_context
+
     lead = query_one("SELECT * FROM leads WHERE id = ?", (lead_id,))
     if not lead:
         raise ValueError(f"Lead {lead_id} not found")
+    with workspace_context(lead["workspace_id"]):
+        return _enrich_lead(lead_id, lead)
+
+
+def _enrich_lead(lead_id: int, lead: dict) -> dict:
 
     _update(lead_id, {"enrichment_status": "partial", "enrichment_error": None})
     errors: list[str] = []
@@ -163,8 +223,15 @@ def enrich_lead(lead_id: int) -> dict:
         try:
             fields = stage(lead)
             if fields:
-                _update(lead_id, fields)
-                lead.update(fields)
+                source = fields.pop("_source", None)
+                extras = fields.pop("_extras", None)
+                if fields:
+                    _update(lead_id, fields)
+                    lead.update(fields)
+                    if source:
+                        _record_provenance(lead_id, fields, *source)
+                if extras:
+                    _record_extras(lead_id, extras, source)
         except Exception as exc:  # noqa: BLE001 - one bad stage must not sink the lead
             errors.append(f"{name}: {exc}")
             log_failure(f"enrich.{name}", str(exc), lead_id)
@@ -172,6 +239,16 @@ def enrich_lead(lead_id: int) -> dict:
     scored = stage_score(lead)
     _update(lead_id, scored)
     lead.update(scored)
+    try:
+        lineage.refresh_lead(lead_id)
+    except Exception as exc:  # noqa: BLE001 - confidence is advisory, never sink the lead
+        log_failure("enrich.lineage", str(exc), lead_id)
+    try:
+        stage_audit(lead)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"audit: {exc}")
+        log_failure("enrich.audit", str(exc), lead_id)
+    leadscore.safe_recompute(lead_id)      # signals + multi-score, from everything above
 
     _update(lead_id, {
         "enrichment_status": "complete" if not errors else "partial",
@@ -218,18 +295,23 @@ def enrich_many(lead_ids: list[int], on_progress=None) -> dict:
     return {"enriched": done, "failed": failed, "hot_ids": hot_ids}
 
 
-def enrich_pending(limit: int = 50) -> dict:
-    """Enrich every lead that hasn't been through the pipeline yet."""
+def enrich_pending(limit: int = 50, workspace_id: int | None = None) -> dict:
+    """Enrich every lead that hasn't been through the pipeline yet.
+
+    `workspace_id` limits the sweep to one tenant; None is the system-wide
+    scheduler pass (each lead is still enriched inside its own workspace)."""
+    scope, sp = ("", ()) if workspace_id is None else (" AND workspace_id = ?", (workspace_id,))
     rows = query_one(
         "SELECT COUNT(*) AS n FROM leads WHERE enrichment_status IN ('pending','partial')"
+        + scope, sp
     )
     pending_total = rows["n"] if rows else 0
     from .db import query
 
     leads = query(
-        "SELECT id FROM leads WHERE enrichment_status IN ('pending','partial') "
-        "ORDER BY id LIMIT ?",
-        (limit,),
+        "SELECT id FROM leads WHERE enrichment_status IN ('pending','partial')"
+        f"{scope} ORDER BY id LIMIT ?",
+        (*sp, limit),
     )
     result = enrich_many([row["id"] for row in leads])
 

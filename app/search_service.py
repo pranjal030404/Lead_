@@ -11,9 +11,10 @@ import hashlib
 import threading
 from datetime import datetime, timedelta, timezone
 
+from . import emailintel, lineage, social
 from .config import settings
-from .db import (execute, get_conn, log_automation, log_failure, query, query_one,
-                 utcnow)
+from .db import (current_ws, execute, get_conn, log_automation, log_failure, query,
+                 query_one, utcnow, workspace_context)
 from .enrich import enrich_many
 from .providers import get_provider
 from .quota import QuotaExceeded
@@ -21,7 +22,7 @@ from .scoring import score_lead
 from .validation import normalise_phone, whatsapp_number
 
 LEAD_COLUMNS = [
-    "business_name", "owner_name", "phone", "phone_valid", "email", "whatsapp",
+    "workspace_id", "business_name", "owner_name", "phone", "phone_valid", "email", "whatsapp",
     "website_url", "address", "city", "area", "pincode", "state", "country",
     "lat", "lng", "place_id", "google_maps_url", "google_rating", "google_reviews",
     "instagram_url", "facebook_url", "linkedin_url", "business_status",
@@ -55,8 +56,9 @@ def coverage_status(row: dict) -> str:
 
 def get_coverage(niche: str, city: str, area: str = "", country: str = "") -> dict:
     row = query_one(
-        "SELECT * FROM search_coverage WHERE city = ? AND area = ? AND niche = ? AND country = ?",
-        (city, area or "", niche, country or ""),
+        "SELECT * FROM search_coverage WHERE workspace_id = ? AND city = ? AND area = ? "
+        "AND niche = ? AND country = ?",
+        (current_ws(), city, area or "", niche, country or ""),
     )
     if not row:
         return {"status": "NEVER", "times_searched": 0, "total_leads_found": 0,
@@ -66,9 +68,10 @@ def get_coverage(niche: str, city: str, area: str = "", country: str = "") -> di
 
 
 def _update_coverage(niche, city, area, country, found, new_leads) -> None:
-    key = (city, area or "", niche, country or "")
+    key = (current_ws(), city, area or "", niche, country or "")
     existing = query_one(
-        "SELECT * FROM search_coverage WHERE city = ? AND area = ? AND niche = ? AND country = ?",
+        "SELECT * FROM search_coverage WHERE workspace_id = ? AND city = ? AND area = ? "
+        "AND niche = ? AND country = ?",
         key,
     )
     now = utcnow()
@@ -85,11 +88,11 @@ def _update_coverage(niche, city, area, country, found, new_leads) -> None:
     else:
         execute(
             """INSERT INTO search_coverage
-               (city, area, pincode, niche, country, last_searched, times_searched,
-                total_leads_found, new_leads_last_search, barren_runs, status,
-                created_at, updated_at)
-               VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?)""",
-            (city, area or "", None, niche, country or "", now, new_leads, new_leads,
+               (workspace_id, city, area, pincode, niche, country, last_searched,
+                times_searched, total_leads_found, new_leads_last_search, barren_runs,
+                status, created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?,?)""",
+            (current_ws(), city, area or "", None, niche, country or "", now, new_leads, new_leads,
              0 if new_leads else 1, "FRESH", now, now),
         )
 
@@ -145,8 +148,8 @@ def find_cached_search(
     row = query_one(
         """SELECT sc.*, s.status AS search_status
            FROM search_cache sc JOIN searches s ON s.id = sc.search_id
-           WHERE sc.fingerprint = ?""",
-        (fp,),
+           WHERE sc.workspace_id = ? AND sc.fingerprint = ?""",
+        (current_ws(), fp),
     )
     if not row or row["search_status"] != "COMPLETED":
         return None
@@ -180,14 +183,14 @@ def record_cache(
     now = utcnow()
     execute(
         """INSERT INTO search_cache
-           (fingerprint, niche, city, area, country, provider, lat, lng, radius_m,
-            search_id, result_count, created_at, updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+           (workspace_id, fingerprint, niche, city, area, country, provider, lat, lng,
+            radius_m, search_id, result_count, created_at, updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON DUPLICATE KEY UPDATE search_id = VALUES(search_id),
              result_count = VALUES(result_count),
              created_at = VALUES(created_at), updated_at = VALUES(updated_at)""",
-        (fp, niche, city, area or "", country or "", provider_name, lat, lng, radius_m,
-         search_id, result_count, now, now),
+        (current_ws(), fp, niche, city, area or "", country or "", provider_name, lat, lng,
+         radius_m, search_id, result_count, now, now),
     )
 
 
@@ -205,8 +208,9 @@ def _serve_from_cache(
     and is logged, but enrichment/alerts are not re-run."""
     source_id = cached["search_id"]
     source = query_one(
-        "SELECT results_found, hot_count, warm_count, cold_count FROM searches WHERE id = ?",
-        (source_id,),
+        "SELECT results_found, hot_count, warm_count, cold_count FROM searches "
+        "WHERE id = ? AND workspace_id = ?",
+        (source_id, current_ws()),
     ) or {}
     results_found = cached.get("result_count") or source.get("results_found") or 0
     now = utcnow()
@@ -237,6 +241,21 @@ def _serve_from_cache(
 
 # ------------------------------------------------------------------ search --
 
+def _record_candidate_provenance(lead_id: int, candidate: dict, fields: list[str],
+                                 provider_name: str) -> None:
+    """Lineage for values a provider supplied. Failure here must never lose the
+    lead, so it is logged and swallowed."""
+    try:
+        values = {f: candidate.get(f) for f in fields}
+        lineage.record_many(lead_id, values, provider_name, "provider")
+        if values.get("email"):
+            emailintel.register(lead_id, values["email"], provider_name, "provider")
+        social.register_lead_columns(lead_id, values, provider_name, "provider")
+        lineage.refresh_lead(lead_id)
+    except Exception as exc:  # noqa: BLE001
+        log_failure("search.lineage", str(exc), lead_id)
+
+
 def _insert_lead(conn, candidate: dict, niche: str, search_id: int) -> int:
     phone, phone_valid = normalise_phone(candidate.get("phone"), candidate.get("country"))
     candidate["phone"] = phone
@@ -247,7 +266,7 @@ def _insert_lead(conn, candidate: dict, niche: str, search_id: int) -> int:
     now = utcnow()
     values = {col: candidate.get(col) for col in LEAD_COLUMNS}
     values.update(
-        niche=niche, search_id=search_id, status="NEW",
+        workspace_id=current_ws(), niche=niche, search_id=search_id, status="NEW",
         found_date=now, created_at=now, updated_at=now,
         source=candidate.get("source") or "Search",
     )
@@ -273,13 +292,25 @@ def run_search(
     lng: float | None = None,
     radius_m: int | None = None,
     user_id: int | None = None,
+    workspace_id: int | None = None,
 ) -> dict:
     """Run one search end to end. Blocking - call via start_search for the API.
+
+    Runs inside `workspace_id` (default: the caller's active workspace). Worker
+    threads inherit no request context, so this is entered explicitly here.
 
     Passing lat/lng centres the search on a point instead of a geocoded city
     name, which is what the "near me" button does. `user_id` marks who owns the
     search so a completed run can be charged against their subscription.
     """
+    workspace_id = workspace_id if workspace_id is not None else current_ws()
+    with workspace_context(workspace_id):
+        return _run_search(niche, city, area, country, max_results, provider_name,
+                           triggered_by, search_id, enrich, lat, lng, radius_m, user_id)
+
+
+def _run_search(niche, city, area, country, max_results, provider_name, triggered_by,
+                search_id, enrich, lat, lng, radius_m, user_id) -> dict:
     from .dedup import find_duplicate, merge_into_existing
 
     max_results = min(max_results, settings.max_results_per_search)
@@ -288,10 +319,10 @@ def run_search(
     if search_id is None:
         search_id = execute(
             """INSERT INTO searches
-               (user_id, niche, city, area, country, provider, max_results, status, progress,
-                triggered_by, started_at)
-               VALUES(?,?,?,?,?,?,?,'RUNNING','Starting...',?,?)""",
-            (user_id, niche, city, area or "", country or "", provider.name, max_results,
+               (workspace_id, user_id, niche, city, area, country, provider, max_results,
+                status, progress, triggered_by, started_at)
+               VALUES(?,?,?,?,?,?,?,?,'RUNNING','Starting...',?,?)""",
+            (current_ws(), user_id, niche, city, area or "", country or "", provider.name, max_results,
              triggered_by, utcnow()),
         )
 
@@ -313,7 +344,8 @@ def run_search(
     quota_hit = False
 
     def progress(message: str) -> None:
-        execute("UPDATE searches SET progress = ? WHERE id = ?", (message, search_id))
+        execute("UPDATE searches SET progress = ? WHERE id = ? AND workspace_id = ?",
+                (message, search_id, current_ws()))
 
     try:
         where = f"{radius_m or settings.nearby_radius_m}m around you" if lat is not None \
@@ -341,6 +373,8 @@ def run_search(
                         conn.execute("COMMIT")
                         stats["duplicates_skipped"] += 1
                         if filled:
+                            _record_candidate_provenance(existing["id"], candidate, filled,
+                                                         provider.name)
                             log_automation(
                                 "search",
                                 f"Duplicate ({reason}): merged {', '.join(filled)} into "
@@ -384,6 +418,8 @@ def run_search(
 
             with get_conn() as conn:
                 lead_id = _insert_lead(conn, candidate, niche, search_id)
+            _record_candidate_provenance(lead_id, candidate, list(lineage.TRACKED_FIELDS),
+                                         provider.name)
             new_ids.append(lead_id)
             stats["new_leads"] += 1
             progress(f"{index}/{len(candidates)} checked - {stats['new_leads']} new leads")
@@ -407,9 +443,9 @@ def run_search(
         if new_ids:
             placeholders = ",".join("?" for _ in new_ids)
             counts = query(
-                f"SELECT lead_priority, COUNT(*) AS n FROM leads WHERE id IN ({placeholders}) "
-                "GROUP BY lead_priority",
-                tuple(new_ids),
+                f"SELECT lead_priority, COUNT(*) AS n FROM leads WHERE workspace_id = ? "
+                f"AND id IN ({placeholders}) GROUP BY lead_priority",
+                (current_ws(), *new_ids),
             )
             for row in counts:
                 key = f"{(row['lead_priority'] or 'cold').lower()}_count"
@@ -460,25 +496,32 @@ def run_search(
 
 def start_search(**kwargs) -> int:
     """Kick a search off in a worker thread; returns the search id immediately."""
+    workspace_id = kwargs.pop("workspace_id", None)
+    if workspace_id is None:
+        workspace_id = current_ws()
     search_id = execute(
         """INSERT INTO searches
-           (user_id, niche, city, area, country, provider, max_results, status, progress,
-            triggered_by, started_at)
-           VALUES(?,?,?,?,?,?,?,'RUNNING','Queued...',?,?)""",
-        (kwargs.get("user_id"),
+           (workspace_id, user_id, niche, city, area, country, provider, max_results,
+            status, progress, triggered_by, started_at)
+           VALUES(?,?,?,?,?,?,?,?,'RUNNING','Queued...',?,?)""",
+        (workspace_id, kwargs.get("user_id"),
          kwargs.get("niche"), kwargs.get("city"), kwargs.get("area") or "",
          kwargs.get("country") or "", kwargs.get("provider_name") or settings.provider,
          kwargs.get("max_results", 20), kwargs.get("triggered_by", "manual"), utcnow()),
     )
     thread = threading.Thread(
-        target=run_search, kwargs={**kwargs, "search_id": search_id}, daemon=True
+        target=run_search,
+        kwargs={**kwargs, "search_id": search_id, "workspace_id": workspace_id}, daemon=True
     )
     thread.start()
     return search_id
 
 
 def cancel_search(search_id: int) -> bool:
-    if search_id in _running:
+    """Cancel a running search of the active workspace (others' ids are ignored)."""
+    if search_id in _running and query_one(
+            "SELECT 1 AS x FROM searches WHERE id = ? AND workspace_id = ?",
+            (search_id, current_ws())):
         _running[search_id] = False
         return True
     return False

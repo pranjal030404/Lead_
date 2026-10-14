@@ -45,6 +45,8 @@ def calls_this_month(service: str) -> int:
 def cap_for(service: str) -> int:
     if service == "hunter":
         return settings.max_hunter_calls_per_month
+    if service == "pagespeed":
+        return settings.max_pagespeed_calls_per_day
     return settings.max_google_calls_per_day
 
 
@@ -85,7 +87,7 @@ def check_and_reserve(service: str = "google_places", tier: str = "default", n: 
 
     # Part 7.6 - warn on the approach, not the wall. Outside the transaction so
     # a mail failure can never roll back a reservation we already committed.
-    if not monthly:
+    if not monthly and service == "google_places":
         from . import notify
 
         notify.alert_quota(used + n, cap)
