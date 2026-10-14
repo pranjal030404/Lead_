@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from .. import audit, leadscore, opportunities
 from ..config import settings
-from ..db import current_ws, query, query_one
+from ..db import current_ws, lead_scope, query, query_one
 from ..security import rate_limit, require_role
 from .leads import _own_lead
 
@@ -49,6 +49,7 @@ def get_audit(audit_id: int):
     found = audit.get_audit(audit_id)
     if not found:
         raise HTTPException(404, "Audit not found")
+    _own_lead(found["lead_id"], "id")
     return found
 
 
@@ -73,6 +74,12 @@ class StatusPayload(BaseModel):
 
 @router.patch("/opportunities/{opportunity_id}")
 def update_opportunity(opportunity_id: int, payload: StatusPayload):
+    scope, params = lead_scope("l")
+    owned = query_one(
+        f"SELECT o.lead_id FROM lead_opportunities o JOIN leads l ON l.id = o.lead_id "
+        f"WHERE o.id = ? AND {scope}", (opportunity_id, *params))
+    if not owned:
+        raise HTTPException(404, "Opportunity not found")
     try:
         row = opportunities.set_status(opportunity_id, payload.status.upper())
     except ValueError as exc:
@@ -90,7 +97,8 @@ def list_opportunities(
     limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
 ):
     """The workspace's opportunity pipeline, biggest first."""
-    clauses, params = ["o.workspace_id = ?"], [current_ws()]
+    scope, sp = lead_scope("l")
+    clauses, params = [scope], list(sp)
     for col, val in (("o.opportunity_type", type and type.upper()),
                      ("o.severity", severity and severity.upper()),
                      ("o.status", status and status.upper())):
@@ -117,15 +125,17 @@ def list_opportunities(
 
 @router.get("/opportunities/summary")
 def opportunity_summary():
+    scope, sp = lead_scope("l")
     rows = query(
-        "SELECT opportunity_type AS type, severity, COUNT(*) AS n, "
-        "SUM(est_value_min) AS value_min, SUM(est_value_max) AS value_max "
-        "FROM lead_opportunities WHERE workspace_id = ? AND status = 'OPEN' "
-        "GROUP BY opportunity_type, severity ORDER BY value_max DESC", (current_ws(),))
+        f"SELECT o.opportunity_type AS type, o.severity, COUNT(*) AS n, "
+        f"SUM(o.est_value_min) AS value_min, SUM(o.est_value_max) AS value_max "
+        f"FROM lead_opportunities o JOIN leads l ON l.id = o.lead_id "
+        f"WHERE {scope} AND o.status = 'OPEN' "
+        f"GROUP BY o.opportunity_type, o.severity ORDER BY value_max DESC", tuple(sp))
     total = query_one(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(est_value_min),0) AS lo, "
-        "COALESCE(SUM(est_value_max),0) AS hi FROM lead_opportunities "
-        "WHERE workspace_id = ? AND status = 'OPEN'", (current_ws(),))
+        f"SELECT COUNT(*) AS n, COALESCE(SUM(o.est_value_min),0) AS lo, "
+        f"COALESCE(SUM(o.est_value_max),0) AS hi FROM lead_opportunities o "
+        f"JOIN leads l ON l.id = o.lead_id WHERE {scope} AND o.status = 'OPEN'", tuple(sp))
     return {"by_type": rows, "open": total["n"],
             "estimated_value": {"min": int(total["lo"]), "max": int(total["hi"]),
                                 "currency": "INR"},

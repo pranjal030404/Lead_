@@ -583,6 +583,37 @@ ul.reasons li::before { content: "✓"; color: var(--ok); }
   .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
 }
 
+/* Phones: tighten spacing, stack form rows, let wide tables and tab strips
+   scroll instead of squashing. Everything here is additive - desktop keeps the
+   layout above. */
+@media (max-width: 640px) {
+  .main { padding: 16px 12px 56px; }
+  h1 { font-size: 20px; }
+  .page-head { margin-bottom: 18px; gap: 10px; }
+  .card { padding: 14px; }
+  .grid.cols-4, .grid.cols-5 { grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stat .value { font-size: 24px; }
+
+  /* One control per line is easier to tap than two cramped ones. */
+  .row > * { min-width: 100%; }
+  .row > .shrink { min-width: 0; }
+
+  .table-wrap { -webkit-overflow-scrolling: touch; }
+
+  .tabs { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tabs button { white-space: nowrap; }
+
+  .drawer { width: 100vw; padding: 20px 16px 60px; }
+  dl.kv { grid-template-columns: 1fr; gap: 2px; }
+  dl.kv dt { margin-top: 8px; }
+
+  #toast { max-width: calc(100vw - 24px); }
+
+  .login-pane { padding: 20px 16px; }
+  .login-card { padding: 24px 20px; }
+}
+
 /* =================================================== reduced motion --- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

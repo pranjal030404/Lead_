@@ -16,8 +16,8 @@ from urllib.parse import quote
 
 from . import emailintel, http
 from .config import settings
-from .db import (current_ws, execute, log_automation, log_failure, query, query_one,
-                 scalar, utcnow, workspace_context)
+from .db import (current_ws, execute, lead_scope, log_automation, log_failure, query,
+                 query_one, scalar, utcnow, workspace_context)
 from .scoring import observation_for, website_issue_for
 
 RESEND_URL = "https://api.resend.com/emails"
@@ -186,10 +186,15 @@ def _days_since(value: str | None) -> int | None:
 
 
 def generate_followups() -> dict:
-    """Generation only - never sends. Part 8.5. Acts on the current workspace."""
+    """Generation only - never sends. Part 8.5. Acts on the current workspace.
+
+    Scoped to the caller's leads when a signed-in user is present (a regular
+    user only nudges their own pipeline); background runs with no user context
+    cover the whole workspace."""
     generated, lost = 0, 0
-    leads = query("SELECT * FROM leads WHERE workspace_id = ? AND status = 'CONTACTED' "
-                  "AND last_contacted_date IS NOT NULL", (current_ws(),))
+    scope, params = lead_scope()
+    leads = query(f"SELECT * FROM leads WHERE {scope} AND status = 'CONTACTED' "
+                  f"AND last_contacted_date IS NOT NULL", tuple(params))
 
     for lead in leads:
         days = _days_since(lead["last_contacted_date"])
@@ -333,13 +338,15 @@ def log_interaction(lead_id: int, kind: str, subject: str, content: str,
     )
 
 
-def send_approved(limit: int | None = None, workspace_id: int | None = None) -> dict:
+def send_approved(limit: int | None = None, workspace_id: int | None = None,
+                  owner_user_id: int | None = None) -> dict:
     """Send APPROVED email rows, respecting the (shared) hourly cap.
 
     `workspace_id` limits sending to one tenant (the API passes the caller's).
     None means every workspace - only the scheduler uses that. Each row is sent
     inside its own workspace so suppression and logging use that tenant's data.
-    """
+    `owner_user_id` narrows further to one person's leads (a regular user's
+    manual send); None leaves every owner in scope (scheduler/admin)."""
     budget = settings.max_emails_per_hour - sent_last_hour()
     if budget <= 0:
         return {"sent": 0, "failed": 0, "skipped": 0,
@@ -347,12 +354,18 @@ def send_approved(limit: int | None = None, workspace_id: int | None = None) -> 
     if limit:
         budget = min(budget, limit)
 
-    scope, params = "", [budget]
+    clauses, params = ["q.status = 'APPROVED'", "q.channel = 'email'"], []
+    source = "approval_queue q"
+    if owner_user_id is not None:
+        source += " JOIN leads l ON l.id = q.lead_id"
+        clauses.append("l.owner_user_id = ?")
+        params.append(owner_user_id)
     if workspace_id is not None:
-        scope, params = " AND workspace_id = ?", [workspace_id, budget]
+        clauses.append("q.workspace_id = ?")
+        params.append(workspace_id)
+    params.append(budget)
     rows = query(
-        "SELECT * FROM approval_queue WHERE status = 'APPROVED' AND channel = 'email'"
-        f"{scope} ORDER BY id LIMIT ?",
+        f"SELECT q.* FROM {source} WHERE {' AND '.join(clauses)} ORDER BY q.id LIMIT ?",
         tuple(params),
     )
     sent = failed = skipped = 0

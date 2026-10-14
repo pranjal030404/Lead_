@@ -445,6 +445,11 @@ _local = threading.local()
 # workspace id explicitly and enter `workspace_context` itself.
 _ws_var: contextvars.ContextVar[int | None] = contextvars.ContextVar("workspace_id", default=None)
 
+# The signed-in user for the current request, set by the auth middleware. None
+# for background work (the scheduler, worker threads), which therefore sees the
+# whole workspace rather than one person's slice of it.
+_user_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar("current_user", default=None)
+
 
 class NoWorkspace(RuntimeError):
     """A tenant-scoped operation ran with no workspace established."""
@@ -459,6 +464,47 @@ def current_ws() -> int:
 
 def current_ws_or_none() -> int | None:
     return _ws_var.get()
+
+
+def set_current_user(user: dict | None):
+    return _user_var.set(user)
+
+
+def reset_current_user(token) -> None:
+    _user_var.reset(token)
+
+
+def current_user() -> dict | None:
+    return _user_var.get()
+
+
+def lead_scope(alias: str = "") -> tuple[str, list]:
+    """SQL predicate + params for the leads the current user may see.
+
+    Every lead carries `owner_user_id`: who searched it (0 for system/imported
+    leads nobody owns). A regular user only sees their own; an admin/superadmin -
+    and background work with no user context - sees the whole workspace. `alias`
+    qualifies the columns when the leads table is joined (`lead_scope("l")` ->
+    `l.workspace_id = ? ...`).
+    """
+    prefix = f"{alias}." if alias else ""
+    ws = current_ws()
+    user = current_user()
+    if user and user.get("role") not in ("admin", "superadmin"):
+        return f"{prefix}workspace_id = ? AND {prefix}owner_user_id = ?", [ws, user["id"]]
+    return f"{prefix}workspace_id = ?", [ws]
+
+
+def search_scope(alias: str = "") -> tuple[str, list]:
+    """Like `lead_scope` but for the `searches` table, whose owner column is
+    `user_id`. A regular user sees only their own searches; admins and
+    background work see the whole workspace."""
+    prefix = f"{alias}." if alias else ""
+    ws = current_ws()
+    user = current_user()
+    if user and user.get("role") not in ("admin", "superadmin"):
+        return f"{prefix}workspace_id = ? AND {prefix}user_id = ?", [ws, user["id"]]
+    return f"{prefix}workspace_id = ?", [ws]
 
 
 @contextmanager
@@ -813,6 +859,45 @@ def _add_workspace_scope(conn: Conn) -> None:
                     )
 
 
+def _add_lead_owner(conn: Conn) -> None:
+    """Per-user lead ownership: leads.owner_user_id records who ran the search
+    that found a lead. Regular users see only their own leads; admin/superadmin
+    (and background work) see every lead in the workspace.
+
+    `place_id` uniqueness is re-keyed per owner, so two people who search the
+    same business each keep their own copy instead of the second search being
+    deduplicated away into the first person's lead. Legacy rows are backfilled
+    from the search that produced them. Rows with no attributable search (an
+    import, or an automated run with no owner) keep owner 0 - a sentinel, not a
+    real user id - which is what lets the unique key still bite: MySQL treats
+    NULLs in a unique index as distinct, so a nullable column would let the same
+    unowned place_id slip in twice.
+
+    Rollback: ALTER TABLE leads DROP INDEX uq_leads_place_owner,
+    ADD UNIQUE KEY uq_leads_place_id_ws (workspace_id, place_id),
+    DROP INDEX idx_leads_owner, DROP COLUMN owner_user_id."""
+    with conn.cursor() as cur:
+        if not _col_exists(cur, "leads", "owner_user_id"):
+            cur.execute(
+                "ALTER TABLE leads ADD COLUMN owner_user_id INT NOT NULL DEFAULT 0 "
+                "AFTER workspace_id"
+            )
+        cur.execute(
+            "UPDATE leads l JOIN searches s ON s.id = l.search_id "
+            "SET l.owner_user_id = s.user_id "
+            "WHERE l.owner_user_id = 0 AND s.user_id IS NOT NULL"
+        )
+        if not _index_exists(cur, "leads", "idx_leads_owner"):
+            cur.execute("ALTER TABLE leads ADD KEY idx_leads_owner (workspace_id, owner_user_id)")
+        if _index_exists(cur, "leads", "uq_leads_place_id_ws") \
+                and not _index_exists(cur, "leads", "uq_leads_place_owner"):
+            cur.execute("ALTER TABLE leads DROP INDEX uq_leads_place_id_ws")
+            cur.execute(
+                "ALTER TABLE leads ADD UNIQUE KEY uq_leads_place_owner "
+                "(workspace_id, owner_user_id, place_id)"
+            )
+
+
 def _create_intel_tables(conn: Conn) -> None:
     """Data-intelligence tables: field lineage, decision-maker contacts, email
     addresses (with classification) and social profiles; plus freshness /
@@ -1140,6 +1225,7 @@ MIGRATIONS: list[tuple[int, str, Any]] = [
     (7, "backfill field lineage for existing leads", _backfill_lineage),
     (8, "website audits and opportunities", _create_audit_tables),
     (9, "lead scores, signals, competitors", _create_scoring_tables),
+    (10, "leads.owner_user_id (per-user leads)", _add_lead_owner),
 ]
 
 CREATE_MIGRATIONS_TABLE = """

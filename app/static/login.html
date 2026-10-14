@@ -96,6 +96,13 @@
         }
         const data = await response.json().catch(() => ({}));
         error.textContent = data.detail || 'Sign in failed';
+        if (response.status === 403 && /admin/i.test(data.detail || '')) {
+          const link = document.createElement('a');
+          link.href = '/admin';
+          link.textContent = 'Go to admin sign-in';
+          link.style.marginLeft = '6px';
+          error.appendChild(link);
+        }
         error.style.display = 'block';
       } finally {
         button.disabled = false;

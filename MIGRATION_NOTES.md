@@ -92,3 +92,35 @@ enrichment pass, or `POST /api/leads/{id}/scores/recompute`.
 
 Rollback: DROP TABLE lead_competitors, lead_signals, lead_score_history, lead_scores;
 drop the five `leads` columns; delete version 9 from `schema_migrations`.
+
+## v2 / Phase 6 — per-user private leads (migration 10)
+
+**Back up first.** The upgrade runs automatically on the next start.
+
+- `leads` gains `owner_user_id INT NOT NULL DEFAULT 0`. `0` is the sentinel for
+  *system / unowned* leads (automation targets, imports, anything created with no
+  request user in context). It is deliberately **not nullable**: MySQL treats
+  NULLs in a unique index as distinct, so a nullable column would let duplicate
+  unowned rows slip past the dedup key.
+- Existing rows are backfilled from their search's author:
+  `UPDATE leads SET owner_user_id = (search owner) WHERE owner_user_id = 0 AND
+  the owning search has a user_id`. Leads with no attributable user stay `0`.
+- The place-id uniqueness moves from `uq_leads_place_id (workspace_id, place_id)`
+  to `uq_leads_place_owner (workspace_id, owner_user_id, place_id)`, and an index
+  `idx_leads_owner (workspace_id, owner_user_id)` is added (old key dropped only
+  after the replacement exists).
+
+Behaviour changes:
+- A regular user now sees only their own leads; workspace admins and
+  superadmins see every lead in the workspace. Background work with no request
+  user stays workspace-scoped.
+- Two users in the same workspace can each keep their own copy of the same
+  business (their `place_id` no longer collides).
+- Dedup and the search cache are owner-scoped, so a user is never served another
+  user's cached leads. Automated targets produce owner-`0` leads, visible only to
+  admins.
+
+Rollback: drop `idx_leads_owner`, re-add `uq_leads_place_id (workspace_id,
+place_id)`, drop the `owner_user_id` column, delete version 10 from
+`schema_migrations`. (Re-adding the old unique key fails if two users now hold
+the same `place_id`; restore the pre-upgrade backup instead in that case.)

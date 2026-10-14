@@ -4,8 +4,8 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..config import settings
-from ..db import (current_ws, execute, get_ws_setting, query, query_one, set_ws_setting,
-                  utcnow)
+from ..db import (current_user, current_ws, execute, get_ws_setting, lead_scope, query,
+                  query_one, set_ws_setting, utcnow)
 from ..outreach import (generate_followups, queue_message, send_approved,
                         set_approval_status, suppress, unsuppress)
 
@@ -65,8 +65,10 @@ def delete_template(template_id: int):
 # ---------------------------------------------------------- approval queue --
 
 def _own_queue(queue_id: int) -> dict:
-    row = query_one("SELECT * FROM approval_queue WHERE id = ? AND workspace_id = ?",
-                    (queue_id, current_ws()))
+    scope, params = lead_scope("l")
+    row = query_one(
+        "SELECT q.* FROM approval_queue q JOIN leads l ON l.id = q.lead_id "
+        f"WHERE q.id = ? AND {scope}", (queue_id, *params))
     if not row:
         raise HTTPException(404, "Queued message not found")
     return row
@@ -74,12 +76,13 @@ def _own_queue(queue_id: int) -> dict:
 
 @router.get("/approvals")
 def list_approvals(status: str = "PENDING", limit: int = Query(100, le=500)):
+    scope, params = lead_scope("l")
     return query(
-        """SELECT q.*, l.business_name, l.city, l.lead_priority, l.lead_score, l.phone
+        f"""SELECT q.*, l.business_name, l.city, l.lead_priority, l.lead_score, l.phone
            FROM approval_queue q JOIN leads l ON l.id = q.lead_id
-           WHERE q.workspace_id = ? AND q.status = ?
+           WHERE {scope} AND q.status = ?
            ORDER BY l.lead_score DESC, q.id ASC LIMIT ?""",
-        (current_ws(), status, limit),
+        (*params, status, limit),
     )
 
 
@@ -121,9 +124,17 @@ class BulkApprove(BaseModel):
 
 @router.post("/approvals/approve-all")
 def approve_all(payload: BulkApprove):
+    scope, params = lead_scope("l")
+    approved = 0
     for queue_id in payload.ids:
+        owned = query_one(
+            "SELECT q.id FROM approval_queue q JOIN leads l ON l.id = q.lead_id "
+            f"WHERE q.id = ? AND {scope}", (queue_id, *params))
+        if not owned:
+            continue
         set_approval_status(queue_id, "APPROVED")
-    return {"approved": len(payload.ids)}
+        approved += 1
+    return {"approved": approved}
 
 
 class QueuePayload(BaseModel):
@@ -135,8 +146,9 @@ class QueuePayload(BaseModel):
 
 @router.post("/approvals/queue")
 def queue_one(payload: QueuePayload):
-    lead = query_one("SELECT * FROM leads WHERE id = ? AND workspace_id = ?",
-                     (payload.lead_id, current_ws()))
+    scope, params = lead_scope()
+    lead = query_one(f"SELECT * FROM leads WHERE id = ? AND {scope}",
+                     (payload.lead_id, *params))
     if not lead:
         raise HTTPException(404, "Lead not found")
     queue_id = queue_message(lead, payload.template, payload.step, payload.channel)
@@ -156,7 +168,9 @@ def generate_now():
 
 @router.post("/approvals/send")
 def send_now(limit: int | None = None):
-    return send_approved(limit, workspace_id=current_ws())
+    user = current_user()
+    owner = user["id"] if user and user.get("role") not in ("admin", "superadmin") else None
+    return send_approved(limit, workspace_id=current_ws(), owner_user_id=owner)
 
 
 # ------------------------------------------------------------- suppression --

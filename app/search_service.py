@@ -108,6 +108,7 @@ def search_fingerprint(
     lat: float | None = None,
     lng: float | None = None,
     radius_m: int | None = None,
+    owner_user_id: int | None = None,
 ) -> str:
     """Hash of everything that defines a result set.
 
@@ -115,6 +116,11 @@ def search_fingerprint(
     users on different plans have different caps, and shares between them are
     the whole point of the cache. A different max_results still works - the
     cached snapshot simply serves the top-N the requester asked for.
+
+    owner_user_id *is* here: the cache points at another search's leads, and a
+    regular user must never be served somebody else's leads. Keying per owner
+    keeps the cache useful for the person who ran it and a miss for everyone
+    else (who then scrapes their own copy).
     """
     parts = (
         (niche or "").strip().lower(),
@@ -125,6 +131,7 @@ def search_fingerprint(
         round(float(lat), 6) if lat is not None else None,
         round(float(lng), 6) if lng is not None else None,
         int(radius_m) if radius_m else settings.nearby_radius_m,
+        int(owner_user_id) if owner_user_id is not None else None,
     )
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
@@ -138,13 +145,15 @@ def find_cached_search(
     lat: float | None = None,
     lng: float | None = None,
     radius_m: int | None = None,
+    owner_user_id: int | None = None,
 ) -> dict | None:
     """The cache entry (with its producing search) for an identical query, or
     None. Refused when the snapshot is older than the TTL or the search that
     produced it did not complete - either way the caller must scrape fresh."""
     if not settings.search_cache_enabled:
         return None
-    fp = search_fingerprint(niche, city, area, country, provider_name, lat, lng, radius_m)
+    fp = search_fingerprint(niche, city, area, country, provider_name, lat, lng, radius_m,
+                            owner_user_id)
     row = query_one(
         """SELECT sc.*, s.status AS search_status
            FROM search_cache sc JOIN searches s ON s.id = sc.search_id
@@ -175,11 +184,13 @@ def record_cache(
     lat: float | None = None,
     lng: float | None = None,
     radius_m: int | None = None,
+    owner_user_id: int | None = None,
 ) -> None:
     """Point the fingerprint at this completed search. `created_at` is reset on
     every refresh, so the TTL measures from the last scrape - a fresh run (manual
     or the automated sweep) starts a new 7-day serving window."""
-    fp = search_fingerprint(niche, city, area, country, provider_name, lat, lng, radius_m)
+    fp = search_fingerprint(niche, city, area, country, provider_name, lat, lng, radius_m,
+                            owner_user_id)
     now = utcnow()
     execute(
         """INSERT INTO search_cache
@@ -256,7 +267,8 @@ def _record_candidate_provenance(lead_id: int, candidate: dict, fields: list[str
         log_failure("search.lineage", str(exc), lead_id)
 
 
-def _insert_lead(conn, candidate: dict, niche: str, search_id: int) -> int:
+def _insert_lead(conn, candidate: dict, niche: str, search_id: int,
+                 owner_user_id: int | None = None) -> int:
     phone, phone_valid = normalise_phone(candidate.get("phone"), candidate.get("country"))
     candidate["phone"] = phone
     candidate["phone_valid"] = 1 if phone_valid else 0
@@ -266,9 +278,9 @@ def _insert_lead(conn, candidate: dict, niche: str, search_id: int) -> int:
     now = utcnow()
     values = {col: candidate.get(col) for col in LEAD_COLUMNS}
     values.update(
-        workspace_id=current_ws(), niche=niche, search_id=search_id, status="NEW",
-        found_date=now, created_at=now, updated_at=now,
-        source=candidate.get("source") or "Search",
+        workspace_id=current_ws(), owner_user_id=owner_user_id or 0, niche=niche,
+        search_id=search_id, status="NEW", found_date=now, created_at=now,
+        updated_at=now, source=candidate.get("source") or "Search",
     )
     columns = ", ".join(values)
     placeholders = ", ".join("?" for _ in values)
@@ -332,7 +344,8 @@ def _run_search(niche, city, area, country, max_results, provider_name, triggere
     # Automated/target runs bypass this and always scrape fresh, so the daily
     # sweep refreshes the snapshot and the cache never goes stale forever.
     if settings.search_cache_enabled and triggered_by == "manual":
-        cached = find_cached_search(niche, city, area, country, provider.name, lat, lng, radius_m)
+        cached = find_cached_search(niche, city, area, country, provider.name, lat, lng, radius_m,
+                                    owner_user_id=user_id)
         if cached:
             result = _serve_from_cache(search_id, cached, user_id, niche, city, area, country)
             _running.pop(search_id, None)
@@ -367,7 +380,7 @@ def _run_search(niche, city, area, country, max_results, provider_name, triggere
             with get_conn() as conn:
                 conn.execute("START TRANSACTION")
                 try:
-                    existing, reason = find_duplicate(conn, candidate)
+                    existing, reason = find_duplicate(conn, candidate, owner_user_id=user_id)
                     if existing:
                         filled = merge_into_existing(conn, existing, candidate)
                         conn.execute("COMMIT")
@@ -417,7 +430,7 @@ def _run_search(niche, city, area, country, max_results, provider_name, triggere
                     log_failure("search.ratings", str(exc), payload=candidate.get("place_id"))
 
             with get_conn() as conn:
-                lead_id = _insert_lead(conn, candidate, niche, search_id)
+                lead_id = _insert_lead(conn, candidate, niche, search_id, owner_user_id=user_id)
             _record_candidate_provenance(lead_id, candidate, list(lineage.TRACKED_FIELDS),
                                          provider.name)
             new_ids.append(lead_id)
@@ -480,7 +493,8 @@ def _run_search(niche, city, area, country, max_results, provider_name, triggere
         count_search(user_id)
     if status == "COMPLETED":
         record_cache(search_id, niche, city, area, country, provider.name,
-                     stats["results_found"], lat=lat, lng=lng, radius_m=radius_m)
+                     stats["results_found"], lat=lat, lng=lng, radius_m=radius_m,
+                     owner_user_id=user_id)
     _update_coverage(niche, city, area, country, stats["results_found"], stats["new_leads"])
 
     if status == "COMPLETED":

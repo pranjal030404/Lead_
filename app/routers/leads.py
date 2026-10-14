@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .. import emailintel, leadscore, lineage, social
 from ..config import settings
-from ..db import current_ws, execute, query, query_one, scalar, utcnow
+from ..db import current_ws, execute, lead_scope, query, query_one, scalar, utcnow
 from ..fastjson import rows_response
 from ..dedup import dedupe_existing_leads
 from ..enrich import enrich_lead, parse_issues
@@ -47,11 +47,13 @@ SORTABLE = {
 
 
 def _own_lead(lead_id: int, columns: str = "*") -> dict:
-    """The lead, only if it belongs to the active workspace. A lead in another
-    workspace is indistinguishable from one that does not exist (404, never 403),
-    so ids can't be probed across tenants."""
-    lead = query_one(f"SELECT {columns} FROM leads WHERE id = ? AND workspace_id = ?",
-                     (lead_id, current_ws()))
+    """The lead, only if it belongs to the active workspace and to the current
+    user (admins see every lead in the workspace). A lead in another workspace -
+    or another user's lead - is indistinguishable from one that does not exist
+    (404, never 403), so ids can't be probed across tenants or owners."""
+    scope, params = lead_scope()
+    lead = query_one(f"SELECT {columns} FROM leads WHERE id = ? AND {scope}",
+                     (lead_id, *params))
     if not lead:
         raise HTTPException(404, "Lead not found")
     return lead
@@ -68,7 +70,8 @@ def _build_filters(
     q, status, priority, city, niche, country, has_website, tag, min_quality,
     enrichment_status, source, min_overall=None, tier=None, min_intent=None,
 ) -> tuple[str, list]:
-    clauses, params = ["workspace_id = ?"], [current_ws()]
+    scope, scope_params = lead_scope()
+    clauses, params = [scope], list(scope_params)
     if q:
         clauses.append(
             "(business_name LIKE ? OR phone LIKE ? OR email LIKE ? OR address LIKE ?)"
@@ -177,12 +180,14 @@ def export_leads(
 
 @router.get("/leads/facets")
 def facets():
+    scope, params = lead_scope()
+
     def distinct(column: str):
         return [
             r[column] for r in
-            query(f"SELECT DISTINCT {column} FROM leads WHERE workspace_id = ? "
+            query(f"SELECT DISTINCT {column} FROM leads WHERE {scope} "
                   f"AND {column} IS NOT NULL AND {column} != '' ORDER BY {column}",
-                  (current_ws(),))
+                  tuple(params))
         ]
     return {
         "cities": distinct("city"), "niches": distinct("niche"),
@@ -264,10 +269,11 @@ def bulk_status(payload: BulkStatus):
     if not payload.ids:
         raise HTTPException(400, "No lead ids given")
     placeholders = ",".join("?" for _ in payload.ids)
+    scope, scope_params = lead_scope()
     execute(
-        f"UPDATE leads SET status = ?, updated_at = ? WHERE workspace_id = ? "
+        f"UPDATE leads SET status = ?, updated_at = ? WHERE {scope} "
         f"AND id IN ({placeholders})",
-        (payload.status, utcnow(), current_ws(), *payload.ids),
+        (payload.status, utcnow(), *scope_params, *payload.ids),
     )
     return {"updated": len(payload.ids), "status": payload.status}
 
@@ -279,10 +285,11 @@ class BulkTag(BaseModel):
 
 @router.post("/leads/bulk-tag")
 def bulk_tag(payload: BulkTag):
+    scope, scope_params = lead_scope()
     updated = 0
     for lead_id in payload.ids:
-        lead = query_one("SELECT tags FROM leads WHERE id = ? AND workspace_id = ?",
-                         (lead_id, current_ws()))
+        lead = query_one(f"SELECT tags FROM leads WHERE id = ? AND {scope}",
+                         (lead_id, *scope_params))
         if not lead:
             continue
         tags = {t.strip() for t in (lead["tags"] or "").split(",") if t.strip()}
@@ -313,6 +320,7 @@ class InteractionPayload(BaseModel):
 
 @router.get("/leads/{lead_id}/interactions")
 def list_interactions(lead_id: int):
+    _own_lead(lead_id, "id")
     return query(
         "SELECT * FROM interactions WHERE lead_id = ? AND workspace_id = ? ORDER BY date DESC",
         (lead_id, current_ws()),

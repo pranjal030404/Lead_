@@ -230,8 +230,8 @@ def test_branding_api_returns_brand_and_overridden_keys_for_admin():
     _cleanup()
     set_branding({"brand_name": "Beacon Leads"})
     with _client() as client:
-        client.post("/api/auth/login", json={"username": config.settings.admin_user,
-                                             "password": config.settings.admin_password})
+        client.post("/api/auth/admin/login", json={"username": config.settings.admin_user,
+                                                   "password": config.settings.admin_password})
         response = client.get("/api/branding")
         assert response.status_code == 200
         body = response.json()
@@ -254,8 +254,8 @@ def test_pages_serve_the_brand_without_a_session():
 def test_full_rebrand_flow_via_api():
     _cleanup()
     with _client() as client:
-        client.post("/api/auth/login", json={"username": config.settings.admin_user,
-                                             "password": config.settings.admin_password})
+        client.post("/api/auth/admin/login", json={"username": config.settings.admin_user,
+                                                   "password": config.settings.admin_password})
         response = client.put("/api/branding", json={
             "brand_name": "Hawkline", "brand_accent": "#00b8d4",
         })

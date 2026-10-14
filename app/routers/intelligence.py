@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from .. import audit, competitors, leadscore, signals
 from ..config import settings
-from ..db import current_ws, query, query_one
+from ..db import current_ws, lead_scope, query, query_one
 from ..security import rate_limit, require_role
 from .leads import _own_lead
 
@@ -67,6 +67,7 @@ class PinPayload(BaseModel):
 @router.post("/leads/{lead_id}/competitors")
 def pin_competitor(lead_id: int, payload: PinPayload):
     _own_lead(lead_id, "id")
+    _own_lead(payload.competitor_lead_id, "id")
     if not competitors.pin(lead_id, payload.competitor_lead_id):
         raise HTTPException(404, "Competitor lead not found in this workspace")
     return competitors.competitive_gap(lead_id)
@@ -121,13 +122,13 @@ def put_weights(table: dict, _: dict = Depends(require_role("superadmin", "admin
 
 @router.get("/scoring/summary")
 def scoring_summary():
-    ws = current_ws()
-    tiers = query("SELECT COALESCE(opportunity_tier, 'UNSCORED') AS tier, COUNT(*) AS n, "
-                  "ROUND(AVG(overall_score)) AS avg_overall FROM leads WHERE workspace_id = ? "
-                  "GROUP BY opportunity_tier", (ws,))
-    top = query("SELECT id, business_name, city, niche, overall_score, opportunity_tier, "
-                "intent_score, score_confidence FROM leads WHERE workspace_id = ? AND "
-                "overall_score IS NOT NULL ORDER BY overall_score DESC, id LIMIT 10", (ws,))
+    scope, sp = lead_scope()
+    tiers = query(f"SELECT COALESCE(opportunity_tier, 'UNSCORED') AS tier, COUNT(*) AS n, "
+                  f"ROUND(AVG(overall_score)) AS avg_overall FROM leads WHERE {scope} "
+                  f"GROUP BY opportunity_tier", tuple(sp))
+    top = query(f"SELECT id, business_name, city, niche, overall_score, opportunity_tier, "
+                f"intent_score, score_confidence FROM leads WHERE {scope} AND "
+                f"overall_score IS NOT NULL ORDER BY overall_score DESC, id LIMIT 10", tuple(sp))
     active = query_one("SELECT COUNT(DISTINCT lead_id) AS n FROM lead_signals WHERE "
-                       "workspace_id = ? AND status = 'ACTIVE'", (ws,))["n"]
+                       "workspace_id = ? AND status = 'ACTIVE'", (current_ws(),))["n"]
     return {"tiers": tiers, "top_leads": top, "leads_with_active_signals": active}

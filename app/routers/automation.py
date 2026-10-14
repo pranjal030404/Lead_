@@ -7,7 +7,7 @@ from ..automation import (JOB_SWITCHES, SYSTEM_JOBS, build_digest, run_job_now,
                           scheduled_jobs, set_switch, switches)
 from ..backup import list_backups, run_backup
 from ..config import settings
-from ..db import current_ws, execute, query, scalar
+from ..db import current_ws, execute, lead_scope, query, scalar, search_scope
 from ..security import require_role
 from ..http import breaker_state
 from ..quota import usage_summary
@@ -23,6 +23,8 @@ class SwitchPayload(BaseModel):
 @router.get("/status")
 def status():
     ws = current_ws()
+    lscope, lp = lead_scope()
+    sscope, sp = search_scope()
     return {
         "switches": switches(),
         "jobs": scheduled_jobs(),
@@ -31,17 +33,17 @@ def status():
         "provider": settings.provider,
         "today": {
             "searches": scalar(
-                "SELECT COUNT(*) FROM searches WHERE workspace_id = ? "
-                "AND LEFT(started_at, 10) = CURDATE()", (ws,)
+                f"SELECT COUNT(*) FROM searches WHERE {sscope} "
+                f"AND LEFT(started_at, 10) = CURDATE()", tuple(sp)
             ),
             "leads_found": scalar(
-                "SELECT COUNT(*) FROM leads WHERE workspace_id = ? "
-                "AND LEFT(created_at, 10) = CURDATE()", (ws,)
+                f"SELECT COUNT(*) FROM leads WHERE {lscope} "
+                f"AND LEFT(created_at, 10) = CURDATE()", tuple(lp)
             ),
             "enriched": scalar(
-                "SELECT COUNT(*) FROM leads WHERE workspace_id = ? "
-                "AND enrichment_status = 'complete' AND LEFT(updated_at, 10) = CURDATE()",
-                (ws,)
+                f"SELECT COUNT(*) FROM leads WHERE {lscope} "
+                f"AND enrichment_status = 'complete' AND LEFT(updated_at, 10) = CURDATE()",
+                tuple(lp)
             ),
             "awaiting_approval": scalar(
                 "SELECT COUNT(*) FROM approval_queue WHERE workspace_id = ? "

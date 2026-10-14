@@ -28,10 +28,15 @@ def _set_session_cookie(response: Response, token: str) -> None:
 
 
 def _login_with_role_floor(payload: LoginPayload, request: Request,
-                           response: Response, role_floor: str | None):
+                           response: Response, role_floor: str | None,
+                           block_admin: bool = False):
     """Shared login path. `role_floor` upgrades the endpoint to an admin-only
     door: the same credentials are validated the same way, but any account
-    below the floor is rejected outright. 'admin' means admin OR superadmin."""
+    below the floor is rejected outright. 'admin' means admin OR superadmin.
+
+    `block_admin` is the mirror image: the public sign-in door turns admins and
+    superadmins away and points them at /admin, so the two consoles stay
+    separate."""
     client = client_ip(request)
     if not rate_limit(f"login:{client}", limit=settings.login_rate_limit,
                       window_seconds=settings.login_rate_window):
@@ -55,6 +60,14 @@ def _login_with_role_floor(payload: LoginPayload, request: Request,
             )
         raise HTTPException(401, "Invalid username or password")
 
+    if block_admin and user.get("role") in ("admin", "superadmin"):
+        # Correct credentials, but the wrong door. Admins use /admin; telling
+        # the account's own owner this leaks nothing (same reasoning as below).
+        raise HTTPException(
+            403,
+            "Administrators sign in at /admin.",
+        )
+
     if role_floor:
         level = {"user": 0, "admin": 1, "superadmin": 2}.get(user.get("role"), 0)
         floor = {"admin": 1, "superadmin": 2}.get(role_floor, 0)
@@ -75,8 +88,10 @@ def _login_with_role_floor(payload: LoginPayload, request: Request,
 
 @router.post("/login")
 def login(payload: LoginPayload, request: Request, response: Response):
-    """Standard sign-in for every role."""
-    return _login_with_role_floor(payload, request, response, role_floor=None)
+    """Standard sign-in for regular users. Admins and superadmins are told to
+    use /admin instead - the two consoles are deliberately separate doors."""
+    return _login_with_role_floor(payload, request, response, role_floor=None,
+                                  block_admin=True)
 
 
 @router.post("/admin/login")

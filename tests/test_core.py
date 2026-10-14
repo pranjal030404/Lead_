@@ -520,8 +520,8 @@ def test_list_endpoint_returns_only_the_columns_the_table_draws():
     from app.routers.leads import LIST_COLUMNS
 
     with TestClient(app) as client:
-        client.post("/api/auth/login", json={"username": config.settings.admin_user,
-                                             "password": config.settings.admin_password})
+        client.post("/api/auth/admin/login", json={"username": config.settings.admin_user,
+                                                   "password": config.settings.admin_password})
         slim = client.get("/api/leads?limit=5").json()["leads"]
         wide = client.get("/api/leads?limit=5&full=true").json()["leads"]
 

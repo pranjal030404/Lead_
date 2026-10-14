@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from .. import geo
 from ..config import settings
-from ..db import current_ws, execute, query, query_one, utcnow
+from ..db import current_ws, execute, lead_scope, query, query_one, search_scope, utcnow
 from ..fastjson import rows_response
 from ..providers import available_providers
 from ..quota import usage_summary
@@ -67,7 +67,8 @@ def start(payload: SearchPayload, request: Request):
     # run_search.
     provider_name = payload.provider or settings.provider
     cached = find_cached_search(payload.niche.strip(), city, area, country, provider_name,
-                                lat=payload.lat, lng=payload.lng, radius_m=radius)
+                                lat=payload.lat, lng=payload.lng, radius_m=radius,
+                                owner_user_id=user["id"] if user else None)
     usage = usage_summary()
     if not cached and usage["google"]["remaining"] <= 0 and \
             provider_name == "google":
@@ -104,8 +105,9 @@ def geo_map(limit: int = Query(1000, ge=1, le=5000), priority: str | None = None
     Deliberately not the full lead row - a thousand complete records is a lot of
     payload to hand a map that only draws a dot and a label.
     """
-    where = ["workspace_id = ?", "lat IS NOT NULL", "lng IS NOT NULL"]
-    params: list = [current_ws()]
+    scope, scope_params = lead_scope()
+    where = [scope, "lat IS NOT NULL", "lng IS NOT NULL"]
+    params: list = list(scope_params)
     for column, value in (("lead_priority", priority), ("city", city), ("status", status)):
         if value:
             where.append(f"{column} = ?")
@@ -121,8 +123,9 @@ def geo_map(limit: int = Query(1000, ge=1, le=5000), priority: str | None = None
 
 @router.get("/search/history")
 def history(limit: int = Query(30, le=200)):
-    rows = query("SELECT * FROM searches WHERE workspace_id = ? ORDER BY id DESC LIMIT ?",
-                 (current_ws(), limit))
+    scope, params = search_scope()
+    rows = query(f"SELECT * FROM searches WHERE {scope} ORDER BY id DESC LIMIT ?",
+                 (*params, limit))
     for row in rows:
         row["from_cache"] = bool(row.get("cached_from"))
     return rows
@@ -147,18 +150,20 @@ def preview(niche: str, city: str, area: str = "", country: str = ""):
 
 @router.get("/search/{search_id}/status")
 def status(search_id: int):
-    row = query_one("SELECT * FROM searches WHERE id = ? AND workspace_id = ?",
-                    (search_id, current_ws()))
+    sscope, sp = search_scope()
+    row = query_one(f"SELECT * FROM searches WHERE id = ? AND {sscope}",
+                    (search_id, *sp))
     if not row:
         raise HTTPException(404, "Search not found")
     # A cache hit reused a previous search's leads; list those, not (there would
     # be none) this row's own.
     effective_id = row.get("cached_from") or row["id"]
     if row["status"] == "COMPLETED":
+        scope, lp = lead_scope()
         row["leads"] = query(
-            "SELECT id, business_name, phone, website_url, lead_score, lead_priority, city "
-            "FROM leads WHERE workspace_id = ? AND search_id = ? ORDER BY lead_score DESC",
-            (current_ws(), effective_id),
+            f"SELECT id, business_name, phone, website_url, lead_score, lead_priority, city "
+            f"FROM leads WHERE {scope} AND search_id = ? ORDER BY lead_score DESC",
+            (*lp, effective_id),
         )
     row["from_cache"] = bool(row.get("cached_from"))
     row["cache_source_search_id"] = row.get("cached_from")

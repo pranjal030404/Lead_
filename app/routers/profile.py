@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from .. import emailintel, leadscore, lineage, people, social
-from ..db import current_ws, execute, query, query_one, utcnow
+from ..db import current_ws, execute, lead_scope, query, query_one, utcnow
 from ..quota import QuotaExceeded
 from .leads import _decorate, _own_lead
 
@@ -19,8 +19,10 @@ router = APIRouter(prefix="/api", tags=["profile"])
 
 
 def _own(table: str, row_id: int) -> dict:
-    row = query_one(f"SELECT * FROM {table} WHERE id = ? AND workspace_id = ?",
-                    (row_id, current_ws()))
+    scope, params = lead_scope("l")
+    row = query_one(
+        f"SELECT t.* FROM {table} t JOIN leads l ON l.id = t.lead_id "
+        f"WHERE t.id = ? AND {scope}", (row_id, *params))
     if not row:
         raise HTTPException(404, "Not found")
     return row
@@ -134,8 +136,9 @@ def add_contact(lead_id: int, payload: ContactPayload):
 def list_contacts(q: str | None = None, min_probability: float = Query(0, ge=0, le=1),
                   role: str | None = None, limit: int = Query(50, ge=1, le=500),
                   offset: int = Query(0, ge=0)):
-    clauses, params = ["c.workspace_id = ?", "c.decision_maker_probability >= ?"], \
-        [current_ws(), min_probability]
+    scope, scope_params = lead_scope("l")
+    clauses, params = [scope, "c.decision_maker_probability >= ?"], \
+        [*scope_params, min_probability]
     if q:
         clauses.append("(c.name LIKE ? OR c.title LIKE ? OR l.business_name LIKE ?)")
         params += [f"%{q}%"] * 3

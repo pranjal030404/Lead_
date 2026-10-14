@@ -69,7 +69,7 @@ def test_admin_page_is_public_and_branded():
 
 def test_admin_page_redirects_signed_in_admin_to_app():
     with _client() as client:
-        client.post("/api/auth/login", json={
+        client.post("/api/auth/admin/login", json={
             "username": config.settings.admin_user,
             "password": config.settings.admin_password,
         })
@@ -143,13 +143,46 @@ def test_admin_login_rejects_regular_user_as_wrong_password():
         assert "/login" in right_pw.json()["detail"]
 
 
-def test_regular_login_still_works_for_every_role():
+def test_regular_login_works_for_regular_user():
     _make_user("plainuser", "user-pass", "user")
     with _client() as client:
         response = client.post("/api/auth/login", json={
             "username": "plainuser", "password": "user-pass",
         })
         assert response.status_code == 200
+
+
+def test_public_login_rejects_admin_and_points_at_admin_door():
+    """Admins may only sign in at /admin; the public door turns them away with a
+    pointer, not a token."""
+    _make_user("frontadm", "adm-pass", "admin")
+    with _client() as client:
+        response = client.post("/api/auth/login", json={
+            "username": "frontadm", "password": "adm-pass",
+        })
+        assert response.status_code == 403
+        assert "/admin" in response.json()["detail"]
+
+
+def test_public_login_rejects_superadmin_and_points_at_admin_door():
+    _make_user("frontroot", "root-pass", "superadmin")
+    with _client() as client:
+        response = client.post("/api/auth/login", json={
+            "username": "frontroot", "password": "root-pass",
+        })
+        assert response.status_code == 403
+        assert "/admin" in response.json()["detail"]
+
+
+def test_public_login_wrong_password_still_401_for_admin_account():
+    """A wrong password must stay an opaque 401 - only the correct password
+    reveals which door the account belongs to."""
+    _make_user("frontadm2", "adm-pass2", "admin")
+    with _client() as client:
+        response = client.post("/api/auth/login", json={
+            "username": "frontadm2", "password": "nope",
+        })
+        assert response.status_code == 401
 
 
 def test_admin_login_rate_limited_like_user_login():
@@ -185,12 +218,13 @@ def test_admin_console_sends_signed_in_regular_users_to_login():
 
 
 def test_existing_session_survives_after_admin_login_adds_nothing():
-    """The same cookie name is reused; an admin logging in twice (either door)
-    just replaces it. Smoke-test both doors in sequence in one client."""
+    """The same cookie name is reused; an admin signs in at the console door and
+    the cookie is theirs. The public door refuses admins outright, so it never
+    mints a session for them."""
     _make_user("twodoors", "pw-twodoors", "superadmin")
     with _client() as client:
         assert client.post("/api/auth/login", json={
-            "username": "twodoors", "password": "pw-twodoors"}).status_code == 200
+            "username": "twodoors", "password": "pw-twodoors"}).status_code == 403
         assert client.post("/api/auth/admin/login", json={
             "username": "twodoors", "password": "pw-twodoors"}).status_code == 200
         me = client.get("/api/auth/me").json()

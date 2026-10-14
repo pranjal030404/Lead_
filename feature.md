@@ -858,18 +858,19 @@ remote configured first.
 
 | Page | Endpoint | Accepts |
 |---|---|---|
-| `/login` | `POST /api/auth/login` | any role |
+| `/login` | `POST /api/auth/login` | `user` only (admins get a 403 pointing at `/admin`) |
 | `/admin` | `POST /api/auth/admin/login` | `admin` and `superadmin` only |
 
-The admin door is a dedicated page and a role-floored endpoint. A **wrong
-password** gets the same 401 as an unknown user, so neither door lets an attacker
-enumerate accounts. A regular user's **correct** credentials, though, get a 403
-telling them to sign in at `/login` — they have already proven ownership of the
-account, so the guidance leaks nothing and stops a freshly created user from
-reading "Invalid username or password" as "my account doesn't work". The admin
-page is intentionally not linked from the user login page — point administrators
-at `/admin` directly. Signed-in visitors are routed to the door that matches
-their role: admins from `/login` to `/admin`, regular users from `/admin` to
+Both doors are role-floored endpoints. The user door rejects `admin` and
+`superadmin` with a 403 telling them to sign in at `/admin`, so an operator who
+lands on the wrong page is steered to the right one instead of being let in. A
+**wrong password** gets the same 401 as an unknown user, so neither door lets an
+attacker enumerate accounts. A regular user's **correct** credentials on the
+admin door get a 403 telling them to sign in at `/login` — they have already
+proven ownership of the account, so the guidance leaks nothing and stops a
+freshly created user from reading "Invalid username or password" as "my account
+doesn't work". Signed-in visitors are routed to the door that matches their
+role: admins from `/login` to `/admin`, regular users from `/admin` to
 `/login`.
 
 ### 10.3 Roles
@@ -976,7 +977,7 @@ Mechanics:
 | Route | File | What it is |
 |---|---|---|
 | `/landing` | `landing.html` | Marketing page: headline, feature grid, four-step explainer, self-hosting section, plan tiers, CTA. Public. |
-| `/login` | `login.html` | Sign-in for all roles. Public. |
+| `/login` | `login.html` | Sign-in for user accounts. Admins are redirected to `/admin`. Public. |
 | `/admin` | `admin.html` | Administrator door. Public (it *is* a login form); any signed-in user is redirected to `/`. |
 | `/` | `index.html` | The app. Requires a session. |
 | `/health` | — | `{"status":"ok"}` after a `SELECT 1`, `503` on failure. Unauthenticated, safe for an uptime monitor. |
@@ -1025,7 +1026,7 @@ Mechanics:
 
 | Table | Holds | Notable |
 |---|---|---|
-| `leads` | The core record — 56 columns | `UNIQUE KEY uq_leads_place_id`, plus indexes on status, priority, city, niche, follow_up_date, (name, city), phone, enrichment_status, search_id |
+| `leads` | The core record — per-user private leads | `owner_user_id` (0 = system/unowned); `UNIQUE KEY uq_leads_place_owner (workspace_id, owner_user_id, place_id)`, plus indexes on status, priority, city, niche, follow_up_date, (name, city), phone, enrichment_status, search_id, (workspace_id, owner_user_id) |
 | `interactions` | Every logged touchpoint | type, direction, subject, content, outcome, next step, automated flag |
 | `searches` | One row per search run | progress string, counts, api_calls, status, `user_id`, `cached_from`, error_message |
 | `search_cache` | Query fingerprint → source search id | the shared cache; TTL from `created_at` |

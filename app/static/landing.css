@@ -392,6 +392,20 @@ h2 { font-size: clamp(26px, 4vw, 38px); letter-spacing: -0.8px; line-height: 1.1
 .reveal.d3 { transition-delay: 0.24s; } .reveal.d4 { transition-delay: 0.32s; }
 .reveal.d5 { transition-delay: 0.4s; }
 
+/* Phones: the header has no room for two CTAs side by side, and the fixed-nav
+   offset can be trimmed now that the bar is shorter. */
+@media (max-width: 520px) {
+  .wrap { padding: 0 18px; }
+  .nav-inner { gap: 14px; }
+  .nav-cta .btn:not(.primary) { display: none; }
+  .btn.sm { padding: 7px 13px; font-size: 12.5px; }
+  .hero { padding: 128px 0 70px; }
+  .counters { gap: 26px; margin-top: 46px; }
+  .cta-panel { padding: 40px 20px; }
+  .footer-inner { flex-direction: column; gap: 16px; text-align: center; }
+  .footer-links { flex-wrap: wrap; justify-content: center; gap: 16px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
   html { scroll-behavior: auto; }

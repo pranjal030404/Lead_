@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from difflib import SequenceMatcher
 
-from .db import current_ws, get_conn, utcnow
+from .db import current_ws, get_conn, lead_scope, utcnow
 
 FUZZY_THRESHOLD = 0.80
 
@@ -55,21 +55,30 @@ def similarity(a: str | None, b: str | None) -> float:
     return (sequence + containment) / 2
 
 
-def find_duplicate(conn, candidate: dict) -> tuple[dict | None, str | None]:
-    """Return (existing_lead, reason) or (None, None)."""
+def find_duplicate(conn, candidate: dict,
+                   owner_user_id: int | None = None) -> tuple[dict | None, str | None]:
+    """Return (existing_lead, reason) or (None, None).
+
+    Lookups are scoped to the owner who is searching, so a regular user always
+    gets their own copy of a business rather than merging into somebody else's
+    lead. `owner_user_id=None` (system/automated runs) matches the shared,
+    unowned leads, which are stored under the sentinel owner 0.
+    """
+    owner = owner_user_id or 0
     place_id = candidate.get("place_id")
     if place_id:
         row = conn.execute(
-            "SELECT * FROM leads WHERE workspace_id = ? AND place_id = ?",
-            (current_ws(), place_id)).fetchone()
+            "SELECT * FROM leads WHERE workspace_id = ? AND owner_user_id = ? AND place_id = ?",
+            (current_ws(), owner, place_id)).fetchone()
         if row:
             return dict(row), "place_id"
 
     phone = candidate.get("phone")
     if phone:
         row = conn.execute(
-            "SELECT * FROM leads WHERE workspace_id = ? AND phone = ? AND phone != ''",
-            (current_ws(), phone)
+            "SELECT * FROM leads WHERE workspace_id = ? AND owner_user_id = ? "
+            "AND phone = ? AND phone != ''",
+            (current_ws(), owner, phone)
         ).fetchone()
         if row:
             return dict(row), "phone"
@@ -79,9 +88,9 @@ def find_duplicate(conn, candidate: dict) -> tuple[dict | None, str | None]:
         return None, None
 
     rows = conn.execute(
-        "SELECT * FROM leads WHERE workspace_id = ? "
+        "SELECT * FROM leads WHERE workspace_id = ? AND owner_user_id = ? "
         "AND LOWER(COALESCE(city,'')) = LOWER(COALESCE(?,''))",
-        (current_ws(), city),
+        (current_ws(), owner, city),
     ).fetchall()
     norm_candidate = normalise_name(name)
     best, best_score = None, 0.0
@@ -136,15 +145,22 @@ def merge_into_existing(conn, existing: dict, candidate: dict) -> list[str]:
 
 
 def dedupe_existing_leads() -> list[dict]:
-    """Sweep the current workspace for duplicates that slipped in. Returns merge report."""
+    """Sweep the current workspace for duplicates that slipped in. Returns merge report.
+
+    Only leads the caller can see are considered, and a merge never crosses
+    owners - an admin sweeping the whole workspace keeps each person's leads
+    separate."""
     merged = []
+    scope, scope_params = lead_scope()
     with get_conn() as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM leads WHERE workspace_id = ? ORDER BY id", (current_ws(),)).fetchall()]
+            f"SELECT * FROM leads WHERE {scope} ORDER BY id", tuple(scope_params)).fetchall()]
         seen: list[dict] = []
         for lead in rows:
             match = None
             for kept in seen:
+                if lead.get("owner_user_id") != kept.get("owner_user_id"):
+                    continue  # never merge one person's lead into another's
                 if lead.get("place_id") and lead["place_id"] == kept.get("place_id"):
                     match = kept
                     break

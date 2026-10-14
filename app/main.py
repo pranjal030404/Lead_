@@ -12,7 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from . import branding
 from .automation import start_scheduler, stop_scheduler
 from .config import settings
-from .db import (MIGRATIONS, NoWorkspace, _ws_var, init_db, query, query_one)
+from .db import (MIGRATIONS, NoWorkspace, _ws_var, init_db, query, query_one,
+                 reset_current_user, set_current_user)
 from .routers import (audits, auth, automation, intelligence, branding as branding_router, leads, outreach,
                       plans, profile, search, stats, users, workspaces)
 from .tenancy import TenancyError, resolve_workspace
@@ -108,11 +109,13 @@ async def auth_and_rate_limit(request: Request, call_next):
     user["workspace_id"] = membership["workspace_id"] if membership else None
     user["workspace_role"] = membership["member_role"] if membership else None
     request.state.user = user
-    token = _ws_var.set(user["workspace_id"])
+    wtoken = _ws_var.set(user["workspace_id"])
+    utoken = set_current_user(user)
     try:
         response = await call_next(request)
     finally:
-        _ws_var.reset(token)
+        _ws_var.reset(wtoken)
+        reset_current_user(utoken)
     # The rendered HTML bakes in operator config - the Google Maps JS key lands
     # in a meta tag - and branding.render_page reads it per request. Without a
     # cache directive the browser heuristically caches the page, so a .env edit

@@ -75,7 +75,7 @@ def test_lead_endpoints_do_not_cross_tenants(tenants):
     assert cb.patch(f"/api/leads/{lead_id}", json={"notes": "hacked"}).status_code == 404
     assert cb.delete(f"/api/leads/{lead_id}").status_code == 404
     assert cb.post(f"/api/leads/{lead_id}/enrich").status_code == 404
-    assert cb.get(f"/api/leads/{lead_id}/interactions").json() == []
+    assert cb.get(f"/api/leads/{lead_id}/interactions").status_code == 404
     assert cb.post(f"/api/leads/{lead_id}/interactions",
                    json={"type": "call"}).status_code == 404
     assert cb.post(f"/api/leads/{lead_id}/message",
@@ -117,6 +117,68 @@ def test_same_place_id_allowed_in_two_workspaces(tenants):
 def test_insert_without_workspace_fails_loudly():
     with pytest.raises(pymysql.err.OperationalError):
         execute("INSERT INTO leads(business_name) VALUES('orphan')")
+
+
+# ----------------------------------------------------- per-user ownership --
+
+@pytest.fixture(scope="module")
+def shared_team():
+    """One workspace, one admin and two regular members - the shape that makes
+    per-user lead separation observable."""
+    ws = create_workspace("Shared Team")
+    owner = _user("own_boss", "admin")
+    worker = _user("own_worker", "user")
+    peer = _user("own_peer", "user")
+    add_member(ws, owner, "owner")
+    add_member(ws, worker, "member")
+    add_member(ws, peer, "member")
+    return {"ws": ws, "owner": owner, "worker": worker, "peer": peer,
+            "cowner": _client("own_boss"), "cworker": _client("own_worker"),
+            "cpeer": _client("own_peer")}
+
+
+def test_leads_are_private_to_their_owner(shared_team):
+    s = shared_team
+    mine = _lead(s["ws"], "Worker Dental", owner_user_id=s["worker"])
+    theirs = _lead(s["ws"], "Peer Dental", owner_user_id=s["peer"])
+
+    worker_names = {x["business_name"] for x in s["cworker"].get("/api/leads").json()["leads"]}
+    assert "Worker Dental" in worker_names and "Peer Dental" not in worker_names
+
+    assert s["cworker"].get(f"/api/leads/{mine}").status_code == 200
+    assert s["cworker"].get(f"/api/leads/{theirs}").status_code == 404
+    assert s["cpeer"].get(f"/api/leads/{mine}").status_code == 404
+
+    # A peer's lead is unreadable AND immutable, through any door.
+    assert s["cworker"].patch(f"/api/leads/{theirs}",
+                              json={"notes": "hacked"}).status_code == 404
+    s["cworker"].post("/api/leads/bulk-status", json={"ids": [theirs], "status": "LOST"})
+    s["cworker"].post("/api/leads/bulk-tag", json={"ids": [theirs], "tag": "pwned"})
+    row = query_one("SELECT status, notes, tags FROM leads WHERE id = ?", (theirs,))
+    assert row["status"] != "LOST" and not row["notes"] and not row["tags"]
+
+    assert "Peer Dental" not in s["cworker"].get("/api/leads/export").text
+    assert "Worker Dental" in s["cworker"].get("/api/leads/export").text
+
+    assert s["cworker"].get("/api/stats").json()["total_leads"] == 1
+    assert s["cworker"].get(f"/api/leads/{theirs}/interactions").status_code == 404
+
+
+def test_workspace_admin_sees_every_lead(shared_team):
+    s = shared_team
+    _lead(s["ws"], "Worker Two", owner_user_id=s["worker"])
+    _lead(s["ws"], "Peer Two", owner_user_id=s["peer"])
+    names = {x["business_name"] for x in s["cowner"].get("/api/leads").json()["leads"]}
+    assert {"Worker Two", "Peer Two"} <= names
+    assert s["cowner"].get("/api/stats").json()["total_leads"] >= 2
+
+
+def test_same_place_id_allowed_for_two_owners_in_one_workspace(shared_team):
+    s = shared_team
+    _lead(s["ws"], "Dup Worker", place_id="dupe-place", owner_user_id=s["worker"])
+    _lead(s["ws"], "Dup Peer", place_id="dupe-place", owner_user_id=s["peer"])  # allowed
+    with pytest.raises(pymysql.err.IntegrityError):
+        _lead(s["ws"], "Dup Worker 2", place_id="dupe-place", owner_user_id=s["worker"])
 
 
 # -------------------------------------------------- templates / suppression --
