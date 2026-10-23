@@ -86,7 +86,7 @@ def merge_context(lead: dict) -> dict:
         "website_url": lead.get("website_url") or "",
         "observation": observation_for(lead),
         "website_issue": website_issue_for(lead),
-        "portfolio_url": settings_value("portfolio_url", "https://example.com/work"),
+        "portfolio_url": settings_value("portfolio_url", "http://arthvex.co.in/"),
         "sender_name": settings.mail_from_name or "Me",
         "sender_company": settings_value("company_name", "") or brand_company_name(),
     }

@@ -214,7 +214,7 @@ def get_identity():
     brand = get_branding()
     return {
         "company_name": get_ws_setting("company_name", "") or brand_company_name(),
-        "portfolio_url": get_ws_setting("portfolio_url", "https://example.com/work"),
+        "portfolio_url": get_ws_setting("portfolio_url", "http://arthvex.co.in/"),
         "sender_name": settings.mail_from_name,
         "sender_email": settings.mail_from,
         "dry_run": settings.dry_run,

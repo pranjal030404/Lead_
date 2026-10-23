@@ -150,6 +150,40 @@ listening at the `MYSQL_HOST`/`MYSQL_PORT` in `.env`. Common causes:
 
 ---
 
+## Android app
+
+A native Kotlin/Compose client lives in [`android/`](android/README.md). It talks
+to this same FastAPI backend over the JSON API and signs in with the same
+accounts — same users, same leads, same interaction history.
+
+What it does on the phone:
+
+- **Leads** list with search, status/priority filters and paging.
+- **Call** a lead through the system dialer (`ACTION_DIAL`, no phone permission).
+- **WhatsApp** composer with server-side templates, pre-filled but editable text,
+  sent via `wa.me` so nothing is auto-sent without you pressing send.
+- Optional auto-logging of calls/WhatsApp as CRM interactions (toggle in Settings),
+  matching the web app's "draft, don't auto-send" policy.
+- Lead detail: status changes, follow-ups, notes, timeline, manual log.
+- **Follow-ups** queue (Today / Overdue / Upcoming / Suggested) and a **Dashboard**.
+
+Build and install:
+
+```bash
+cd android
+./gradlew :app:assembleDebug --no-configuration-cache
+adb install -r dist/ArthvexLeadGen.apk
+```
+
+A production release APK (fixed to the deployed server, no URL prompt; see `android/FEATURE_PARITY.md`) is checked in at `android/dist/ArthvexLeadGen.apk`.
+On first launch, enter your server URL (e.g. `http://192.168.1.20:8000` — the
+phone must be able to reach it, so `127.0.0.1` only works with `adb reverse`).
+Admin accounts need the admin door toggled on at sign-in. See
+[`android/README.md`](android/README.md) for requirements, release signing and
+troubleshooting.
+
+---
+
 ## It works with no API key
 
 `PROVIDER` picks where businesses come from:

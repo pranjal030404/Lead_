@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+app/build/
+.kotlin/
+
+# Local machine config (SDK path)
+local.properties
+
+# IDE
+.idea/
+*.iml
+*.hprof
+captures/
+
+# Signing material — never commit
+*.jks
+*.keystore
+keystore.properties
+
+# Keep the packaged debug APK in dist/, ignore anything else there
+dist/*
+!dist/ArthvexLeadGen-debug.apk
