@@ -205,6 +205,7 @@ private fun HomeShell(
             composable("myplan") { MyPlanScreen(repo = repo, onBack = back) }
             composable("targets") { TargetsScreen(repo = repo, onBack = back) }
             composable("templates") { TemplatesScreen(repo = repo, onBack = back) }
+            composable("demos") { DemoSitesScreen(onBack = back) }
             composable("users") { UsersScreen(repo = repo, onBack = back) }
             composable("plans") { PlansScreen(repo = repo, onBack = back) }
             composable("settings") {

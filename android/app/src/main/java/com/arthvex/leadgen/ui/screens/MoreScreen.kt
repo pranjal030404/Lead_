@@ -67,7 +67,8 @@ fun MoreScreen(
                 listOf(
                     MoreItem("myplan", "My Plan", "Subscription and usage", Icons.Default.CreditCard, PurpleColor),
                     MoreItem("targets", "Targets", "Saved niche + city", Icons.Default.TrackChanges, InfoColor),
-                    MoreItem("templates", "Templates", "Message copy", Icons.Default.Description, WarmColor)
+                    MoreItem("templates", "Templates", "Message copy", Icons.Default.Description, WarmColor),
+                    MoreItem("demos", "Demo websites", "Sample sites to show prospects", Icons.Default.Language, InfoColor)
                 )
             )
         )

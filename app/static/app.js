@@ -1657,6 +1657,31 @@ routes['/templates'] = async () => {
     </div>`;
 };
 
+// ----------------------------------------------------------- demo sites ---
+const DEMO_SITES = [
+  { name: 'Chartered Accountant', url: 'https://ca.demo.arthvex.co.in/' },
+  { name: 'Dry Cleaner', url: 'https://cleanthut.arthvex.co.in/' },
+  { name: 'Computer Service', url: 'https://websites.demo.arthvex.co.in/' },
+  { name: 'Tiffin Service', url: 'https://tiffin.arthvex.co.in/' },
+];
+
+routes['/demos'] = async () => {
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Demo websites</h1>
+      <div class="subtitle">Finished sample sites to show prospects in the same niche</div></div></div>
+    <div class="grid cols-2">
+      ${DEMO_SITES.map((site) => `
+        <div class="card">
+          <div class="flex between" style="margin-bottom:8px">
+            <b>${esc(site.name)}</b>
+            <a href="${esc(site.url)}" target="_blank" rel="noopener">
+              <button class="sm">Open</button></a>
+          </div>
+          <div class="faint">${esc(site.url)}</div>
+        </div>`).join('')}
+    </div>`;
+};
+
 async function saveTemplate(name, type, stage, market, id) {
   const subject = document.querySelector(`[data-tsub="${id}"]`);
   const body = document.querySelector(`[data-tbody="${id}"]`);
