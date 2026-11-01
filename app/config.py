@@ -56,6 +56,11 @@ class Settings:
     # seconds to wait for a connection to the DB server - set high enough for a
     # container that is still warming up when the app starts
     mysql_connect_timeout = _float("MYSQL_CONNECT_TIMEOUT", 10)
+    # Socket-level limits so a hung server/network can never block a worker
+    # forever. read_timeout bounds how long ONE statement may go without the
+    # server answering (so it is also the effective query timeout).
+    mysql_read_timeout = _float("MYSQL_READ_TIMEOUT", 120)
+    mysql_write_timeout = _float("MYSQL_WRITE_TIMEOUT", 30)
 
     # concurrency
     enrich_workers = _int("ENRICH_WORKERS", 8)

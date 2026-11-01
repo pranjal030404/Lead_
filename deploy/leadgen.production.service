@@ -1,0 +1,59 @@
+# RECOMMENDED unit for the /var/www/Lead_ deployment. Review against the live
+# unit (`systemctl cat leadgen`) before replacing it - this file was written
+# without access to the VPS, so User/Group and paths are assumptions to verify.
+#
+# Install (see DEPLOY_DB_HARDENING.md):
+#   sudo install -m 0644 deploy/leadgen.production.service /etc/systemd/system/leadgen.service
+#   sudo systemctl daemon-reload && sudo systemctl restart leadgen
+#
+# What restarts what: systemd only sees the PROCESS. A stale MySQL connection
+# no longer needs a restart - app/db.py validates and replaces connections -
+# and /health/ready is the signal for an external monitor, not for systemd.
+
+[Unit]
+Description=Arthvex LeadGen
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+# Crash-loop protection: give up after 5 failed starts in 5 minutes instead of
+# hammering the database forever. Clear with `systemctl reset-failed leadgen`.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=leadgen
+Group=leadgen
+WorkingDirectory=/var/www/Lead_
+# 0600, owned by root:leadgen (0640) - never world-readable, never in the repo.
+EnvironmentFile=/etc/leadgen/leadgen.env
+ExecStart=/var/www/Lead_/.venv/bin/python run.py
+
+# Restart only when the process dies abnormally (crash, OOM, non-zero exit);
+# a deliberate `systemctl stop` / clean exit stays stopped.
+Restart=on-failure
+RestartSec=5
+
+# init_db() applies migrations at boot, which can take a while on big tables.
+TimeoutStartSec=120
+# SIGTERM -> uvicorn drains requests, lifespan shutdown releases the scheduler
+# lease. SIGKILL only if that takes longer than TimeoutStopSec.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/www/Lead_/data /var/www/Lead_/backups
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=leadgen
+
+[Install]
+WantedBy=multi-user.target

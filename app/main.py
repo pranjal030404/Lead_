@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -12,7 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from . import branding
 from .automation import start_scheduler, stop_scheduler
 from .config import settings
-from .db import (MIGRATIONS, NoWorkspace, _ws_var, init_db, query, query_one,
+from .db import ping as db_ping
+from .db import (MIGRATIONS, NoWorkspace, _ws_var, init_db, pool_stats, query, scalar,
                  reset_current_user, set_current_user)
 from .routers import (audits, auth, automation, intelligence, branding as branding_router, leads, outreach,
                       plans, profile, search, stats, users, workspaces)
@@ -172,37 +174,51 @@ app.mount("/static", StaticFiles(directory=settings.static_dir), name="static")
 
 
 @app.get("/health/live")
-def health_live():
-    """Process is up. Touches nothing external, so it never flaps on a DB blip."""
+async def health_live():
+    """The process is up and its event loop is answering. Deliberately `async`
+    and DB-free: it runs on the loop itself (not the worker thread pool), so it
+    proves the interpreter is responsive and never flaps on a database blip."""
     return {"status": "ok"}
+
+
+def _db_check() -> dict[str, str]:
+    """Probe MySQL through the same connection manager every query uses (so a
+    stale handle is healed, not just reported). Failure detail goes to the log
+    only - the response never carries driver text, hosts or credentials."""
+    checks: dict[str, str] = {"mysql": "error", "migrations": "unknown"}
+    try:
+        if scalar("SELECT 1") != 1:
+            raise RuntimeError("SELECT 1 returned an unexpected value")
+        checks["mysql"] = "ok"
+        applied = {r["version"] for r in query("SELECT version FROM schema_migrations")}
+        pending = [v for v, _, _ in MIGRATIONS if v not in applied]
+        checks["migrations"] = "ok" if not pending else "pending"
+        if pending:
+            logging.getLogger("leadgen.health").error("migrations pending: %s", pending)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("leadgen.health").error(
+            "readiness: database check failed: %s %r (pool=%s)",
+            type(exc).__name__, exc.args[:2], pool_stats())
+    return checks
 
 
 @app.get("/health/ready")
 def health_ready():
-    """Ready to serve: DB reachable and all migrations applied."""
-    checks: dict[str, str] = {}
-    try:
-        query_one("SELECT 1 AS ok")
-        checks["mysql"] = "ok"
-        applied = {r["version"] for r in query("SELECT version FROM schema_migrations")}
-        pending = [v for v, _, _ in MIGRATIONS if v not in applied]
-        checks["migrations"] = "ok" if not pending else f"pending: {pending}"
-    except Exception:  # noqa: BLE001 - detail stays in logs, not the public response
-        checks.setdefault("mysql", "error")
-        checks.setdefault("migrations", "unknown")
+    """Ready to serve: DB reachable (via the shared connection manager) and
+    all migrations applied. 200 when ready, 503 otherwise."""
+    checks = _db_check()
     ok = all(v == "ok" for v in checks.values())
-    return JSONResponse({"status": "ok" if ok else "error", "checks": checks},
+    return JSONResponse({"status": "ok" if ok else "unavailable", "checks": checks},
                         status_code=200 if ok else 503)
 
 
 @app.get("/health")
 def health():
-    """Unauthenticated liveness probe - safe to point a uptime monitor at."""
-    try:
-        query_one("SELECT 1 AS ok")
+    """Unauthenticated probe for uptime monitors. Equivalent to readiness
+    without the migration check."""
+    if db_ping():
         return {"status": "ok"}
-    except Exception:  # noqa: BLE001 - don't leak driver errors publicly
-        return JSONResponse({"status": "error"}, status_code=503)
+    return JSONResponse({"status": "error"}, status_code=503)
 
 
 @app.get("/login")

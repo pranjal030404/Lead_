@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from . import emailintel, lineage, social
 from .config import settings
-from .db import (current_ws, execute, get_conn, log_automation, log_failure, query,
+from .db import (current_ws, execute, get_conn, safe_rollback, log_automation, log_failure, query,
                  query_one, utcnow, workspace_context)
 from .enrich import enrich_many
 from .providers import get_provider
@@ -396,7 +396,7 @@ def _run_search(niche, city, area, country, max_results, provider_name, triggere
                         continue
                     conn.execute("ROLLBACK")
                 except Exception:
-                    conn.execute("ROLLBACK")
+                    safe_rollback(conn)
                     raise
 
             # Stage 2 - only now, for a place we definitely don't have yet.
