@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import contextvars
 import json
-import threading
+import logging
 import re
+import threading
+import time
+import weakref
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
@@ -525,15 +528,29 @@ class Conn(pymysql.connections.Connection):
     it (so `.fetchone()`, `.lastrowid`, `.rowcount` all behave as before).
     """
 
+    def _track(self, cur):
+        # Cursors handed out by the sqlite-style helpers have no `with` block
+        # around them; remember them so the connection manager can close any
+        # the caller forgot when the connection is released.
+        try:
+            self._open_cursors.add(cur)
+        except AttributeError:
+            self._open_cursors = weakref.WeakSet([cur])
+        return cur
+
     def execute(self, query: str, args=None):
-        cur = self.cursor()
+        cur = self._track(self.cursor())
         cur.execute(query, args)
         return cur
 
     def executemany(self, query: str, args=None):
-        cur = self.cursor()
+        cur = self._track(self.cursor())
         cur.executemany(query, args)
         return cur
+
+    def close_open_cursors(self) -> None:
+        for cur in list(getattr(self, "_open_cursors", ())):
+            _close_cursor(cur)
 
 
 def _new_conn() -> Conn:
@@ -546,59 +563,336 @@ def _new_conn() -> Conn:
         charset=settings.mysql_charset,
         autocommit=True,
         connect_timeout=settings.mysql_connect_timeout,
+        read_timeout=settings.mysql_read_timeout,
+        write_timeout=settings.mysql_write_timeout,
         cursorclass=TranslateCursor,
     )
     return conn
 
 
+# ---------------------------------------------------------------- connections --
+# Ownership model: every thread owns at most ONE connection (a `_Slot` in
+# thread-local storage), so a handle is never used by two threads at once. The
+# slot is checked out for the duration of a `get_conn()` block, health-checked
+# before use, and discarded (never reused) if it may be in an unknown state.
+#
+# Lifecycle rules:
+#   * reuse: a healthy handle is reused across calls (no connect per query);
+#   * validate: a closed handle, or one idle > _IDLE_PING_SECONDS, is pinged
+#     before use and replaced when dead;
+#   * discard: any connection-level failure, protocol error, or interrupted
+#     (non-Exception) unwind drops the handle; the next use reconnects;
+#   * cleanup: on release, an open transaction is rolled back and any cursor
+#     left open by the sqlite-style helpers is closed;
+#   * no indefinite retention: handles older than _MAX_AGE_SECONDS are
+#     recycled, and handles idle longer than _MAX_IDLE_SECONDS are closed by a
+#     rate-limited sweep (threads that exit take their handle with them).
+
+log = logging.getLogger("leadgen.db")
+
+# Idle handles are pinged before reuse: MySQL's wait_timeout, a proxy or a NAT
+# can silently drop an idle socket, and the next use then fails with
+# `InterfaceError (0, '')` or "MySQL server has gone away".
+_IDLE_PING_SECONDS = 5.0
+_MAX_AGE_SECONDS = 1800.0
+_MAX_IDLE_SECONDS = 300.0
+_SWEEP_EVERY_SECONDS = 60.0
+
+# 2003 can't connect, 2006 server gone away (send failed), 2013 lost during
+# query (read failed), 2055 lost connection, 1053 shutdown in progress,
+# 1927 connection killed.
+_LOST_CODES = frozenset({2003, 2006, 2013, 2055, 1053, 1927})
+
+_IN_TRANS = pymysql.constants.SERVER_STATUS.SERVER_STATUS_IN_TRANS
+
+
+class _Slot:
+    """One thread's connection plus its bookkeeping."""
+
+    __slots__ = ("conn", "created", "used", "depth", "broken", "busy", "__weakref__")
+
+    def __init__(self) -> None:
+        self.conn: Conn | None = None
+        self.created = 0.0
+        self.used = 0.0
+        self.depth = 0       # nesting level of get_conn() on this thread
+        self.broken = False  # set when the body saw a connection-level failure
+        self.busy = False    # checked out; the sweeper must not touch it
+
+
+_reg_lock = threading.Lock()
+_registry: "weakref.WeakSet[_Slot]" = weakref.WeakSet()
+_last_sweep = 0.0
+
+
+def _slot() -> _Slot:
+    slot = getattr(_local, "slot", None)
+    if slot is None:
+        slot = _local.slot = _Slot()
+        with _reg_lock:
+            _registry.add(slot)
+    return slot
+
+
+def _is_lost(exc: BaseException) -> bool:
+    """True when `exc` means the connection itself is dead (not a bad query)."""
+    if isinstance(exc, pymysql.err.InterfaceError):
+        return True
+    if isinstance(exc, pymysql.err.OperationalError):
+        return bool(exc.args) and exc.args[0] in _LOST_CODES
+    return isinstance(exc, (BrokenPipeError, ConnectionError, TimeoutError))
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError) or (
+        isinstance(exc, pymysql.err.OperationalError) and "timed out" in str(exc))
+
+
+def _never_sent(exc: BaseException) -> bool:
+    """PyMySQL raises InterfaceError(0, '') only from `_execute_command` when
+    the socket is already gone, i.e. before a single byte of the statement was
+    written. That is the one failure after which even a write is safe to retry."""
+    return isinstance(exc, pymysql.err.InterfaceError) and tuple(exc.args[:1]) == (0,)
+
+
+def _close_cursor(cur) -> None:
+    try:
+        cur.close()
+    except Exception:  # noqa: BLE001 - a cursor on a dead connection can't be drained
+        pass
+
+
+def _close_conn(conn) -> None:
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001 - the socket is already dead
+        conn._force_close()
+
+
+def _drop(slot: _Slot) -> None:
+    conn, slot.conn = slot.conn, None
+    slot.broken = False
+    _close_conn(conn)
+
+
+def _sweep(now: float) -> None:
+    """Close handles whose owning thread went quiet. Cheap and rate-limited; run
+    opportunistically from checkouts so no extra thread is needed."""
+    global _last_sweep
+    if now - _last_sweep < _SWEEP_EVERY_SECONDS:
+        return
+    with _reg_lock:
+        _last_sweep = now
+        for slot in list(_registry):
+            if slot.conn is not None and not slot.busy and now - slot.used > _MAX_IDLE_SECONDS:
+                conn, slot.conn = slot.conn, None
+                _close_conn(conn)
+
+
+def _checkout(slot: _Slot) -> Conn:
+    """Return this thread's connection, verified alive; reconnect if needed."""
+    now = time.monotonic()
+    _sweep(now)
+    with _reg_lock:
+        slot.busy = True
+    try:
+        conn = slot.conn
+        if conn is not None:
+            if not conn.open or now - slot.created > _MAX_AGE_SECONDS:
+                _drop(slot)
+            elif now - slot.used > _IDLE_PING_SECONDS:
+                try:
+                    conn.ping(reconnect=False)
+                except Exception as exc:  # noqa: BLE001 - any ping failure => replace
+                    log.info("db: idle connection failed ping (%s); replacing", type(exc).__name__)
+                    _drop(slot)
+        if slot.conn is None:
+            slot.conn = _new_conn()
+            slot.created = time.monotonic()
+        slot.depth, slot.broken = 1, False
+        return slot.conn
+    except BaseException:
+        slot.depth = 0
+        with _reg_lock:
+            slot.busy = False
+        raise
+
+
+def _release(slot: _Slot) -> None:
+    conn = slot.conn
+    try:
+        if conn is not None:
+            if slot.broken or not conn.open:
+                _drop(slot)
+            else:
+                conn.close_open_cursors()
+                if conn.server_status & _IN_TRANS:
+                    # A transaction left open would pin locks and leak into the
+                    # next caller on this thread. Roll it back.
+                    log.warning("db: transaction left open on release; rolling back")
+                    try:
+                        conn.rollback()
+                    except Exception:  # noqa: BLE001
+                        _drop(slot)
+    finally:
+        slot.depth = 0
+        slot.used = time.monotonic()
+        with _reg_lock:
+            slot.busy = False
+
+
 @contextmanager
 def get_conn() -> Iterator[pymysql.connections.Connection]:
-    """Yield this thread's connection. Deliberately does not close it - the
-    handle is reused for every later call on the same thread."""
-    conn = getattr(_local, "conn", None)
-    if conn is None:
-        conn = _local.conn = _new_conn()
-    yield conn
+    """Yield this thread's connection (reused across calls, health-checked on
+    checkout). Nested use on the same thread shares the outer handle, so a
+    helper called inside a transaction stays inside it. The handle is
+    discarded if the body fails in a way that leaves it unusable."""
+    slot = _slot()
+    if slot.depth:
+        slot.depth += 1
+        try:
+            yield slot.conn
+        except BaseException as exc:
+            if _is_fatal(exc):
+                slot.broken = True
+            raise
+        finally:
+            slot.depth -= 1
+        return
+    conn = _checkout(slot)
+    try:
+        yield conn
+    except BaseException as exc:
+        if _is_fatal(exc):
+            slot.broken = True
+        raise
+    finally:
+        _release(slot)
+
+
+def _is_fatal(exc: BaseException) -> bool:
+    """Failures after which the connection's protocol state can't be trusted."""
+    return (not isinstance(exc, Exception)  # KeyboardInterrupt, SystemExit, cancellation
+            or _is_lost(exc)
+            or isinstance(exc, pymysql.err.InternalError))
+
+
+def safe_rollback(conn) -> None:
+    """Roll back from an `except` block without masking the exception being
+    handled: if the connection is what died, the rollback itself fails, and the
+    caller must still see the ORIGINAL error. The server discards an open
+    transaction when its connection drops, so nothing is left pending."""
+    try:
+        conn.rollback()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("db: rollback failed (%s); connection will be discarded", _describe(exc))
+        _slot().broken = True
 
 
 def close_conn() -> None:
     """Drop this thread's connection. Only needed when a thread is about to
     exit, or when tests point at a fresh database."""
-    conn = getattr(_local, "conn", None)
-    if conn is not None:
+    slot = _slot()
+    if not slot.busy:
+        _drop(slot)
+
+
+def pool_stats() -> dict[str, int]:
+    """Counts only - safe to log. `open` is handles currently held."""
+    with _reg_lock:
+        slots = list(_registry)
+    return {"threads": len(slots),
+            "open": sum(1 for s in slots if s.conn is not None and s.conn.open),
+            "busy": sum(1 for s in slots if s.busy)}
+
+
+_READ_ONLY = re.compile(r"^\s*(?:/\*.*?\*/\s*)*(?:SELECT|SHOW|DESCRIBE|DESC|EXPLAIN)\b", re.I | re.S)
+_SIDE_EFFECTS = re.compile(
+    r"\bFOR\s+UPDATE\b|\bLOCK\s+IN\s+SHARE\s+MODE\b|\bINTO\s+(?:OUTFILE|DUMPFILE|@)|\bGET_LOCK\b"
+    r"|\bRELEASE_LOCK\b|\bNEXTVAL\b|\bSLEEP\s*\(|\bLAST_INSERT_ID\s*\(\s*[^)\s]", re.I)
+
+
+def is_read_only(sql: str) -> bool:
+    """True only for statements that are safe to run twice."""
+    return bool(_READ_ONLY.match(sql)) and not _SIDE_EFFECTS.search(sql)
+
+
+def _run(sql: str, params, fn):
+    """Run `fn(cursor)` on a healthy connection.
+
+    Retry policy (at most ONE retry, never inside a caller's `get_conn()` block
+    where a transaction may be open):
+      * any statement, if PyMySQL says nothing was sent (`_never_sent`);
+      * a read-only statement, if the connection died mid-flight - unless the
+        server simply took too long (a timeout would just take as long again);
+      * never a write after "lost connection during query" / "gone away": the
+        server may already have applied it, and retrying could duplicate it;
+      * never ordinary SQL errors (syntax, integrity, auth, ...);
+      * never a failure to connect (the checkout already made a fresh attempt).
+    If the retry fails with another connection error the ORIGINAL exception is
+    raised (with the retry's as its cause)."""
+    read_only = is_read_only(sql)
+    nested = _slot().depth > 0
+    first: BaseException | None = None
+    for attempt in (0, 1):
+        connected = False
         try:
-            conn.close()
-        finally:
-            _local.conn = None
+            with get_conn() as conn:
+                connected = True
+                cur = conn.cursor()
+                try:
+                    cur.execute(sql, params)
+                    return fn(cur)
+                finally:
+                    _close_cursor(cur)
+        except Exception as exc:  # noqa: BLE001
+            if first is not None:
+                if _is_lost(exc):
+                    log.error("db: retry after %s failed too (%s)",
+                              type(first).__name__, _describe(exc))
+                    raise first from exc
+                raise
+            retry = (attempt == 0 and connected and not nested and (
+                _never_sent(exc)
+                or (read_only and _is_lost(exc) and not _is_timeout(exc))))
+            if not retry:
+                raise
+            log.warning("db: %s on %s statement; reconnecting and retrying once",
+                        _describe(exc), "read" if read_only else "write")
+            first = exc
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _describe(exc: BaseException) -> str:
+    """Diagnostic text for logs: type and errno/message, never connection params."""
+    return f"{type(exc).__name__}{exc.args[:2]!r}"
+
+
+def ping() -> bool:
+    """Cheap liveness check; heals a stale connection like any other query."""
+    try:
+        return scalar("SELECT 1") == 1
+    except Exception as exc:  # noqa: BLE001
+        log.error("db: ping failed: %s", _describe(exc))
+        return False
 
 
 def query(sql: str, params: tuple | dict | None = None) -> list[dict]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return [dict(r) for r in cur.fetchall()]
+    return _run(sql, params, lambda cur: [dict(r) for r in cur.fetchall()])
 
 
 def query_one(sql: str, params: tuple | dict | None = None) -> dict | None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            row = cur.fetchone()
-            return dict(row) if row else None
+    return _run(sql, params, lambda cur: (lambda r: dict(r) if r else None)(cur.fetchone()))
 
 
 def execute(sql: str, params: tuple | dict | None = None) -> int:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.lastrowid or cur.rowcount
+    return _run(sql, params, lambda cur: cur.lastrowid or cur.rowcount)
 
 
 def scalar(sql: str, params: tuple | dict | None = None, default: Any = 0) -> Any:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            row = cur.fetchone()
+    row = _run(sql, params, lambda cur: cur.fetchone())
     if row is None:
         return default
     value = next(iter(row.values()), None)

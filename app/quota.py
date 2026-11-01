@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .config import settings
-from .db import execute, get_conn, query, query_one, today
+from .db import execute, get_conn, query, query_one, safe_rollback, today
 
 
 class QuotaExceeded(RuntimeError):
@@ -82,7 +82,7 @@ def check_and_reserve(service: str = "google_places", tier: str = "default", n: 
         except QuotaExceeded:
             raise
         except Exception:
-            conn.execute("ROLLBACK")
+            safe_rollback(conn)
             raise
 
     # Part 7.6 - warn on the approach, not the wall. Outside the transaction so

@@ -21,7 +21,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from .backup import run_backup
 from .config import parse_hhmm, settings
-from .db import (execute, get_conn, get_setting, log_automation, log_failure, query,
+from .db import (execute, get_conn, get_setting, safe_rollback, log_automation, log_failure, query,
                  query_one, scalar, set_setting, today, utcnow, workspace_context)
 from . import leadscore, lineage, notify
 from .enrich import enrich_pending
@@ -378,7 +378,7 @@ def claim_lease() -> bool:
             conn.execute("COMMIT")
             return True
         except Exception:
-            conn.execute("ROLLBACK")
+            safe_rollback(conn)
             raise
 
 
