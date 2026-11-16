@@ -176,7 +176,7 @@ def job_startups(force: bool = False, workspace_id: int | None = None) -> dict:
         with workspace_context(wid):
             for provider, niche, city, country in runs:
                 try:
-                    result = run_search(niche=niche, city=city, country=country, max_results=50,
+                    result = run_search(niche=niche, city=city, country=country, max_results=20,
                                         provider_name=provider, triggered_by="automation",
                                         workspace_id=wid)
                     ran += 1

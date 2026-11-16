@@ -46,6 +46,12 @@ def step_key(campaign_id: int, position: int) -> str:
     return f"c{campaign_id}s{position}"
 
 
+def variant_for(step: dict, lead_id: int) -> str:
+    """A/B split: a step with a second template sends B to odd lead ids and A to even ones.
+    Deterministic, so a lead always gets the same variant and stats need no extra storage."""
+    return "B" if step.get("template_b") and lead_id % 2 else "A"
+
+
 # --------------------------------------------------------------- enrolment ---
 def enroll(campaign_id: int, lead_ids: list[int]) -> dict:
     """Enrol leads the caller may see. -> {enrolled, skipped: {reason: count}}."""
@@ -162,7 +168,9 @@ def _advance(enr: dict, steps: list[dict], now: datetime) -> str:
                          "AND status IN ('PENDING','APPROVED','SENT') ORDER BY id DESC",
                          (current_ws(), lead["id"], key))
     try:
-        qid = existing["id"] if existing else queue_message(lead, step["template_name"], key, "email")
+        qid = existing["id"] if existing else queue_message(
+            lead, step["template_b"] if variant_for(step, lead["id"]) == "B" else step["template_name"],
+            key, "email")
     except (ValueError, PermissionError) as exc:
         _stop(enr, f"cannot queue: {exc}"); return "stopped"
     if qid is None:
@@ -184,7 +192,7 @@ def tick(campaign_id: int | None = None) -> dict:
     steps_cache: dict[int, list[dict]] = {}
     for enr in rows:
         steps = steps_cache.setdefault(enr["campaign_id"], query(
-            "SELECT position, template_name, delay_days FROM campaign_steps WHERE campaign_id = ? "
+            "SELECT position, template_name, template_b, delay_days FROM campaign_steps WHERE campaign_id = ? "
             "ORDER BY position", (enr["campaign_id"],)))
         try:
             result = _advance(enr, steps, now)
@@ -207,10 +215,32 @@ def stats(campaign_id: int) -> dict:
         (current_ws(), like))}
     replied = query_one("SELECT COUNT(*) AS n FROM campaign_enrollments WHERE campaign_id = ? AND "
                         "workspace_id = ? AND stop_reason LIKE ?", (campaign_id, current_ws(), "replied%"))["n"]
-    return {"active": counts.get("ACTIVE", 0), "completed": counts.get("COMPLETED", 0),
+    return {"variants": ab_results(campaign_id), "active": counts.get("ACTIVE", 0), "completed": counts.get("COMPLETED", 0),
             "stopped": counts.get("STOPPED", 0), "enrolled": sum(counts.values()),
             "awaiting_approval": queue.get("PENDING", 0), "approved": queue.get("APPROVED", 0),
             "sent": queue.get("SENT", 0), "replied": replied}
+
+
+def ab_results(campaign_id: int) -> list[dict]:
+    """Per A/B step: sent and replied counts for each variant (reply is credited to the step
+    that was last sent to the lead before they answered)."""
+    out = []
+    for st in query("SELECT position, template_name, template_b FROM campaign_steps WHERE campaign_id = ? "
+                    "AND template_b IS NOT NULL ORDER BY position", (campaign_id,)):
+        key = step_key(campaign_id, st["position"])
+        sent = {"A": 0, "B": 0}
+        for r in query("SELECT lead_id FROM approval_queue WHERE workspace_id = ? AND step = ? AND status = 'SENT'",
+                       (current_ws(), key)):
+            sent[variant_for(st, r["lead_id"])] += 1
+        replied = {"A": 0, "B": 0}
+        for r in query("SELECT lead_id FROM campaign_enrollments WHERE campaign_id = ? AND workspace_id = ? "
+                       "AND stop_reason LIKE ? AND next_position = ?",
+                       (campaign_id, current_ws(), "replied%", st["position"] + 1)):
+            replied[variant_for(st, r["lead_id"])] += 1
+        out.append({"position": st["position"],
+                    "A": {"template": st["template_name"], "sent": sent["A"], "replied": replied["A"]},
+                    "B": {"template": st["template_b"], "sent": sent["B"], "replied": replied["B"]}})
+    return out
 
 
 def parse_criteria(raw) -> dict:

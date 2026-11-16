@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from .. import registry_check
 from ..db import current_ws, execute, lead_scope, query, query_one, utcnow
+from ..providers.web_ai import clamp_batch
 from ..search_service import start_search
 from ..security import require_role
 from ..subscription import check_search_entitlement, max_results_for
@@ -18,6 +19,15 @@ router = APIRouter(prefix="/api/startups", tags=["startups"])
 WRITE = Depends(require_role("superadmin", "admin", "user"))
 
 _REG = re.compile(r"(?:incorporated|registered) (\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4}|\d{4}-\d{2}|\d{4})")
+
+
+_ABOUT = re.compile(r"registered [^;]*;\s*(.*)\)\s*$")
+_FIELDS = ("owner_name", "email", "phone", "address", "website_url", "instagram_url", "facebook_url", "linkedin_url")
+
+
+def _about(source: str | None) -> str:
+    m = _ABOUT.search(source or "")
+    return m.group(1).strip() if m else ""
 
 
 def _registered(source: str | None) -> str | None:
@@ -31,7 +41,7 @@ def list_startups(country: str = "", q: str = "", closed: bool = False,
     """Registry leads (UK Companies House / India MCA) with owner and status."""
     scope, params = lead_scope()
     sql = (f"SELECT id, business_name, owner_name, address, city, state, pincode, country, website_url, "
-           f"email, phone, status, business_status, lead_score, source, place_id, updated_at FROM leads "
+           f"email, phone, instagram_url, facebook_url, linkedin_url, created_at, status, business_status, lead_score, source, place_id, updated_at FROM leads "
            f"WHERE {scope} AND (place_id LIKE 'ch:%%' OR place_id LIKE 'mca:%%' OR place_id LIKE 'web:%%')")
     if country:
         sql += " AND country = ?"; params.append(country)
@@ -46,6 +56,9 @@ def list_startups(country: str = "", q: str = "", closed: bool = False,
         r["registry"] = {"ch": "uk", "mca": "india"}.get(r["place_id"].split(":", 1)[0], "web")
         r["registration_number"] = r["place_id"].split(":", 1)[1] if r["registry"] != "web" else "web"
         r["registered_on"] = _registered(r["source"])
+        r["about"] = _about(r["source"])
+        have = sum(1 for k in _FIELDS if r.get(k)) + bool(r["registered_on"])
+        r["completeness"] = round(100 * have / (len(_FIELDS) + 1))
     return {"count": len(rows), "startups": rows}
 
 
@@ -53,7 +66,7 @@ class FindPayload(BaseModel):
     niche: str = "tech"
     city: str = ""
     country: str = "both"          # any country name, uk, india, both or worldwide
-    max_results: int = 50
+    max_results: int = 15          # 10-20 per run, never more
 
 
 @router.post("/find")
@@ -75,7 +88,7 @@ def find(payload: FindPayload, request: Request, _: dict = WRITE):
         countries = [c[:100]]
     runs = [("web_ai", x) for x in countries]
     ids = [start_search(niche=payload.niche.strip() or "tech", city=payload.city.strip(), area="",
-                        country=country, max_results=max_results_for(user, payload.max_results),
+                        country=country, max_results=clamp_batch(max_results_for(user, payload.max_results)),
                         provider_name=prov, enrich=True, triggered_by="manual",
                         user_id=user.get("id")) for prov, country in runs]
     return {"search_ids": ids, "status": "RUNNING"}

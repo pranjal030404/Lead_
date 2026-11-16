@@ -1729,6 +1729,15 @@ def _add_denied_features(conn: Conn) -> None:
             cur.execute("ALTER TABLE users ADD COLUMN denied_features TEXT NULL")
 
 
+def _add_step_template_b(conn: Conn) -> None:
+    """campaign_steps.template_b: optional second template for A/B testing a step."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 AS x FROM information_schema.columns WHERE table_schema = DATABASE() "
+                    "AND table_name = 'campaign_steps' AND column_name = 'template_b'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE campaign_steps ADD COLUMN template_b VARCHAR(128) NULL")
+
+
 MIGRATIONS: list[tuple[int, str, Any]] = [
     (1, "searches.user_id", _ensure_searches_user_id),
     (2, "searches.cached_from", _ensure_searches_cached_from),
@@ -1748,6 +1757,7 @@ MIGRATIONS: list[tuple[int, str, Any]] = [
     (16, "pipeline stages per workspace, meetings, proposals", _create_pipeline_meetings_proposals),
     (17, "segments, job_queue", _create_segments_and_queue),
     (18, "users.denied_features", _add_denied_features),
+    (19, "campaign_steps.template_b (A/B testing)", _add_step_template_b),
 ]
 
 CREATE_MIGRATIONS_TABLE = """

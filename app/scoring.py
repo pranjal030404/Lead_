@@ -90,6 +90,11 @@ def score_lead(lead: dict) -> dict:
         score = 5
         reasons.append("capped at 5 - data quality below 3, not enough to act on")
 
+    if lead.get("source") == "Inbound form":
+        # They asked to be contacted: always at least HOT, whatever the site looks like.
+        score = max(score, 8)
+        reasons.append("inbound enquiry - they asked to be contacted (HOT)")
+
     if score >= 8:
         priority = "HOT"
     elif score >= 5:
