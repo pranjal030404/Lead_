@@ -17,7 +17,7 @@ from .leads import _own_lead
 router = APIRouter(prefix="/api/startups", tags=["startups"])
 WRITE = Depends(require_role("superadmin", "admin", "user"))
 
-_REG = re.compile(r"(?:incorporated|registered) (\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4})")
+_REG = re.compile(r"(?:incorporated|registered) (\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4}|\d{4}-\d{2}|\d{4})")
 
 
 def _registered(source: str | None) -> str | None:
@@ -52,7 +52,7 @@ def list_startups(country: str = "", q: str = "", closed: bool = False,
 class FindPayload(BaseModel):
     niche: str = "tech"
     city: str = ""
-    country: str = "both"          # uk | india | both
+    country: str = "both"          # any country name, uk, india, both or worldwide
     max_results: int = 50
 
 
@@ -63,14 +63,17 @@ def find(payload: FindPayload, request: Request, _: dict = WRITE):
     ent = check_search_entitlement(user)
     if not ent["ok"]:
         raise HTTPException(403, "Plan search limit reached or no active subscription.")
-    c = payload.country.lower()
-    if c not in ("uk", "india", "both"):
-        raise HTTPException(400, "country must be uk, india or both")
-    runs = []
-    if c in ("uk", "both"):
-        runs.append(("web_ai", "United Kingdom"))
-    if c in ("india", "both"):
-        runs.append(("web_ai", "India"))
+    c = payload.country.strip()
+    low = c.lower()
+    if low in ("", "both", "all", "worldwide", "global"):
+        countries = [""] if low in ("all", "worldwide", "global") else ["United Kingdom", "India"]
+    elif low == "uk":
+        countries = ["United Kingdom"]
+    elif low == "india":
+        countries = ["India"]
+    else:
+        countries = [c[:100]]
+    runs = [("web_ai", x) for x in countries]
     ids = [start_search(niche=payload.niche.strip() or "tech", city=payload.city.strip(), area="",
                         country=country, max_results=max_results_for(user, payload.max_results),
                         provider_name=prov, enrich=True, triggered_by="manual",

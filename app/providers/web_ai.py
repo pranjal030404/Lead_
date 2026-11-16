@@ -251,8 +251,8 @@ class WebAiProvider:
                      city=(f.get("city") or city or None),
                      website_url=(f"https://{dom}" if dom else None),
                      owner_name=(str(f.get("founders"))[:200] if f.get("founders") else None),
-                     source=f"Web AI search ({'LLM' if settings.llm_base_url else 'heuristic'}; "
-                            f"registered {f.get('founded') or 'n/a'}; {str(f.get('about') or '')[:160]})")
+                     source=(f"Web AI search ({'LLM' if settings.llm_base_url else 'heuristic'}; "
+                             f"registered {f.get('founded') or 'n/a'}; {str(f.get('about') or '')[:120]})")[:250])
             out.append(c)
         return out[:max_results]
 

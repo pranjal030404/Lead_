@@ -1706,14 +1706,14 @@ routes['/startups'] = async () => {
       <div class="flex" style="gap:8px;flex-wrap:wrap">
         <input id="su-niche" value="tech" placeholder="niche words (tech, software, cafe)">
         <input id="su-city" placeholder="city (optional)">
-        <select id="su-country"><option value="both">UK + India</option><option value="uk">UK</option><option value="india">India</option></select>
+        <select id="su-country"><option value="worldwide">All countries (worldwide)</option><option value="both">UK + India</option><option>India</option><option>United Kingdom</option><option>United States</option><option>Canada</option><option>Australia</option><option>Germany</option><option>France</option><option>Netherlands</option><option>Singapore</option><option>United Arab Emirates</option><option>Brazil</option><option>Nigeria</option><option>South Africa</option><option>Indonesia</option><option>Philippines</option><option>Pakistan</option><option>Bangladesh</option><option>Sri Lanka</option><option>Nepal</option><option>Spain</option><option>Italy</option><option>Ireland</option><option>Sweden</option><option>Japan</option></select>
         <button id="su-find">Find new startups</button>
       </div>
     </div>
     <div class="card">
       <div class="flex" style="gap:8px;flex-wrap:wrap;margin-bottom:10px">
         <input id="su-q" placeholder="filter: name, address, owner">
-        <select id="su-lc"><option value="">All countries</option><option>United Kingdom</option><option>India</option></select>
+        <select id="su-lc"><option value="">All countries</option><option>India</option><option>United Kingdom</option><option>United States</option><option>Canada</option><option>Australia</option><option>Germany</option><option>France</option><option>Netherlands</option><option>Singapore</option><option>United Arab Emirates</option><option>Brazil</option><option>Nigeria</option><option>South Africa</option><option>Indonesia</option><option>Philippines</option><option>Pakistan</option><option>Bangladesh</option><option>Sri Lanka</option><option>Nepal</option><option>Spain</option><option>Italy</option><option>Ireland</option><option>Sweden</option><option>Japan</option></select>
         <label class="flex" style="gap:4px"><input type="checkbox" id="su-closed"> show closed</label>
         <button id="su-reload" class="sm">Reload</button>
         <button id="su-dry" class="sm">Check (preview)</button>
