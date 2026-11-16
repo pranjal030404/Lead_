@@ -56,18 +56,37 @@
         <div class="login-sub">Sign in to your workspace to continue.</div>
 
         <div class="field">
-          <label for="username">Username</label>
-          <input id="username" name="username" autocomplete="username" autofocus required>
+          <label for="username">Username or email</label>
+          <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus required>
         </div>
         <div class="field">
           <label for="password">Password</label>
           <input id="password" name="password" type="password" autocomplete="current-password" required>
         </div>
+        <div class="field" id="codeField" style="display:none">
+          <label for="code">Authenticator code</label>
+          <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
+        </div>
         <button class="primary" type="submit">Sign in</button>
         <p id="error" class="banner err login-error" style="display:none; margin:14px 0 0"></p>
+        <p style="margin:12px 0 0"><a href="#" id="forgot">Forgot password?</a></p>
         <span class="faint">
           Accounts are managed by your administrator. No account? {{BRAND_SUPPORT_HTML}}.
         </span>
+      </form>
+      <form class="card login-card" id="resetForm" style="display:none">
+        <div class="login-title" id="resetTitle">Reset password</div>
+        <div class="field" id="resetIdField">
+          <label for="resetId">Username or email</label>
+          <input id="resetId" autocapitalize="none" spellcheck="false">
+        </div>
+        <div class="field" id="resetPwField" style="display:none">
+          <label for="resetPw">New password (8+ characters)</label>
+          <input id="resetPw" type="password" autocomplete="new-password" minlength="8">
+        </div>
+        <button class="primary" type="submit" id="resetBtn">Send reset link</button>
+        <p id="resetMsg" class="banner" style="display:none; margin:14px 0 0"></p>
+        <p style="margin:12px 0 0"><a href="/login">Back to sign in</a></p>
       </form>
     </main>
   </div>
@@ -88,6 +107,7 @@
           body: JSON.stringify({
             username: form.username.value,
             password: form.password.value,
+            code: form.code.value || null,
           }),
         });
         if (response.ok) {
@@ -96,6 +116,10 @@
         }
         const data = await response.json().catch(() => ({}));
         error.textContent = data.detail || 'Sign in failed';
+        if (response.headers.get('X-MFA-Required')) {
+          document.getElementById('codeField').style.display = '';
+          document.getElementById('code').focus();
+        }
         if (response.status === 403 && /admin/i.test(data.detail || '')) {
           const link = document.createElement('a');
           link.href = '/admin';
@@ -107,6 +131,37 @@
       } finally {
         button.disabled = false;
       }
+    });
+
+    // Password reset: "Forgot password?" asks for a link; /login?reset=TOKEN sets the new password.
+    const resetForm = document.getElementById('resetForm');
+    const resetMsg = document.getElementById('resetMsg');
+    const resetToken = new URLSearchParams(location.search).get('reset');
+    function showReset() {
+      form.style.display = 'none';
+      resetForm.style.display = '';
+      if (resetToken) {
+        document.getElementById('resetIdField').style.display = 'none';
+        document.getElementById('resetPwField').style.display = '';
+        document.getElementById('resetBtn').textContent = 'Set new password';
+      }
+    }
+    document.getElementById('forgot').addEventListener('click', (e) => { e.preventDefault(); showReset(); });
+    if (resetToken) showReset();
+    resetForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const url = resetToken ? '/api/auth/password-reset/confirm' : '/api/auth/password-reset/request';
+      const body = resetToken
+        ? { token: resetToken, password: document.getElementById('resetPw').value }
+        : { identifier: document.getElementById('resetId').value };
+      const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                   body: JSON.stringify(body) });
+      const d = await r.json().catch(() => ({}));
+      resetMsg.className = 'banner ' + (r.ok ? 'ok' : 'err');
+      resetMsg.textContent = r.ok
+        ? (resetToken ? 'Password updated. You can sign in now.' : (d.message || 'Check your email.'))
+        : (d.detail || 'Request failed');
+      resetMsg.style.display = 'block';
     });
   </script>
 </body>

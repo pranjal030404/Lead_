@@ -240,7 +240,7 @@ def test_contact_upsert_keeps_better_source_and_title_logic():
 # --------------------------------------------------------- email safety ------
 
 def test_outreach_refuses_inferred_invalid_and_disposable_addresses():
-    lid = _lead("Mail Safe", email="priya.nair@mailsafe.in")
+    lid = _lead("Mail Safe", email="priya.nair@mailsafe.in", email_valid=1)
     people.add_contact(lid, "Priya Nair", "Owner")
     lead = query_one("SELECT * FROM leads WHERE id = ?", (lid,))
     # unverified-but-real address is allowed
@@ -278,7 +278,7 @@ def test_inference_uses_domain_evidence_and_is_never_verified():
 
 
 def test_send_time_block_when_address_turns_out_invalid():
-    lid = _lead("Late Bounce", email="owner@latebounce.in")
+    lid = _lead("Late Bounce", email="owner@latebounce.in", email_valid=1)
     lead = query_one("SELECT * FROM leads WHERE id = ?", (lid,))
     qid = queue_message(lead, "cold_email_first", "x")
     assert qid

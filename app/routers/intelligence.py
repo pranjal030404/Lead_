@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from .. import audit, competitors, leadscore, signals
+from .. import evidence, audit, competitors, leadscore, signals
 from ..config import settings
 from ..db import current_ws, lead_scope, query, query_one
 from ..security import rate_limit, require_role
@@ -21,6 +21,13 @@ def lead_scores(lead_id: int):
     if not row:
         raise HTTPException(404, "This lead has not been scored yet - POST .../scores/recompute")
     return row
+
+
+@router.get("/leads/{lead_id}/evidence")
+def lead_evidence(lead_id: int):
+    """How well-evidenced is this lead? Grade A-D plus the concrete gaps to close."""
+    lead = _own_lead(lead_id, "*")
+    return evidence.grade_evidence(dict(lead))
 
 
 @router.post("/leads/{lead_id}/scores/recompute")

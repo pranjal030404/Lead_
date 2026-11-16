@@ -74,7 +74,7 @@ function table(headers, rows, emptyMessage = 'Nothing here yet.') {
 }
 
 // -------------------------------------------------------- session & roles ---
-const ROLE_LEVEL = { user: 0, admin: 1, superadmin: 2 };
+const ROLE_LEVEL = { viewer: 0, user: 0, admin: 1, superadmin: 2 };
 
 function me() {
   return window.__me || { user: null, subscription: null };
@@ -89,6 +89,7 @@ function hasMinRole(role) {
 }
 
 function isAdmin() { return hasMinRole('admin'); }
+function isFree() { return !!(window.__me && window.__me.free_mode); }
 
 const progressBar = (used, cap) => {
   const pct = cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0;
@@ -101,8 +102,10 @@ function configureNav() {
   const admin = isAdmin();
   document.getElementById('admingroup').style.display = admin ? '' : 'none';
   document.getElementById('navUsers').style.display = admin ? '' : 'none';
-  document.getElementById('navPlans').style.display = admin ? '' : 'none';
+  document.getElementById('navPlans').style.display = admin && !isFree() ? '' : 'none';
+  document.querySelectorAll('#nav a[href="#/myplan"]').forEach((a) => { a.style.display = isFree() ? 'none' : ''; });
   document.getElementById('navSettings').style.display = admin ? '' : 'none';
+  ['navIntegrations', 'navAudit'].forEach((id) => { const n = document.getElementById(id); if (n) n.style.display = admin ? '' : 'none'; });
   const user = me().user;
   if (user) {
     const name = [user.full_name, user.username].filter(Boolean).join(' · ');
@@ -127,6 +130,7 @@ function navigate() {
   const [rawPath, queryString] = hash.split('?');
   let path = rawPath;
   if (!hasMinRole('admin') && ADMIN_ONLY[path]) path = '/dashboard';
+  if (isFree() && (path === '/myplan' || path === '/plans')) path = '/dashboard';
   currentPath = path;
   const params = Object.fromEntries(new URLSearchParams(queryString || ''));
 
@@ -176,13 +180,8 @@ routes['/dashboard'] = async () => {
   const [stats, conversions] = await Promise.all([
     api('/api/stats'), api('/api/stats/conversions'),
   ]);
-  const quota = stats.quota.google;
 
   const warnings = [];
-  if (quota.warning) {
-    warnings.push(`<div class="banner warn">API usage is at ${quota.pct}% of today's cap
-      (${quota.used_today}/${quota.cap}). Searches stop automatically when it hits 100%.</div>`);
-  }
   if (stats.unresolved_failures) {
     warnings.push(`<div class="banner err">${stats.unresolved_failures} unresolved job
       failure(s). <a href="#/automation" style="color:inherit">Review them</a>.</div>`);
@@ -233,17 +232,13 @@ routes['/dashboard'] = async () => {
           ${conversions.reached.NEW} leads kept (${conversions.search_to_lead}%)
         </div>
       </div>
-      <div class="card"><h3>API budget today</h3>
-        <div class="value" style="font-size:27px;font-weight:650;font-variant-numeric:tabular-nums">
-          ${quota.used_today}<span class="faint" style="font-size:16px"> / ${quota.cap}</span></div>
-        <div class="bar ${quota.pct > 90 ? 'danger' : quota.pct > 70 ? '' : 'ok'}"
-             style="margin:10px 0"><span style="width:${Math.min(quota.pct, 100)}%"></span></div>
-        <dl class="kv" style="margin-top:14px">
-          <dt>Provider</dt><dd>${esc(stats.quota.provider)}</dd>
-          <dt>Hunter.io</dt><dd>${stats.quota.hunter.used_this_month} /
-            ${stats.quota.hunter.cap} this month</dd>
+      <div class="card"><h3>Data sources</h3>
+        <p class="muted" style="margin:0 0 10px">Free and open source - no keys, no quotas.</p>
+        <dl class="kv">
+          <dt>Active provider</dt><dd>${esc(stats.quota.provider)}</dd>
           <dt>Pending enrichment</dt><dd>${stats.pending_enrichment}</dd>
         </dl>
+        <a class="btn sm" href="#/discover" style="margin-top:10px">See all sources</a>
       </div>
       <div class="card"><h3>By niche</h3>
         ${table([{ label: 'Niche' }, { label: 'Leads', num: true }, { label: 'Hot', num: true }],
@@ -258,14 +253,16 @@ routes['/dashboard'] = async () => {
 routes['/search'] = async () => {
   const [providers, history, plan] = await Promise.all([
     api('/api/providers'), api('/api/search/history?limit=15'),
-    me().user && me().user.role !== 'superadmin'
+    me().user && me().user.role !== 'superadmin' && !isFree()
       ? api('/api/me/subscription') : Promise.resolve({ subscription: null }),
   ]);
 
   const sub = plan ? plan.subscription : null;
   let quotaBanner = '';
   let locked = false;
-  if (me().user && me().user.role === 'superadmin') {
+  if (isFree()) {
+    quotaBanner = `<div class="banner info">Free and open source. Every feature included.</div>`;
+  } else if (me().user && me().user.role === 'superadmin') {
     quotaBanner = '';
   } else if (!sub) {
     quotaBanner = `<div class="banner warn">No active subscription. Searches are paused until
@@ -305,7 +302,7 @@ routes['/search'] = async () => {
         <div><label>Area / sector (optional)</label><input id="area" placeholder="Sector 15"></div>
         <div><label>Country (optional)</label><input id="country" placeholder="India"></div>
         <div class="shrink" style="width:110px"><label>Max results</label>
-          <input id="max" type="number" value="20" min="1" max="60"></div>
+          <input id="max" type="number" value="20" min="1"></div>
         <div class="shrink" style="width:160px"><label>Provider</label>
           <select id="provider">${providers.available.map((p) =>
             `<option value="${p.key}" ${p.key === providers.active ? 'selected' : ''}
@@ -479,6 +476,8 @@ routes['/leads'] = async (params) => {
       <div><h1>Leads</h1><div class="subtitle" id="leadCount"></div></div>
       <div class="flex">
         <button id="exportBtn">Export CSV</button>
+        <button id="exportJsonBtn">Export JSONL</button>
+        <button id="exportVcfBtn">Export vCard</button>
         <button id="dedupeBtn">Find duplicates</button>
       </div>
     </div>
@@ -543,6 +542,20 @@ routes['/leads'] = async (params) => {
       Object.entries(leadFilters).filter(([k, v]) =>
         v !== undefined && !['limit', 'offset', 'sort', 'direction'].includes(k))
     );
+    window.location.href = `/api/leads/export?${query}`;
+  };
+  document.getElementById('exportVcfBtn').onclick = () => {
+    const query = new URLSearchParams(
+      Object.entries(leadFilters).filter(([k, v]) =>
+        v !== undefined && !['limit', 'offset', 'sort', 'direction'].includes(k)));
+    query.set('format', 'vcf');
+    window.location.href = `/api/leads/export?${query}`;
+  };
+  document.getElementById('exportJsonBtn').onclick = () => {
+    const query = new URLSearchParams(
+      Object.entries(leadFilters).filter(([k, v]) =>
+        v !== undefined && !['limit', 'offset', 'sort', 'direction'].includes(k)));
+    query.set('format', 'jsonl');
     window.location.href = `/api/leads/export?${query}`;
   };
   document.getElementById('dedupeBtn').onclick = async () => {
@@ -690,6 +703,7 @@ function renderDrawer(tab) {
           ${name[0].toUpperCase() + name.slice(1)}</button>`).join('')}</div>
       ${body}
     </div>`;
+  if (tab === 'analysis') { loadEvidence(lead.id); loadFit(lead.id); loadVelocity(lead.id); }
 }
 
 function drawerDetails(lead) {
@@ -763,7 +777,10 @@ function drawerAnalysis(lead) {
       <dt>Copyright year</dt><dd>${esc(lead.website_last_updated) || '—'}</dd>
       <dt>Checked</dt><dd>${date(lead.website_checked_at, true)}</dd>
     </dl>` : '<div class="banner info">No website at all — this is the easiest pitch you can make.</div>'}
-    <ul class="issues">${issues || '<li class="faint">No issues recorded.</li>'}</ul>`;
+    <ul class="issues">${issues || '<li class="faint">No issues recorded.</li>'}</ul>
+    <div id="evidenceSlot"></div>
+    <div id="fitSlot"></div>
+    <div id="velocitySlot"></div>`;
 }
 
 function drawerTimeline(lead) {
@@ -812,6 +829,26 @@ function drawerOutreach(lead) {
         <div class="shrink"><button class="primary" onclick="generateMessage(${lead.id})">Generate</button></div>
       </div>
       <div id="msgOut" style="margin-top:12px"></div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Draft with local AI <span class="pill COLD" style="margin-left:6px">optional</span></h3>
+      <p class="muted" style="font-size:12px;margin:0 0 8px">Uses an open-source model on your own computer (Ollama).
+        Nothing is sent anywhere; you review every draft.</p>
+      <div class="row"><div><label>What you offer</label><input id="aiOffer" placeholder="Modern websites for local clinics"></div>
+        <div class="shrink"><button class="primary" onclick="aiDraft(${lead.id})">Write draft</button></div></div>
+      <div id="aiOut" style="margin-top:10px"></div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Log a reply</h3>
+      <p class="muted" style="font-size:12px;margin:0 0 8px">Paste what they wrote. The app works out
+        what they want, stops pending follow-ups, honours STOP requests and moves the lead.</p>
+      <textarea id="replyText" rows="4" placeholder="Paste the prospect's reply..."></textarea>
+      <div class="flex" style="margin-top:8px">
+        <button onclick="previewReply()">Preview</button>
+        <button class="primary" onclick="applyReply(${lead.id})">Log reply & update lead</button>
+        <button class="danger sm" onclick="markLost(${lead.id})">Mark lost...</button>
+      </div>
+      <div id="replyOut" style="margin-top:10px"></div>
     </div>
     <h3>Queued for approval</h3>
     ${queued || '<div class="empty">Nothing queued for this lead.</div>'}`;
@@ -949,6 +986,7 @@ routes['/followups'] = async () => {
     ${extra}</tr>`;
 
   view.innerHTML = `
+    <div id="healthSlot"></div>
     <div class="page-head"><div><h1>Follow-ups</h1>
       <div class="subtitle">80% of deals close after the 5th touch. This page is that.</div></div>
     </div>
@@ -978,6 +1016,7 @@ routes['/followups'] = async () => {
       upcoming.map((l) => row(l,
         `<td class="faint">${date(l.follow_up_date)}</td>${dated(l)}`)),
       'Nothing scheduled.')}`;
+  loadPipelineHealth();
 };
 
 async function followUpDone(leadId) {
@@ -1657,6 +1696,81 @@ routes['/templates'] = async () => {
     </div>`;
 };
 
+// ------------------------------------------------------- new startups ---
+// Newly registered companies (UK Companies House / India MCA) and their owners.
+routes['/startups'] = async () => {
+  view.innerHTML = `
+    <div class="page-head"><div><h1>New startups</h1>
+      <div class="subtitle">Newly registered companies and their owners - find, review, check and update</div></div></div>
+    <div class="card" style="margin-bottom:12px">
+      <div class="flex" style="gap:8px;flex-wrap:wrap">
+        <input id="su-niche" value="tech" placeholder="niche words (tech, software, cafe)">
+        <input id="su-city" placeholder="city (optional)">
+        <select id="su-country"><option value="both">UK + India</option><option value="uk">UK</option><option value="india">India</option></select>
+        <button id="su-find">Find new startups</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="flex" style="gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <input id="su-q" placeholder="filter: name, address, owner">
+        <select id="su-lc"><option value="">All countries</option><option>United Kingdom</option><option>India</option></select>
+        <label class="flex" style="gap:4px"><input type="checkbox" id="su-closed"> show closed</label>
+        <button id="su-reload" class="sm">Reload</button>
+        <button id="su-dry" class="sm">Check (preview)</button>
+        <button id="su-apply" class="sm">Check &amp; apply</button>
+      </div>
+      <div id="su-msg" class="faint" style="margin-bottom:8px"></div>
+      <div style="overflow-x:auto"><table><thead><tr><th>Company</th><th>Owner</th><th>Registered</th>
+        <th>Reg. no.</th><th>Location</th><th>Contact</th><th>Status</th><th></th></tr></thead>
+        <tbody id="su-rows"></tbody></table></div>
+    </div>`;
+  const $ = (id) => document.getElementById(id);
+  const say = (t) => { $('su-msg').textContent = t; };
+  async function load() {
+    const p = new URLSearchParams({ q: $('su-q').value, country: $('su-lc').value, closed: $('su-closed').checked });
+    try {
+      const d = await api('/api/startups?' + p);
+      $('su-rows').innerHTML = d.startups.map((s) => `
+        <tr style="${s.business_status === 'CLOSED_PERMANENTLY' ? 'opacity:.55' : ''}">
+          <td><a href="javascript:void(0)" onclick="openLead(${s.id})">${esc(s.business_name)}</a></td>
+          <td>${esc(s.owner_name || '-')}</td><td>${esc(s.registered_on || '-')}</td>
+          <td>${esc(s.registration_number)}</td>
+          <td>${esc([s.city, s.state, s.pincode].filter(Boolean).join(', ') || '-')}</td>
+          <td>${esc([s.email, s.phone, s.website_url].filter(Boolean).join(' | ') || '-')}</td>
+          <td>${esc(s.business_status === 'CLOSED_PERMANENTLY' ? 'closed' : s.status)}</td>
+          <td>${s.registry === 'uk' ? `<button class="sm" data-owners="${s.id}">Get owners</button>` : ''}</td>
+        </tr>`).join('');
+      say(`${d.count} compan${d.count === 1 ? 'y' : 'ies'}`);
+      $('su-rows').querySelectorAll('[data-owners]').forEach((b) => b.onclick = async () => {
+        try {
+          const r = await post(`/api/startups/${b.dataset.owners}/owners`);
+          say(r.officers.map((o) => `${o.name} (${o.role})`).join(', ') || 'No current officers');
+          load();
+        } catch (e) { say(e.message); }
+      });
+    } catch (e) { say(e.message); }
+  }
+  async function check(dry) {
+    if (!dry && !confirm('Apply: update addresses, mark dissolved companies closed, and DELETE dead leads you never contacted?')) return;
+    try {
+      const r = await post(`/api/startups/check?dry_run=${dry}`);
+      say(`${dry ? 'Preview' : 'Applied'}: ${r.checked} checked, ${r.updated} to update, ${r.retired} closed, ${r.removed} removed, ${r.unknown} not found in registry`);
+      if (!dry) load();
+    } catch (e) { say(e.message); }
+  }
+  $('su-reload').onclick = load;
+  $('su-q').onkeydown = (e) => { if (e.key === 'Enter') load(); };
+  $('su-dry').onclick = () => check(true);
+  $('su-apply').onclick = () => check(false);
+  $('su-find').onclick = async () => {
+    try {
+      await post('/api/startups/find', { niche: $('su-niche').value, city: $('su-city').value, country: $('su-country').value });
+      say('Search running in the background - reload in a minute.');
+    } catch (e) { say(e.message); }
+  };
+  load();
+};
+
 // ----------------------------------------------------------- demo sites ---
 const DEMO_SITES = [
   { name: 'Chartered Accountant', url: 'https://ca.demo.arthvex.co.in/' },
@@ -1799,10 +1913,12 @@ routes['/users'] = async () => {
 
 async function openUserDrawer(userId) {
   const user = userId ? (await api(`/api/users?q=`)).rows.find((u) => u.id === userId) : null;
+  const features = (await api('/api/permissions/features').catch(() => ({ features: [] }))).features;
+  const denied = new Set((user && user.denied_features) || []);
   const myRole = me().user.role;
-  const roleOptions = ['user', 'admin', 'superadmin'].map((r) =>
+  const roleOptions = ['user', 'viewer', 'admin', 'superadmin'].map((r) =>
     `<option value="${r}" ${user && user.role === r ? 'selected' : ''}
-      ${r !== 'user' && myRole !== 'superadmin' ? 'disabled' : ''}
+      ${r !== 'user' && r !== 'viewer' && myRole !== 'superadmin' ? 'disabled' : ''}
       ${r === 'superadmin' && myRole !== 'superadmin' ? 'disabled' : ''}>${r}</option>`).join('');
 
   drawerRoot.innerHTML = `
@@ -1821,6 +1937,10 @@ async function openUserDrawer(userId) {
         <input id="uPass" type="password" autocomplete="new-password"></div>
       <div class="field"><label>Role</label>
         <select id="uRole">${roleOptions}</select></div>
+      <div class="field"><label>Feature access <span class="faint">(untick to switch a feature off for this user)</span></label>
+        ${features.map((f) => `<label style="display:flex;align-items:center;gap:8px;margin:4px 0">
+          <input type="checkbox" class="uFeat" value="${esc(f.key)}" ${denied.has(f.key) ? '' : 'checked'}> ${esc(f.label)}</label>`).join('')}
+        <div class="faint" style="font-size:12px;margin-top:4px">Admins always have full access. Read-only “viewer” accounts can't change anything regardless.</div></div>
       <label class="row" style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
         <input id="uActive" type="checkbox" ${!user || user.is_active ? 'checked' : ''}>
         Account active</label>
@@ -1840,7 +1960,11 @@ async function saveUser(userId) {
   };
   if (!payload.username) return toast('Username is required', 'err');
   if (!userId && !payload.password) return toast('A password is required for new users', 'err');
-  await (userId ? patch(`/api/users/${userId}`, payload) : post('/api/users', payload));
+  const saved = await (userId ? patch(`/api/users/${userId}`, payload) : post('/api/users', payload));
+  if (!['admin', 'superadmin'].includes(payload.role)) {
+    const denied = [...document.querySelectorAll('.uFeat')].filter((c) => !c.checked).map((c) => c.value);
+    await patch(`/api/users/${(saved && saved.id) || userId}/permissions`, { denied });
+  }
   closeDrawer();
   toast('User saved', 'ok');
   navigate();
@@ -2102,17 +2226,14 @@ routes['/settings'] = async () => {
       </div>
 
       <div class="card">
-        <h3>Provider &amp; quota</h3>
+        <h3>Provider</h3>
         <dl class="kv">
           <dt>Active provider</dt><dd>${esc(providers.active)}</dd>
-          <dt>Google calls today</dt><dd>${quota.google.used_today} / ${quota.google.cap}</dd>
-          <dt>By stage</dt><dd class="mono">${esc(JSON.stringify(quota.google.by_tier))}</dd>
-          <dt>Hunter.io</dt><dd>${quota.hunter.used_this_month} / ${quota.hunter.cap} this month</dd>
+          ${providers.active === 'google' ? `<dt>Google calls today</dt><dd>${quota.google.used_today} / ${quota.google.cap}</dd>` : ''}
         </dl>
-        <div class="banner warn" style="margin-top:12px;font-size:12px">
-          This cap is your app-side second layer. Also set a <b>Requests-per-day
-          Quota limit</b> on the API in Google Cloud Console — a billing budget alert
-          only emails you, it does not stop spending.</div>
+        ${providers.active === 'google' ? `<div class="banner warn" style="margin-top:12px;font-size:12px">
+          Google bills per call, so this spend guard stays on. Also set a budget alert in Google Cloud Console.</div>`
+          : '<div class="muted" style="font-size:12px">Free and open-source data - no quota.</div>'}
       </div>
 
       <div class="card">
@@ -2236,6 +2357,538 @@ async function makeBackup() {
 async function logout() {
   await post('/api/auth/logout');
   window.location.href = '/login';
+}
+
+// ------------------------------------------------------------ discover ---
+// Lead-discovery toolkit: every way the app can find leads, in one place.
+let discoverTab = 'sources';
+
+const DISCOVER_TABS = [
+  ['sources', 'Sources'], ['icp', 'Ideal client'], ['intent', 'Intent feed'], ['import', 'CSV import'], ['grid', 'Grid sweep'],
+  ['queries', 'Query generator'], ['signals', 'Signals'], ['reviews', 'Review miner'],
+  ['lookalikes', 'Lookalikes'], ['api', 'API access'],
+];
+
+routes['/discover'] = async (params) => {
+  if (params && params.tab) discoverTab = params.tab;
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Discover</h1>
+      <div class="subtitle">Every way to find leads beyond a plain map search.</div></div></div>
+    <div class="tabs" style="margin-bottom:16px">${DISCOVER_TABS.map(([key, label]) =>
+      `<button class="${key === discoverTab ? 'active' : ''}"
+        onclick="discoverTab='${key}';routes['/discover']()">${label}</button>`).join('')}</div>
+    <div id="discoverBody"><div class="loading">Loading...</div></div>`;
+  const body = document.getElementById('discoverBody');
+  try {
+    await ({ sources: discoverSources, icp: discoverIcp, intent: discoverIntent, api: discoverApi, import: discoverImport, grid: discoverGrid,
+      queries: discoverQueries, signals: discoverSignals, reviews: discoverReviews,
+      lookalikes: discoverLookalikes }[discoverTab])(body);
+  } catch (error) {
+    body.innerHTML = `<div class="banner err">${esc(error.message)}</div>`;
+  }
+};
+
+async function discoverSources(body) {
+  const { sources } = await api('/api/discovery/sources');
+  const kinds = { map: 'Map search', registry: 'New-company registry', import: 'Import',
+    manual: 'Manual', reverse: 'Reverse prospecting', signal: 'Buying signal' };
+  const tabFor = { csv: 'import', osm: 'sources', intent: 'intent', 'osm+grid': 'grid', 'google+grid': 'grid', dorks: 'queries',
+    lookalike: 'lookalikes', hiring: 'signals', ads: 'signals', techstack: 'signals',
+    domain: 'signals', reviews: 'reviews' };
+  const ready = sources.filter((s) => s.ready).length;
+  body.innerHTML = `
+    <div class="banner info">${ready} of ${sources.length} sources are ready, and every core one is
+      <b>free with no key</b>. Sources marked <b>optional</b> add extra coverage when you put their key in <code>.env</code>.</div>
+    <div class="grid cols-3">${sources.map((s) => `<div class="card">
+      <div class="flex between"><h3 style="margin:0">${esc(s.name)}</h3>
+        ${s.ready ? `<span class="pill WARM" style="background:rgba(61,214,140,.12);color:var(--ok);white-space:nowrap;flex-shrink:0">${s.free ? 'free · ready' : 'ready'}</span>`
+          : '<span class="pill COLD" style="white-space:nowrap;flex-shrink:0">optional · needs key</span>'}</div>
+      <div class="muted" style="font-size:12px;margin:6px 0 10px">${esc(kinds[s.kind] || s.kind)}
+        ${s.needs ? `· <code>${esc(s.needs)}</code>` : ''}</div>
+      ${['map', 'registry'].includes(s.kind)
+        ? `<a class="btn sm" href="#/search">Use in Search</a>`
+        : `<button class="sm" onclick="discoverTab='${tabFor[s.id] || 'sources'}';routes['/discover']()">Open</button>`}
+    </div>`).join('')}</div>`;
+}
+
+async function discoverImport(body) {
+  body.innerHTML = `<div class="card" style="max-width:640px">
+    <h3>Import a lead list</h3>
+    <p class="muted">Upload a CSV from a directory export, CRM, or association roster. Columns are
+      matched by name (company, phone, email, website, city...). Rows are de-duplicated against
+      your existing leads, then enriched and scored.</p>
+    <div class="field"><label>CSV file</label><input type="file" id="impFile" accept=".csv,text/csv"></div>
+    <div class="field"><label>Default niche (used when the file has no category column)</label>
+      <input id="impNiche" placeholder="e.g. dentist"></div>
+    <div class="field"><label><input type="checkbox" id="impEnrich" checked style="width:auto">
+      Enrich new leads (website check, email discovery, scoring)</label></div>
+    <button class="primary" id="impBtn">Import</button>
+    <div id="impResult" style="margin-top:14px"></div></div>`;
+  document.getElementById('impBtn').onclick = async () => {
+    const file = document.getElementById('impFile').files[0];
+    const out = document.getElementById('impResult');
+    if (!file) return toast('Choose a CSV file first', 'err');
+    const form = new FormData();
+    form.append('file', file);
+    form.append('niche', document.getElementById('impNiche').value);
+    form.append('enrich', document.getElementById('impEnrich').checked);
+    out.innerHTML = '<div class="loading">Importing...</div>';
+    try {
+      const res = await fetch('/api/discovery/import', { method: 'POST', body: form });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) { window.location.href = '/login'; return; }
+      if (!res.ok) throw new Error(data.detail || `Import failed (${res.status})`);
+      out.innerHTML = `<div class="banner ok">${data.created} new, ${data.merged} merged into
+        existing, ${data.failed} failed, ${(data.skipped || []).length} skipped.
+        <a href="#/leads" style="color:inherit">View leads</a></div>
+        <dl class="kv"><dt>Matched columns</dt><dd>${esc(Object.entries(data.mapped_columns)
+          .map(([h, f]) => `${h} → ${f}`).join(', '))}</dd>
+        <dt>Ignored columns</dt><dd>${esc((data.ignored_columns || []).join(', ')) || '—'}</dd></dl>
+        ${(data.skipped || []).length ? `<ul class="issues">${data.skipped.map((s) =>
+          `<li>Row ${s.row}: ${esc(s.reason)}</li>`).join('')}</ul>` : ''}`;
+      refreshBadges();
+    } catch (error) { out.innerHTML = `<div class="banner err">${esc(error.message)}</div>`; }
+  };
+}
+
+async function discoverGrid(body) {
+  body.innerHTML = `<div class="card" style="max-width:720px">
+    <h3>Grid sweep preview</h3>
+    <p class="muted">A single map query returns only the top ~20 places. A grid sweep splits the area
+      into overlapping cells and searches each one. Preview the cells here, then pick the
+      <b>grid sweep</b> provider on the <a href="#/search">Search</a> page.</p>
+    <div class="row">
+      <div><label>Latitude</label><input id="gLat" type="number" step="any" placeholder="28.6139"></div>
+      <div><label>Longitude</label><input id="gLng" type="number" step="any" placeholder="77.2090"></div>
+      <div><label>Area radius (m)</label><input id="gRad" type="number" value="8000"></div>
+      <div><label>Cell radius (m)</label><input id="gCell" type="number" value="1500"></div>
+      <div class="shrink"><button class="primary" id="gBtn">Preview</button></div>
+      <div class="shrink"><button id="gHere">Use my location</button></div>
+    </div><div id="gOut" style="margin-top:16px"></div></div>`;
+  document.getElementById('gHere').onclick = () => navigator.geolocation
+    ? navigator.geolocation.getCurrentPosition((pos) => {
+      document.getElementById('gLat').value = pos.coords.latitude.toFixed(5);
+      document.getElementById('gLng').value = pos.coords.longitude.toFixed(5);
+    }, () => toast('Location permission denied', 'err'))
+    : toast('Geolocation is not available', 'err');
+  document.getElementById('gBtn').onclick = async () => {
+    const out = document.getElementById('gOut');
+    try {
+      const data = await post('/api/discovery/grid-preview', {
+        lat: parseFloat(document.getElementById('gLat').value),
+        lng: parseFloat(document.getElementById('gLng').value),
+        radius_m: parseInt(document.getElementById('gRad').value, 10),
+        cell_radius_m: parseInt(document.getElementById('gCell').value, 10),
+      });
+      const lats = data.cells.map((c) => c.lat), lngs = data.cells.map((c) => c.lng);
+      const [minLa, maxLa, minLo, maxLo] = [Math.min(...lats), Math.max(...lats), Math.min(...lngs), Math.max(...lngs)];
+      const sx = (v) => 20 + ((v - minLo) / ((maxLo - minLo) || 1)) * 460;
+      const sy = (v) => 280 - ((v - minLa) / ((maxLa - minLa) || 1)) * 260;
+      out.innerHTML = `<div class="banner info"><b>${data.count}</b> cells (cap ${data.max_cells}).
+        Each cell is one provider query, so a sweep costs about ${data.count}× a single search.</div>
+        <svg viewBox="0 0 500 300" style="width:100%;max-width:500px;background:var(--bg-elev,#111);border-radius:10px">
+        ${data.cells.map((c, i) => `<circle cx="${sx(c.lng)}" cy="${sy(c.lat)}" r="${i ? 14 : 18}"
+          fill="rgba(110,140,255,${i ? .16 : .35})" stroke="rgba(110,140,255,.7)"/>`).join('')}</svg>`;
+    } catch (error) { out.innerHTML = `<div class="banner err">${esc(error.message)}</div>`; }
+  };
+}
+
+async function discoverQueries(body) {
+  body.innerHTML = `<div class="card"><h3>Prospecting query generator</h3>
+    <p class="muted">Ready-made search queries that surface businesses with weak web presence.
+      They open in your own browser - nothing is scraped.</p>
+    <div class="row"><div><label>Niche</label><input id="qNiche" placeholder="dentist"></div>
+      <div><label>City</label><input id="qCity" placeholder="Pune"></div>
+      <div class="shrink"><button class="primary" id="qBtn">Generate</button></div></div>
+    <div id="qOut" style="margin-top:16px"></div></div>`;
+  document.getElementById('qBtn').onclick = async () => {
+    const out = document.getElementById('qOut');
+    try {
+      const data = await api(`/api/discovery/dorks?niche=${encodeURIComponent(
+        document.getElementById('qNiche').value)}&city=${encodeURIComponent(document.getElementById('qCity').value)}`);
+      out.innerHTML = data.queries.map((q) => `<div class="card" style="margin-bottom:8px">
+        <div class="flex between"><b>${esc(q.label)}</b>
+          <a class="btn sm" href="${esc(q.url)}" target="_blank" rel="noopener noreferrer">Open</a></div>
+        <code style="font-size:12px;word-break:break-all">${esc(q.query)}</code></div>`).join('');
+    } catch (error) { out.innerHTML = `<div class="banner err">${esc(error.message)}</div>`; }
+  };
+}
+
+async function discoverSignals(body) {
+  const box = (id, title, desc, inputs, btn) => `<div class="card"><h3>${title}</h3>
+    <p class="muted" style="font-size:12px">${desc}</p>
+    <div class="row">${inputs}<div class="shrink"><button class="primary" id="${id}Btn">${btn}</button></div></div>
+    <div id="${id}Out" style="margin-top:12px"></div></div>`;
+  body.innerHTML = `<div class="grid cols-2">
+    ${box('tech', 'Tech-stack fingerprint', 'Detect legacy CMS, Flash, old jQuery, missing analytics for a lead\'s site.',
+      '<div><label>Lead ID</label><input id="techId" type="number" placeholder="123"></div>', 'Inspect')}
+    ${box('dom', 'Domain age & expiry', 'New domains and domains about to expire are both buying moments.',
+      '<div><label>Domain</label><input id="domName" placeholder="example.com"></div>', 'Look up')}
+    ${box('hire', 'Hiring signal (free)', 'Reads the company\'s own careers page and open job feeds for web/marketing roles.',
+      '<div><label>Company</label><input id="hireCo"></div><div><label>Website (recommended)</label><input id="hireWeb" placeholder="example.com"></div>', 'Check')}
+    ${box('ads', 'Paid-ads footprint (free)', 'Detects Google/Meta/LinkedIn/TikTok ad pixels on the site, and wasted-spend gaps.',
+      '<div><label>Website</label><input id="adsUrl" placeholder="example.com"></div><div><label>or Lead ID</label><input id="adsLead" type="number"></div>', 'Scan')}
+  </div>`;
+  const run = (id, fn, render) => {
+    document.getElementById(`${id}Btn`).onclick = async () => {
+      const out = document.getElementById(`${id}Out`);
+      out.innerHTML = '<div class="loading">Checking...</div>';
+      try { out.innerHTML = render(await fn()); }
+      catch (error) { out.innerHTML = `<div class="banner err">${esc(error.message)}</div>`; }
+    };
+  };
+  const list = (items, empty) => items.length ? `<ul class="issues">${items.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>`
+    : `<div class="faint">${empty}</div>`;
+  const val = (id) => document.getElementById(id).value.trim();
+  run('tech', () => api(`/api/discovery/leads/${val('techId')}/techstack`), (d) => `
+    <div class="muted">Modernisation need: <b>${d.modernisation_score}/100</b> ·
+      Stack: ${esc(d.stack.map((s) => s.tech).join(', ')) || 'unknown'}</div>${list(d.issues, 'No issues found.')}`);
+  run('dom', () => api(`/api/discovery/domain?name=${encodeURIComponent(val('domName'))}`), (d) => d.error
+    ? `<div class="banner warn">${esc(d.error)}</div>` : `<dl class="kv">
+      <dt>Registered</dt><dd>${date(d.registered)}</dd><dt>Age</dt><dd>${d.age_days ?? '—'} days</dd>
+      <dt>Expires</dt><dd>${date(d.expires)} (${d.days_to_expiry ?? '—'} days)</dd></dl>
+      ${d.flags.map((f) => `<span class="pill WARM">${esc(f.replace(/_/g, ' '))}</span>`).join(' ')}`);
+  run('hire', () => api(`/api/discovery/hiring?company=${encodeURIComponent(val('hireCo'))}&website=${encodeURIComponent(val('hireWeb'))}`),
+    (d) => (d.hiring_digital
+      ? `<div class="banner ok">Hiring for digital roles</div>${list(d.evidence.map((e) =>
+        `${e.source}: ${(e.roles || []).join(', ')}`), '')}`
+      : `<div class="faint">No digital roles found (checked ${esc(d.checked.join(', '))}). ${esc(d.note)}</div>`));
+  run('ads', () => api(val('adsLead') ? `/api/discovery/ads?lead_id=${encodeURIComponent(val('adsLead'))}`
+      : `/api/discovery/ads?url=${encodeURIComponent(val('adsUrl'))}`),
+    (d) => (d.advertising
+      ? `<div class="banner ok">Advertising on ${esc(d.platforms.map((p) => p.platform).join(', '))}
+          <span class="faint">(${esc(d.confidence)} confidence)</span></div>${list(d.wasted_spend_signals, '')}`
+      : '<div class="faint">No ad pixels found on this site.</div>'));
+}
+
+async function discoverReviews(body) {
+  body.innerHTML = `<div class="card" style="max-width:720px"><h3>Review pain miner</h3>
+    <p class="muted">Paste customer reviews (one per line). Finds direct evidence like "never answers
+      the phone" or "couldn't find their website" - quotable proof for your pitch.</p>
+    <textarea id="rvText" rows="8" placeholder="Great food but they never answer the phone&#10;No website, couldn't find the menu"></textarea>
+    <div style="margin-top:10px"><button class="primary" id="rvBtn">Analyse</button></div>
+    <div id="rvOut" style="margin-top:14px"></div></div>`;
+  document.getElementById('rvBtn').onclick = async () => {
+    const out = document.getElementById('rvOut');
+    const reviews = document.getElementById('rvText').value.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (!reviews.length) return toast('Paste at least one review', 'err');
+    try {
+      const d = await post('/api/discovery/reviews/analyse', { reviews: reviews.slice(0, 500) });
+      out.innerHTML = `<div class="banner ${d.pain_score ? 'ok' : 'info'}">Pain score <b>${d.pain_score}/100</b>
+        from ${d.reviews_scanned} reviews</div>
+        ${Object.entries(d.hits).map(([k, n]) => `<span class="pill WARM">${esc(k.replace(/_/g, ' '))} ×${n}</span>`).join(' ')}
+        <ul class="issues" style="margin-top:10px">${d.quotes.map((q) => `<li>“…${esc(q.quote)}…”</li>`).join('')}</ul>`;
+    } catch (error) { out.innerHTML = `<div class="banner err">${esc(error.message)}</div>`; }
+  };
+}
+
+async function discoverLookalikes(body) {
+  const d = await api('/api/discovery/lookalikes?limit=25');
+  if (!d.lookalikes.length) {
+    body.innerHTML = `<div class="banner info">${esc(d.note || 'No lookalikes found yet.')}</div>`;
+    return;
+  }
+  body.innerHTML = `<div class="banner info">Modelled on your ${d.based_on} won customer(s): same niche, city,
+    size band and web-presence profile.</div>` + table(
+    [{ label: 'Business' }, { label: 'Similarity', num: true }],
+    d.lookalikes.map((l) => `<tr onclick="openLead(${l.id})" style="cursor:pointer">
+      <td>${esc(l.business_name)}</td><td class="num"><b>${l.similarity}%</b></td></tr>`));
+}
+
+// Evidence grade, shown inside the lead drawer's Analysis tab.
+async function loadEvidence(leadId) {
+  const slot = document.getElementById('evidenceSlot');
+  if (!slot) return;
+  try {
+    const ev = await api(`/api/leads/${leadId}/evidence`);
+    if (!document.getElementById('evidenceSlot')) return;
+    slot.innerHTML = `
+      <h3 style="margin-top:20px">Evidence confidence
+        <span class="pill ${ev.grade === 'A' || ev.grade === 'B' ? 'WARM' : 'COLD'}" style="margin-left:6px">
+          Grade ${esc(ev.grade)} · ${ev.evidence_score}/100</span></h3>
+      <dl class="kv">${Object.entries(ev.dimensions).map(([k, v]) =>
+        `<dt>${esc(k)}</dt><dd>${v}/5 <span class="faint" style="font-size:11px">${esc((ev.notes[k] || []).join('; '))}</span></dd>`).join('')}</dl>
+      ${ev.gaps.length ? `<div class="banner warn" style="margin-top:10px"><b>Close these gaps before outreach</b>
+        <ul class="issues">${ev.gaps.map((g) => `<li>${esc(g)}</li>`).join('')}</ul></div>` : ''}`;
+  } catch (_) { slot.innerHTML = ''; }
+}
+
+
+// ------------------------------------------------------- replies & health ---
+const INTENT_LABEL = { STOP: 'Asked to stop', AUTO_REPLY: 'Auto-reply', REFERRAL: 'Referred us on',
+  NOT_INTERESTED: 'Not interested', NOT_NOW: 'Not now', WANTS_MEETING: 'Wants a call',
+  ASKS_PRICE: 'Asking price', INTERESTED: 'Interested', UNCLEAR: 'Unclear - read it yourself' };
+
+function renderVerdict(v, applied) {
+  const bad = ['STOP', 'NOT_INTERESTED'].includes(v.intent);
+  const ref = v.referral && (v.referral.name || v.referral.emails.length || v.referral.phones.length)
+    ? `<div class="muted" style="margin-top:6px">Referral: ${esc([v.referral.name, ...v.referral.emails,
+        ...v.referral.phones].filter(Boolean).join(' · '))}</div>` : '';
+  const ch = applied ? `<ul class="issues" style="margin-top:6px">
+      ${v.changes.status ? `<li>Status → <b>${esc(v.changes.status)}</b></li>` : ''}
+      ${v.changes.cancelled_messages ? `<li>${v.changes.cancelled_messages} pending message(s) cancelled</li>` : ''}
+      ${v.changes.suppressed.length ? `<li>Suppressed: ${esc(v.changes.suppressed.join(', '))}</li>` : ''}
+      ${v.changes.follow_up_date ? `<li>Follow-up set for ${esc(v.changes.follow_up_date)}</li>` : ''}</ul>` : '';
+  return `<div class="banner ${bad ? 'warn' : 'info'}"><b>${esc(INTENT_LABEL[v.intent] || v.intent)}</b>
+    <span class="faint"> · confidence ${Math.round(v.confidence * 100)}%</span><br>
+    Next step: ${esc(v.action.next_step)}${(v.matched || []).length
+      ? `<div class="faint" style="font-size:11.5px">matched: “${esc(v.matched.join('”, “'))}”</div>` : ''}
+    ${ref}${ch}</div>`;
+}
+
+async function previewReply() {
+  const text = document.getElementById('replyText').value.trim();
+  if (!text) return toast('Paste the reply first', 'err');
+  try { document.getElementById('replyOut').innerHTML = renderVerdict(await post('/api/replies/classify', { text }), false); }
+  catch (error) { toast(error.message, 'err'); }
+}
+
+async function applyReply(leadId) {
+  const text = document.getElementById('replyText').value.trim();
+  if (!text) return toast('Paste the reply first', 'err');
+  try {
+    const verdict = await post(`/api/leads/${leadId}/reply`, { text });
+    document.getElementById('replyOut').innerHTML = renderVerdict(verdict, true);
+    toast('Reply logged');
+    refreshBadges();
+    drawerLead = await api(`/api/leads/${leadId}`);
+  } catch (error) { toast(error.message, 'err'); }
+}
+
+async function markLost(leadId) {
+  const reasons = ['NOT_INTERESTED', 'NO_BUDGET', 'HAS_VENDOR', 'BAD_TIMING', 'NO_RESPONSE',
+    'WRONG_FIT', 'CLOSED_BUSINESS', 'OTHER'];
+  const reason = (window.prompt(`Why was this lead lost?\n${reasons.join(', ')}`, 'NOT_INTERESTED') || '').trim().toUpperCase();
+  if (!reason) return;
+  try {
+    await post(`/api/leads/${leadId}/loss`, { reason, note: '' });
+    toast('Marked lost');
+    drawerLead = await api(`/api/leads/${leadId}`);
+    renderDrawer('details');
+    refreshBadges();
+  } catch (error) { toast(error.message, 'err'); }
+}
+
+async function loadPipelineHealth() {
+  const slot = document.getElementById('healthSlot');
+  if (!slot) return;
+  try {
+    const h = await api('/api/pipeline/health');
+    if (!document.getElementById('healthSlot')) return;
+    const s = h.sending;
+    const list = (rows, key) => rows.length ? `<ul class="issues">${rows.slice(0, 6).map((r) =>
+      `<li><a href="#" onclick="openLead(${r.id});return false">${esc(r.business_name)}</a>
+        <span class="faint"> ${ago(r[key])}</span></li>`).join('')}</ul>` : '<div class="faint">None 🎉</div>';
+    slot.innerHTML = `<div class="grid cols-3" style="margin-bottom:16px">
+      <div class="card"><h3>Waiting on you <span class="pill WARM">${h.awaiting_reply_from_us.length}</span></h3>
+        <div class="muted" style="font-size:12px">They replied; you haven't answered.</div>
+        ${list(h.awaiting_reply_from_us, 'replied_at')}</div>
+      <div class="card"><h3>Gone quiet <span class="pill COLD">${h.stale_contacted.length}</span></h3>
+        <div class="muted" style="font-size:12px">Contacted ${h.stale_days}+ days ago, no reply.</div>
+        ${list(h.stale_contacted, 'last_contacted_date')}</div>
+      <div class="card"><h3>Sending</h3>
+        <div class="banner ${s.allowed ? 'ok' : 'warn'}" style="margin:6px 0">${s.allowed
+          ? `Open - up to ${s.budget} now` : `Paused: ${esc(s.reason)}`}</div>
+        ${s.dry_run ? '<div class="faint" style="font-size:12px">Dry run - nothing is really sent.</div>' : ''}
+        ${h.loss_reasons.length ? `<div class="muted" style="font-size:12px;margin-top:6px">Lost because: ${
+          esc(h.loss_reasons.map((r) => `${r.reason.replace(/_/g, ' ').toLowerCase()} ×${r.count}`).join(', '))}</div>` : ''}
+      </div></div>`;
+  } catch (_) { slot.innerHTML = ''; }
+}
+
+
+// ------------------------------------------------- ideal client / intent / api ---
+const listField = (id, label, hint) => `<div class="field"><label>${label}
+  <span class="faint" style="font-weight:400"> ${hint}</span></label><input id="${id}"></div>`;
+
+async function discoverIcp(body) {
+  const { icp } = await api('/api/icp');
+  body.innerHTML = `<div class="card" style="max-width:760px">
+    <h3>Your ideal client</h3>
+    <p class="muted">Tell the app what you sell and who buys it. Every lead is then scored for fit, and
+      your "Not a fit" marks teach it. Paste your website and it proposes a profile you can edit.</p>
+    <div class="row"><div><label>Your website</label><input id="icpUrl" placeholder="yourstudio.com"
+      value="${esc(icp ? icp.url : '')}"></div>
+      <div class="shrink"><button id="icpInfer">Read my website</button></div></div>
+    <div id="icpNote" style="margin:10px 0"></div>
+    ${listField('icpOffer', 'What you sell', '(comma separated, e.g. web design, seo)')}
+    ${listField('icpNiche', 'Who buys it', '(business types, e.g. dentist, restaurant)')}
+    ${listField('icpCities', 'Cities you serve', '(optional)')}
+    ${listField('icpExNiche', 'Never target', '(business types to exclude, e.g. bar, casino)')}
+    ${listField('icpExKw', 'Skip names containing', '(optional, e.g. franchise, outlet)')}
+    ${listField('icpRoles', 'Decision-maker titles', '(optional, e.g. owner, founder, director)')}
+    <div class="field"><label>Minimum Google reviews <span class="faint" style="font-weight:400">(0 = don't care)</span></label>
+      <input id="icpRev" type="number" min="0" value="${icp ? icp.min_reviews || 0 : 0}"></div>
+    <button class="primary" id="icpSave">Save profile</button></div>`;
+  const fill = (d) => {
+    document.getElementById('icpOffer').value = (d.offerings || []).join(', ');
+    document.getElementById('icpNiche').value = (d.target_niches || []).join(', ');
+    document.getElementById('icpCities').value = (d.target_cities || []).join(', ');
+    document.getElementById('icpExNiche').value = (d.exclude_niches || []).join(', ');
+    document.getElementById('icpExKw').value = (d.exclude_keywords || []).join(', ');
+    document.getElementById('icpRoles').value = (d.target_roles || []).join(', ');
+  };
+  if (icp) fill(icp);
+  const split = (id) => document.getElementById(id).value.split(',').map((x) => x.trim()).filter(Boolean);
+  document.getElementById('icpInfer').onclick = async () => {
+    const note = document.getElementById('icpNote');
+    note.innerHTML = '<div class="loading">Reading your site...</div>';
+    try {
+      const d = await post('/api/icp/infer', { url: document.getElementById('icpUrl').value.trim() });
+      fill(d);
+      note.innerHTML = `<div class="banner info"><b>${esc(d.summary || 'Profile proposed')}</b>
+        <span class="faint"> · confidence ${Math.round(d.confidence * 100)}%</span><br>${esc(d.note)}
+        ${d.evidence.length ? `<ul class="issues">${d.evidence.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>` : ''}</div>`;
+    } catch (error) { note.innerHTML = `<div class="banner err">${esc(error.message)}</div>`; }
+  };
+  document.getElementById('icpSave').onclick = async () => {
+    try {
+      await put('/api/icp', { url: document.getElementById('icpUrl').value.trim(), offerings: split('icpOffer'),
+        target_niches: split('icpNiche'), target_cities: split('icpCities'),
+        exclude_niches: split('icpExNiche'), exclude_keywords: split('icpExKw'), target_roles: split('icpRoles'),
+        min_reviews: parseInt(document.getElementById('icpRev').value, 10) || 0 });
+      toast('Ideal-client profile saved', 'ok');
+    } catch (error) { toast(error.message, 'err'); }
+  };
+}
+
+async function discoverIntent(body) {
+  const { icp } = await api('/api/icp');
+  body.innerHTML = `<div class="card"><h3>Intent feed</h3>
+    <p class="muted">Public posts where someone is asking for what you sell (Hacker News and Mastodon, via their open
+      APIs - no scraping, no login). Posts from other providers are filtered out. Reply helpfully;
+      don't spam.</p>
+    <div class="row"><div><label>What you sell (comma separated)</label>
+      <input id="inOffer" value="${esc(icp ? (icp.offerings || []).join(', ') : '')}" placeholder="web design, seo"></div>
+      <div class="shrink"><label>Days</label><input id="inDays" type="number" value="30" style="width:80px"></div>
+      <div class="shrink"><button class="primary" id="inGo">Find requests</button></div></div>
+    <div id="inOut" style="margin-top:14px"></div></div>`;
+  document.getElementById('inGo').onclick = async () => {
+    const out = document.getElementById('inOut');
+    out.innerHTML = '<div class="loading">Searching public posts...</div>';
+    try {
+      const d = await api(`/api/discovery/intent-feed?offer=${encodeURIComponent(document.getElementById('inOffer').value)}&days=${parseInt(document.getElementById('inDays').value, 10) || 30}`);
+      window.__intentItems = d.items;
+      window.__intentOffer = (d.offers || [])[0] || '';
+      out.innerHTML = (d.items.length ? d.items.map((it, i) => `<div class="card" style="margin-bottom:10px">
+        <div class="flex between"><b>${esc(it.author || 'unknown')}</b> <span class="faint">· ${esc(it.source)}</span>
+          <span><span class="pill WARM">intent ${it.score}</span> <span class="faint">${date(it.created_at)}</span></span></div>
+        <p style="margin:8px 0">${esc(it.snippet)}</p>
+        <div class="flex"><a class="btn sm" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">Open post</a>
+          <button class="sm primary" onclick="intentToLead(${i})">Save as lead</button>
+          <span class="faint" style="font-size:11.5px">matched: ${esc(it.signals.join(', '))}</span></div></div>`).join('')
+        : `<div class="banner info">Scanned ${d.scanned} public posts - none were real requests for ${esc(d.offers.join(' / '))} in this window.
+          Genuine requests are rare on open feeds; try a wider window or another offer.</div>`)
+        + (d.errors.length ? `<div class="faint" style="font-size:12px">${esc(d.errors.join(' | '))}</div>` : '');
+    } catch (error) { out.innerHTML = `<div class="banner err">${esc(error.message)}</div>`; }
+  };
+}
+
+async function intentToLead(index) {
+  const offer = window.__intentOffer || '';
+  const it = (window.__intentItems || [])[index];
+  if (!it) return;
+  try {
+    const r = await post('/api/discovery/intent-feed/lead',
+      { author: it.author || 'unknown', url: it.url, snippet: it.snippet, offer, source: it.source });
+    toast(r.created ? 'Saved as a lead' : 'Already in your leads', 'ok');
+    refreshBadges();
+  } catch (error) { toast(error.message, 'err'); }
+}
+
+async function discoverApi(body) {
+  const d = await api('/api/tokens');
+  body.innerHTML = `<div class="card" style="max-width:760px"><h3>Read-only API access</h3>
+    <p class="muted">Create a token so Claude, a script or a dashboard can <b>read</b> your leads. A token can
+      only make GET requests to lead data - it can't edit, delete, send or manage users. It is shown once.</p>
+    <div class="row"><div><label>Token name</label><input id="tkName" placeholder="Claude"></div>
+      <div class="shrink"><button class="primary" id="tkMake">Create token</button></div></div>
+    <div id="tkNew" style="margin:12px 0"></div>
+    ${table([{ label: 'Name' }, { label: 'Token' }, { label: 'Last used' }, { label: '' }],
+      d.tokens.filter((t) => !t.revoked).map((t) => `<tr><td>${esc(t.name)}</td>
+        <td class="mono">${esc(t.prefix)}…</td><td class="faint">${t.last_used_at ? ago(t.last_used_at) : 'never'}</td>
+        <td><button class="sm danger" onclick="revokeToken(${t.id})">Revoke</button></td></tr>`), 'No active tokens.')}
+    <p class="faint" style="font-size:12px;margin-top:12px">Example: <code>${esc(d.usage)}</code><br>
+      Allowed paths: ${esc(d.allowed.join(', '))}</p></div>`;
+  document.getElementById('tkMake').onclick = async () => {
+    try {
+      const t = await post('/api/tokens', { name: document.getElementById('tkName').value || 'API token' });
+      document.getElementById('tkNew').innerHTML = `<div class="banner ok"><b>${esc(t.warning)}</b>
+        <div class="mono" style="word-break:break-all;margin-top:6px" id="tkVal">${esc(t.token)}</div>
+        <button class="sm" onclick="navigator.clipboard.writeText(document.getElementById('tkVal').textContent);toast('Copied','ok')">Copy</button></div>`;
+    } catch (error) { toast(error.message, 'err'); }
+  };
+}
+
+async function revokeToken(id) {
+  try { await del(`/api/tokens/${id}`); toast('Token revoked'); routes['/discover'](); }
+  catch (error) { toast(error.message, 'err'); }
+}
+
+// Fit + feedback, shown in the lead drawer's Analysis tab.
+async function loadFit(leadId) {
+  const slot = document.getElementById('fitSlot');
+  if (!slot) return;
+  try {
+    const f = await api(`/api/leads/${leadId}/fit`);
+    if (!document.getElementById('fitSlot')) return;
+    const shown = f.adjusted_fit ?? f.fit;
+    slot.innerHTML = `<h3 style="margin-top:20px">Fit for your ideal client
+      ${shown === null ? '<span class="pill COLD" style="margin-left:6px">not set up</span>'
+        : `<span class="pill ${shown >= 70 ? 'HOT' : shown >= 45 ? 'WARM' : 'COLD'}" style="margin-left:6px">${shown}/100</span>`}</h3>
+      ${f.configured ? `<ul class="issues reasons">${f.reasons.map((r) => `<li>${esc(r)}</li>`).join('')}
+        ${f.learned.map((r) => `<li class="faint">learned: ${esc(r)}</li>`).join('')}</ul>`
+        : '<div class="banner info">Set up your <a href="#/discover?tab=icp" style="color:inherit">ideal-client profile</a> to see fit.</div>'}
+      <div class="flex" style="margin-top:10px">
+        <button class="sm" onclick="sendFit(${leadId}, 'GOOD_FIT')">👍 Good fit</button>
+        <select id="nfReason" style="max-width:190px"><option value="wrong_industry">Wrong industry</option>
+          <option value="too_small">Too small</option><option value="too_big">Too big</option>
+          <option value="already_has_solution">Already has a solution</option><option value="no_budget">No budget</option>
+          <option value="wrong_location">Wrong location</option><option value="bad_data">Bad data</option>
+          <option value="other">Other</option></select>
+        <button class="sm danger" onclick="sendFit(${leadId}, 'NOT_A_FIT')">👎 Not a fit</button></div>
+      <div class="faint" style="font-size:11.5px;margin-top:6px">Your marks teach the app. "Not a fit" also closes the lead.</div>`;
+  } catch (_) { slot.innerHTML = ''; }
+}
+
+async function sendFit(leadId, verdict) {
+  const reason = document.getElementById('nfReason')?.value || 'other';
+  try {
+    const r = await post(`/api/leads/${leadId}/feedback`, { verdict, reason, mark_lost: true });
+    toast(verdict === 'GOOD_FIT' ? 'Thanks - noted as a good fit' : 'Noted - the app will learn from this', 'ok');
+    drawerLead = await api(`/api/leads/${leadId}`);
+    renderDrawer('analysis');
+    refreshBadges();
+  } catch (error) { toast(error.message, 'err'); }
+}
+
+
+async function loadVelocity(leadId) {
+  const slot = document.getElementById('velocitySlot');
+  if (!slot) return;
+  try {
+    const v = await api(`/api/leads/${leadId}/review-velocity`);
+    if (!document.getElementById('velocitySlot')) return;
+    slot.innerHTML = `<h3 style="margin-top:20px">Review growth</h3>` + (v.per_month === null
+      ? `<div class="faint">${v.snapshots.length} snapshot(s) so far - growth shows once there are two, a week or more apart.</div>`
+      : `<div>${v.rapid ? '<span class="pill HOT">rapid growth</span> ' : ''}<b>${v.per_month}</b> new reviews / month
+          <span class="faint">(from ${v.snapshots.length} snapshots)</span></div>`);
+  } catch (_) { slot.innerHTML = ''; }
+}
+
+async function aiDraft(leadId) {
+  const out = document.getElementById('aiOut');
+  const offer = document.getElementById('aiOffer').value.trim();
+  if (offer.length < 3) return toast('Say what you offer first', 'err');
+  out.innerHTML = '<div class="loading">Writing... (a local model can take a minute)</div>';
+  try {
+    const d = await post(`/api/leads/${leadId}/ai-draft`, { offer, channel: 'email' });
+    out.innerHTML = `<div class="banner ${d.problems.length ? 'warn' : 'info'}">${esc(d.note)}
+        <span class="faint"> model: ${esc(d.model)}</span>${d.problems.length ? `<br>⚠ ${esc(d.problems.join(', '))}` : ''}</div>
+      <label>Subject</label><input id="aiSubj" value="${esc(d.subject || '')}">
+      <label style="margin-top:8px">Body</label><textarea id="aiBody" rows="8">${esc(d.body)}</textarea>
+      <div class="flex" style="margin-top:8px"><button onclick="navigator.clipboard.writeText(document.getElementById('aiBody').value);toast('Copied','ok')">Copy</button></div>`;
+  } catch (error) { out.innerHTML = `<div class="banner warn">${esc(error.message)}</div>`; }
 }
 
 // ---------------------------------------------------------------- boot ---

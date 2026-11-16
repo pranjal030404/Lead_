@@ -91,6 +91,8 @@ def create_workspace(name: str, organization_id: int | None = None,
     )
     with workspace_context(workspace_id):
         seed_templates()
+    from .pipeline import seed_stages
+    seed_stages(workspace_id)
     return workspace_id
 
 

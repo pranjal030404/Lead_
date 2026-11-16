@@ -623,3 +623,81 @@ Honest list of what the blueprint describes that isn't here:
 - **Telegram/WhatsApp alert channels.** Part 7.6 offers these as alternatives to
   email; only email is wired up.
 "# Lead_" 
+
+## Lead discovery toolkit
+
+Beyond the default OpenStreetMap / Google search, the app can find leads these ways
+(`GET /api/discovery/sources` shows which are ready on your install):
+
+| Way | How |
+|---|---|
+| Grid sweep | Provider `osm+grid` / `google+grid` tiles the area into overlapping cells to beat the ~20-result ceiling |
+| Second map source | `foursquare` (needs `FOURSQUARE_API_KEY`) |
+| New-company registries | `companies_house` (UK, free key), `opencorporates` (worldwide) - businesses that have just incorporated |
+| CSV / sheet import | `POST /api/discovery/import` - any directory export, CRM list or association roster; headers matched by synonym, then deduped, enriched and scored |
+| Search-query generator | `GET /api/discovery/dorks?niche=&city=` - ready-made queries for manual prospecting |
+| Tech-stack fingerprint | `GET /api/discovery/leads/{id}/techstack` - legacy CMS, Flash, old jQuery, no analytics, no HTTPS |
+| Domain age / expiry | `GET /api/discovery/domain?name=` (RDAP, free) |
+| Hiring signal | `GET /api/discovery/hiring?company=` (Adzuna key) |
+| Running ads | `GET /api/discovery/ads?page=` (Meta Ad Library token) |
+| Review-text mining | `POST /api/discovery/reviews/analyse` - quotes like "never answers the phone" |
+| Lookalikes | `GET /api/discovery/lookalikes` - leads that resemble your WON customers |
+| Evidence grade | `GET /api/leads/{id}/evidence` - A-D confidence plus the gaps to close |
+
+Not included on purpose: scrapers for Justdial, LinkedIn or Instagram (their terms forbid
+it). Export from those sources where you are entitled to, and use the CSV importer.
+
+### Free, key-less discovery engines
+
+Every core discovery method works with **no API key**:
+
+| Engine | How it works |
+|---|---|
+| `nominatim` provider | OpenStreetMap text search - a second map source; IDs match the Overpass provider so duplicates merge |
+| `osm_new` provider | New-opening detector: businesses first mapped in the last 180 days and never edited (or with an `opening_date`/`start_date` tag). A proxy for "newly opened", labelled with date and confidence |
+| Hiring signal | Reads the company's own careers page, plus the open Arbeitnow and Remotive job feeds |
+| Paid-ads footprint | Detects Google / Meta / LinkedIn / TikTok / Bing / X / Pinterest ad pixels on the site and flags wasted spend (no analytics, not mobile-friendly, no phone/form) |
+
+Keyed sources (Foursquare, Companies House, OpenCorporates, Adzuna, Meta Ad Library) remain as optional upgrades.
+
+### Signing in
+
+Everyone - users and admins - can sign in with **either their username or their email**
+(case-insensitive). Emails are unique per account; an email shared by two legacy accounts
+is treated as ambiguous and those users sign in by username.
+
+## Free & open source
+
+Everything runs on free, open-source software and open data - no keys, no plans, no quotas shown.
+
+| Capability | Open building block |
+|---|---|
+| Map search, grid sweep, new openings | OpenStreetMap (Overpass + Nominatim) |
+| Phones / emails / socials at scale | Overture Maps open places dataset, read with DuckDB |
+| Intent feed | Hacker News (Algolia) + Mastodon public timelines |
+| Hiring & ad signals | The company's own careers page / pixels, Arbeitnow & Remotive open feeds |
+| Domain age | RDAP |
+| AI message drafts (optional) | Ollama - local open-source models; nothing leaves your computer |
+| Database / API / UI | MySQL (or MariaDB), FastAPI, plain JavaScript |
+
+Optional keyed sources (Google Places, Foursquare, registries, Adzuna, Meta) stay hidden until you add a key.
+
+**Safety rails that stay on** (they protect you, not limit you): login and API rate limiting; the
+quiet-hours / pacing rules for sending email (blasting from a fresh domain gets it blacklisted);
+the Google spend guard when a Google key is configured; and the approval queue - nothing is ever
+sent without a human approving it. External services also enforce their own fair-use limits
+(e.g. OpenStreetMap asks for <= 1 request/second), which the app respects.
+
+### Local AI drafts
+
+```bash
+ollama serve &          # once
+ollama pull llama3.2    # any model works
+```
+Then open a lead -> Outreach -> "Draft with local AI". Drafts never include the lead's phone or
+email, never invent facts, always carry a STOP line, and are never auto-sent.
+
+### Review-growth signal
+
+Each time a lead is enriched its review count is snapshotted (at most weekly). Two snapshots
+a week or more apart give reviews/month in the lead's Analysis tab.

@@ -1,0 +1,37 @@
+{
+ "proposals": [
+  {
+   "id": 2,
+   "lead_id": 23,
+   "number": "P-2026-0001",
+   "title": "Website rebuild",
+   "status": "DRAFT",
+   "currency": "INR",
+   "discount_pct": 0.0,
+   "tax_pct": 18.0,
+   "valid_until": null,
+   "notes": "",
+   "share_token": "lfq78AhsDDU3w_e1PFiajxnaprafkCTo",
+   "created_at": "2026-11-14T19:13:01+00:00",
+   "updated_at": "2026-11-14T19:13:01+00:00",
+   "sent_at": null,
+   "decided_at": null,
+   "effective_status": "DRAFT",
+   "items": [
+    {
+     "description": "Design",
+     "qty": 1.0,
+     "unit_price": 40000.0,
+     "line_total": 40000.0
+    }
+   ],
+   "subtotal": 40000.0,
+   "discount": 0.0,
+   "taxable": 40000.0,
+   "tax": 7200.0,
+   "total": 47200.0,
+   "business_name": "Blue Ridge Dentist Hub"
+  }
+ ],
+ "count": 1
+}

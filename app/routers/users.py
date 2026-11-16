@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import json
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from pymysql.err import IntegrityError
 
 from ..db import current_ws, execute, query, query_one, utcnow
-from ..security import hash_password, require_role
+from .. import permissions
+from ..security import hash_password, require_role, revoke_sessions
 from ..tenancy import add_member, can_manage_user, remove_member
 
 router = APIRouter(prefix="/api", tags=["users"])
 
-ROLES = ("user", "admin", "superadmin")
+ROLES = ("user", "viewer", "admin", "superadmin")      # viewer = read-only, sees the whole workspace
 
 
 class UserPayload(BaseModel):
@@ -24,7 +28,10 @@ class UserPayload(BaseModel):
 
 
 def _safe(user: dict) -> dict:
-    return {k: v for k, v in user.items() if k != "password_hash"}
+    out = {k: v for k, v in user.items() if k not in ("password_hash", "mfa_secret")}
+    if "denied_features" in out:
+        out["denied_features"] = permissions.parse(out["denied_features"])
+    return out
 
 
 @router.get("/users")
@@ -42,12 +49,29 @@ def list_users(actor: dict = Depends(require_role("superadmin", "admin")),
         params += [f"%{q}%", f"%{q}%"]
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = query(
-        "SELECT id, username, full_name, email, role, is_active, created_at, updated_at "
+        "SELECT id, username, full_name, email, role, is_active, denied_features, created_at, updated_at "
         f"FROM users {where} ORDER BY id DESC LIMIT ? OFFSET ?",
         (*params, per_page, page * per_page),
     )
+    for row in rows:
+        row["denied_features"] = permissions.parse(row.get("denied_features"))
     return {"rows": rows, "page": page, "per_page": per_page,
             "total": query_one(f"SELECT COUNT(*) AS n FROM users {where}", tuple(params))["n"]}
+
+
+def _check_email(email: str, exclude_id: int | None = None) -> str:
+    """Email is a login identifier, so it must be well-formed and unique (case-insensitive).
+    Blank is allowed - the account then signs in by username only."""
+    email = (email or "").strip()
+    if not email:
+        return ""
+    if len(email) > 255 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]{2,}", email):
+        raise HTTPException(400, "That email address doesn't look valid")
+    clash = query_one("SELECT 1 AS x FROM users WHERE LOWER(email) = LOWER(?) AND id <> ?",
+                      (email, exclude_id or 0))
+    if clash:
+        raise HTTPException(409, "That email is already used by another account")
+    return email
 
 
 @router.post("/users")
@@ -62,6 +86,7 @@ def create_user(payload: UserPayload,
     if role != "user" and actor["role"] != "superadmin":
         raise HTTPException(403, "Only the superadmin can grant privileged roles")
 
+    payload.email = _check_email(payload.email)
     now = utcnow()
     workspace_id = current_ws()  # fails loudly (403) if the actor has no workspace
     try:
@@ -96,6 +121,7 @@ def update_user(user_id: int, payload: UserPayload,
                        (payload.username.strip(), user_id))
     if result:
         raise HTTPException(409, "Username already taken")
+    payload.email = _check_email(payload.email, user_id)
 
     if payload.password:
         execute(
@@ -112,6 +138,8 @@ def update_user(user_id: int, payload: UserPayload,
             (payload.username.strip(), payload.full_name.strip(), payload.email.strip(),
              role, 1 if payload.is_active else 0, utcnow(), user_id),
         )
+    if payload.password or not payload.is_active:
+        revoke_sessions(user_id)       # a new password / a deactivation ends old sessions
     saved = query_one("SELECT * FROM users WHERE id = ?", (user_id,))
     return _safe(saved)
 
@@ -141,3 +169,31 @@ def delete_user(user_id: int, actor: dict = Depends(require_role("superadmin", "
         raise HTTPException(400, "Every system needs at least one active superadmin")
     execute("DELETE FROM users WHERE id = ?", (user_id,))
     return {"deleted": user_id}
+
+# ------------------------------------------------------- feature permissions --
+
+class PermissionsPayload(BaseModel):
+    denied: list[str]
+
+
+@router.get("/permissions/features")
+def permission_features(_: dict = Depends(require_role("superadmin", "admin"))):
+    return {"features": permissions.catalogue()}
+
+
+@router.patch("/users/{user_id}/permissions")
+def set_permissions(user_id: int, payload: PermissionsPayload,
+                    actor: dict = Depends(require_role("superadmin", "admin"))):
+    """Replace the set of features switched OFF for this user (empty list = full access)."""
+    row = query_one("SELECT id, role FROM users WHERE id = ?", (user_id,))
+    if not row or not can_manage_user(actor, user_id):
+        raise HTTPException(404, "User not found")
+    if row["role"] in ("admin", "superadmin"):
+        raise HTTPException(400, "Admins always have full access - change their role first")
+    unknown = [f for f in payload.denied if f not in permissions.FEATURES]
+    if unknown:
+        raise HTTPException(400, f"Unknown feature(s): {', '.join(unknown)}")
+    denied = permissions.parse(payload.denied)
+    execute("UPDATE users SET denied_features = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(denied) if denied else None, utcnow(), user_id))
+    return {"id": user_id, "denied_features": denied}

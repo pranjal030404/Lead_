@@ -20,7 +20,8 @@ data class MeResponse(
 @Serializable
 data class LoginRequest(
     val username: String,
-    val password: String
+    val password: String,
+    val code: String? = null      // authenticator code, only once the account has two-factor on
 )
 
 @Serializable

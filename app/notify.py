@@ -142,6 +142,11 @@ def alert_new_hot_leads(lead_ids: list[int]) -> dict:
     if not fresh:
         return {"alerted": 0}
 
+    from . import webhooks
+    for lead in fresh:
+        webhooks.emit("lead.hot", {"lead_id": lead["id"], "business_name": lead["business_name"],
+                                   "score": lead["lead_score"]})
+
     if len(fresh) == 1:
         subject = f"New HOT lead - {fresh[0]['business_name']}"
     else:

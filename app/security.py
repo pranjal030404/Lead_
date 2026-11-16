@@ -18,7 +18,7 @@ from base64 import urlsafe_b64decode, urlsafe_b64encode
 from fastapi import HTTPException, Request
 
 from .config import settings
-from .db import query_one
+from .db import query, query_one
 
 SESSION_COOKIE = "leadgen_session"
 
@@ -30,6 +30,9 @@ def hash_password(password: str, salt: str | None = None) -> str:
     salt = salt or secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
     return f"{salt}${digest.hex()}"
+
+
+_DUMMY_HASH = hash_password(secrets.token_hex(8))   # for constant-time misses
 
 
 def verify_password(password: str, stored: str) -> bool:
@@ -54,32 +57,62 @@ def normalize_username(username: str | None) -> str:
 def load_user(username: str) -> dict | None:
     """Full safe user row (password hash stripped) for this login."""
     user = query_one(
-        "SELECT id, username, full_name, email, role, is_active FROM users WHERE username = ?",
+        "SELECT id, username, full_name, email, role, is_active, denied_features FROM users WHERE username = ?",
         (normalize_username(username),),
     )
-    return user if user else None
+    if not user:
+        return None
+    from .permissions import parse
+    user["denied_features"] = parse(user.get("denied_features"))
+    return user
+
+
+def resolve_login(identifier: str | None) -> str | None:
+    """Map what the person typed - a username OR an email address - to a username.
+
+    Username wins when it matches exactly (a username may itself contain "@"). Otherwise
+    an identifier with an "@" is matched, case-insensitively, against user emails. An
+    email shared by more than one account is ambiguous, so it resolves to nothing rather
+    than guessing which person is signing in. Returns None when nothing matches.
+    """
+    ident = normalize_username(identifier)
+    if not ident:
+        return None
+    row = query_one("SELECT username FROM users WHERE username = ?", (ident,))
+    if row:
+        return row["username"]
+    if "@" not in ident:
+        return None
+    rows = query("SELECT username FROM users WHERE email != '' AND LOWER(email) = LOWER(?) LIMIT 2",
+                 (ident,))
+    return rows[0]["username"] if len(rows) == 1 else None
 
 
 def authenticate_user(username: str, password: str) -> dict | None:
-    """Check a login against the users table. Returns the safe row, or None."""
-    normalized = normalize_username(username)
+    """Check a login (username or email) against the users table. Returns the safe row, or None."""
+    resolved = resolve_login(username)
     user = query_one(
-        "SELECT * FROM users WHERE username = ? AND is_active = 1", (normalized,)
-    )
-    if not user or not verify_password(password or "", user["password_hash"]):
+        "SELECT * FROM users WHERE username = ? AND is_active = 1", (resolved or "",)
+    ) if resolved else None
+    if not user:
+        # Burn comparable time so a missing account isn't distinguishable by latency.
+        verify_password(password or "", _DUMMY_HASH)
         return None
-    return load_user(normalized)
+    if not verify_password(password or "", user["password_hash"]):
+        return None
+    return load_user(resolved)
 
 
 def account_status(username: str) -> str | None:
-    """Why a username can't sign in, for a clearer message than a wrong password.
+    """Why a login can't sign in, for a clearer message than a wrong password.
 
     Returns "active", "inactive" or None (no such account). The standard login
     uses this to tell a deactivated account apart from a bad password - which is
     what a freshly created, accidentally-inactive account otherwise looks like."""
-    row = query_one(
-        "SELECT is_active FROM users WHERE username = ?", (normalize_username(username),)
-    )
+    resolved = resolve_login(username)
+    if not resolved:
+        return None
+    row = query_one("SELECT is_active FROM users WHERE username = ?", (resolved,))
     if not row:
         return None
     return "active" if row["is_active"] else "inactive"
@@ -106,14 +139,36 @@ def _sign(payload: str) -> str:
     return hmac.new(settings.secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
+def current_token_version(username: str) -> int:
+    row = query_one("SELECT token_version FROM users WHERE username = ?", (normalize_username(username),))
+    return int(row["token_version"] or 0) if row else 0
+
+
+def revoke_sessions(user_id: int) -> None:
+    """Invalidate every signed session cookie of this user (logout everywhere). Used on
+    password change/reset and by POST /api/auth/logout-all."""
+    from .db import execute
+    execute("UPDATE users SET token_version = token_version + 1 WHERE id = ?", (user_id,))
+
+
 def issue_token(username: str) -> str:
     expires = int(time.time()) + settings.session_hours * 3600
-    payload = f"{username}|{expires}"
+    payload = f"{username}|{expires}|{current_token_version(username)}"
     encoded = urlsafe_b64encode(payload.encode()).decode().rstrip("=")
     return f"{encoded}.{_sign(payload)}"
 
 
 def verify_token(token: str | None) -> str | None:
+    """Username from a valid signed token, else None. Also checks the token's version
+    against the user's current one, so a revoked session stops working immediately."""
+    parsed = _parse_token(token)
+    if not parsed:
+        return None
+    username, version = parsed
+    return username if version == current_token_version(username) else None
+
+
+def _parse_token(token: str | None) -> tuple[str, int] | None:
     if not token or "." not in token:
         return None
     encoded, signature = token.rsplit(".", 1)
@@ -124,13 +179,14 @@ def verify_token(token: str | None) -> str | None:
         return None
     if not hmac.compare_digest(_sign(payload), signature):
         return None
-    username, _, expires = payload.partition("|")
+    username, _, rest = payload.partition("|")
+    expires, _, version = rest.partition("|")
     try:
         if int(expires) < time.time():
             return None
+        return username, int(version or 0)       # pre-versioning tokens count as version 0
     except ValueError:
         return None
-    return username
 
 
 

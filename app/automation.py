@@ -35,6 +35,9 @@ JOB_SWITCHES = {
     "enrichment": "job_enrichment",
     "followup_generation": "job_followup_generation",
     "sending": "job_sending",
+    "campaigns": "job_campaigns",
+    "startups": "job_startups",
+    "registry_check": "job_registry_check",
 }
 
 
@@ -145,6 +148,57 @@ def _discover_workspace(workspace_id: int) -> dict:
     return {"ran": ran, "skipped": skipped}
 
 
+def _startup_runs() -> list[tuple[str, str, str, str]]:
+    """(provider, niche, city, country) combos for the new-startups sweep -
+    only for registries whose keys are configured."""
+    csv = lambda v: [x.strip() for x in v.split(",") if x.strip()]  # noqa: E731
+    niches = csv(settings.startup_niches)
+    runs = [("uk_all", n, c, "United Kingdom")
+            for n in niches for c in csv(settings.startup_uk_cities) or [""]]
+    runs += [("india_all", n, c, "India")
+             for n in niches for c in csv(settings.startup_in_cities) or [""]]
+    return runs
+
+
+def job_startups(force: bool = False, workspace_id: int | None = None) -> dict:
+    """Daily pull of newly incorporated companies (UK Companies House, India MCA)
+    into the leads list; enrichment then finds their websites and emails."""
+    from .search_service import run_search
+
+    if not force and not job_on("startups"):
+        return {"skipped": "startups switched off"}
+    runs = _startup_runs()
+    if not runs:
+        log_automation("startups", "No registry available", "warn")
+        return {"ran": 0, "skipped": "no registry keys"}
+    ran = failed = 0
+    for wid in _targets(workspace_id):
+        with workspace_context(wid):
+            for provider, niche, city, country in runs:
+                try:
+                    result = run_search(niche=niche, city=city, country=country, max_results=50,
+                                        provider_name=provider, triggered_by="automation",
+                                        workspace_id=wid)
+                    ran += 1
+                    if result.get("quota_hit"):
+                        return {"ran": ran, "failed": failed, "quota_hit": True}
+                except Exception as exc:  # noqa: BLE001 - one registry down must not stop the rest
+                    failed += 1
+                    log_failure(f"automation.startups.{provider}", str(exc))
+    log_automation("startups", f"New-startup sweep: {ran} search(es) ran, {failed} failed")
+    return {"ran": ran, "failed": failed}
+
+
+def job_registry_check(force: bool = False, workspace_id: int | None = None) -> dict:
+    """Re-check registry leads: update changed addresses, retire dissolved
+    companies, delete retired leads nobody ever worked."""
+    from . import registry_check
+
+    if not force and not job_on("registry_check"):
+        return {"skipped": "registry check switched off"}
+    return registry_check.run(_targets(workspace_id))
+
+
 def job_enrichment(force: bool = False, workspace_id: int | None = None) -> dict:
     if not force and not job_on("enrichment"):
         return {"skipped": "enrichment switched off"}
@@ -199,6 +253,23 @@ def job_followups(force: bool = False, workspace_id: int | None = None) -> dict:
                 f"{one['marked_lost']} marked Lost - No Response",
             )
     return result
+
+
+def job_campaigns(force: bool = False, workspace_id: int | None = None) -> dict:
+    """Advance every active campaign: queue the next due step for approval. Never sends."""
+    if not force and not job_on("campaigns"):
+        return {"skipped": "campaigns switched off"}
+    from . import campaigns
+    total = {"queued": 0, "stopped": 0, "completed": 0}
+    for wid in _targets(workspace_id):
+        with workspace_context(wid):
+            one = campaigns.tick()
+            for key in total:
+                total[key] += one[key]
+            if any(one.values()):
+                log_automation("campaigns", f"{one['queued']} step(s) queued for approval, "
+                               f"{one['completed']} completed, {one['stopped']} stopped")
+    return total
 
 
 def job_sending(force: bool = False, workspace_id: int | None = None) -> dict:
@@ -299,9 +370,12 @@ def job_digest(force: bool = False, workspace_id: int | None = None) -> dict:
 
 JOBS = {
     "discovery": job_discovery,
+    "startups": job_startups,
+    "registry_check": job_registry_check,
     "enrichment": job_enrichment,
     "scoring": job_scoring,
     "followups": job_followups,
+    "campaigns": job_campaigns,
     "sending": job_sending,
     "digest": job_digest,
     "backup": job_backup,
@@ -310,7 +384,7 @@ JOBS = {
 
 # Jobs that can take minutes (website checks, whole-table passes). Running these
 # inline would hold the HTTP request open until they finish and hang the browser.
-LONG_RUNNING = {"discovery", "enrichment", "scoring", "followups"}
+LONG_RUNNING = {"discovery", "startups", "registry_check", "enrichment", "scoring", "followups"}
 
 
 # Install-wide jobs: they touch the whole database / platform mailbox, so only
@@ -393,6 +467,8 @@ def is_leader() -> bool:
 # ---------------------------------------------------------------- scheduler --
 
 SCHEDULED_PLAN = [
+    ("startups", job_startups, "startups_time", (5, 30)),
+    ("registry_check", job_registry_check, "registry_check_time", (4, 30)),
     ("discovery", job_discovery, "discovery_time", (6, 0)),
     ("enrichment", job_enrichment, "enrichment_time", (6, 30)),
     ("scoring", job_scoring, "scoring_time", (7, 0)),
@@ -409,6 +485,15 @@ def _add_real_jobs() -> None:
             func, CronTrigger(hour=hour, minute=minute), id=name,
             replace_existing=True, misfire_grace_time=3600, coalesce=True,
         )
+    from . import jobqueue
+    scheduler.add_job(
+        jobqueue.run_due, "interval", seconds=60, id="job_queue",
+        replace_existing=True, misfire_grace_time=60, coalesce=True,
+    )
+    scheduler.add_job(
+        job_campaigns, CronTrigger(minute=15), id="campaigns",
+        replace_existing=True, misfire_grace_time=900, coalesce=True,
+    )
     scheduler.add_job(
         job_sending, CronTrigger(minute="*/30"), id="sending",
         replace_existing=True, misfire_grace_time=600, coalesce=True,
@@ -419,8 +504,9 @@ def _remove_real_jobs() -> None:
     for name, *_ in SCHEDULED_PLAN:
         if scheduler.get_job(name):
             scheduler.remove_job(name)
-    if scheduler.get_job("sending"):
-        scheduler.remove_job("sending")
+    for extra in ("sending", "campaigns", "job_queue"):
+        if scheduler.get_job(extra):
+            scheduler.remove_job(extra)
 
 
 def _leader_tick() -> None:

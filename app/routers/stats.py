@@ -84,7 +84,8 @@ def dashboard_stats():
 
 @router.get("/pipeline")
 def pipeline():
-    stages = query("SELECT * FROM pipeline_stages ORDER BY position")
+    from .. import pipeline
+    stages = pipeline.stages()
     scope, sp = lead_scope()
     counts = {r["status"]: r["n"] for r in
               query(f"SELECT status, COUNT(*) AS n FROM leads WHERE {scope} "

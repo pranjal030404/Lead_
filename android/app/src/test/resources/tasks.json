@@ -1,0 +1,53 @@
+{
+ "tasks": [
+  {
+   "id": 1,
+   "workspace_id": 1,
+   "lead_id": 23,
+   "owner_user_id": null,
+   "title": "Confirm a time for the call - Blue Ridge Dentist Hub",
+   "notes": null,
+   "due_at": "2026-11-15T18:33:19.929945+00:00",
+   "status": "OPEN",
+   "created_at": "2026-11-14T18:33:19+00:00",
+   "completed_at": null
+  },
+  {
+   "id": 6,
+   "workspace_id": 1,
+   "lead_id": 23,
+   "owner_user_id": null,
+   "title": "Confirm a time for the call - Blue Ridge Dentist Hub",
+   "notes": null,
+   "due_at": "2026-11-15T19:08:36.491600+00:00",
+   "status": "OPEN",
+   "created_at": "2026-11-14T19:08:36+00:00",
+   "completed_at": null
+  },
+  {
+   "id": 8,
+   "workspace_id": 1,
+   "lead_id": 23,
+   "owner_user_id": 1,
+   "title": "Prepare for meeting with Blue Ridge Dentist Hub",
+   "notes": null,
+   "due_at": "2026-11-16T17:13:01+00:00",
+   "status": "OPEN",
+   "created_at": "2026-11-14T19:13:01+00:00",
+   "completed_at": null
+  },
+  {
+   "id": 7,
+   "workspace_id": 1,
+   "lead_id": 23,
+   "owner_user_id": 1,
+   "title": "Call the owner",
+   "notes": "",
+   "due_at": "2026-12-01T09:00:00+00:00",
+   "status": "OPEN",
+   "created_at": "2026-11-14T19:13:01+00:00",
+   "completed_at": null
+  }
+ ],
+ "count": 4
+}

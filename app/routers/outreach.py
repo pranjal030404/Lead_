@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from ..config import settings
-from ..db import (current_user, current_ws, execute, get_ws_setting, lead_scope, query,
+from ..db import (sees_all, current_user, current_ws, execute, get_ws_setting, lead_scope, query,
                   query_one, set_ws_setting, utcnow)
 from ..outreach import (generate_followups, queue_message, send_approved,
                         set_approval_status, suppress, unsuppress)
@@ -169,7 +169,7 @@ def generate_now():
 @router.post("/approvals/send")
 def send_now(limit: int | None = None):
     user = current_user()
-    owner = user["id"] if user and user.get("role") not in ("admin", "superadmin") else None
+    owner = user["id"] if user and not sees_all(user) else None
     return send_approved(limit, workspace_id=current_ws(), owner_user_id=owner)
 
 

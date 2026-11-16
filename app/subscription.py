@@ -57,6 +57,8 @@ def set_payment_enabled(enabled: bool) -> None:
 
 def check_search_entitlement(user: dict) -> dict:
     """Gate one manual search. Returns ok + the subscription that counted."""
+    if settings.free_mode:
+        return {"ok": True, "free": True, "subscription": None}
     if user.get("role") == "superadmin":
         return {"ok": True, "superadmin": True, "subscription": None}
 
@@ -72,7 +74,7 @@ def max_results_for(user: dict, requested: int) -> int:
     """Cap a search's result count for gated users by their plan."""
 
     role_cap = settings.max_results_per_search
-    if user.get("role") == "superadmin":
+    if settings.free_mode or user.get("role") == "superadmin":
         return min(requested, role_cap)
     sub = active_subscription(user["id"])
     plan_cap = sub["max_results_per_search"] if sub else role_cap
@@ -83,7 +85,7 @@ def max_results_for(user: dict, requested: int) -> int:
 
 def count_search(user_id: int | None) -> None:
     """Charge one search against the user's active subscription."""
-    if not user_id:
+    if not user_id or settings.free_mode:
         return
     execute(
         """UPDATE user_subscriptions us

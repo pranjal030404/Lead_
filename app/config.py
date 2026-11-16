@@ -108,7 +108,11 @@ class Settings:
 
     # quota
     max_google_calls_per_day = _int("MAX_GOOGLE_CALLS_PER_DAY", 500)
-    max_results_per_search = _int("MAX_RESULTS_PER_SEARCH", 60)
+    max_results_per_search = _int("MAX_RESULTS_PER_SEARCH", 1000)
+    # FREE_MODE (default on): every signed-in user gets every feature - no plan, no payment,
+    # no search quota. Set FREE_MODE=false to bring back plan-gated searching and the
+    # My Plan / Plans pages for a paid deployment.
+    free_mode = _bool("FREE_MODE", True)
     quota_warn_pct = _int("QUOTA_WARN_PCT", 80)
     enterprise_fetch_min_score = _int("ENTERPRISE_FETCH_MIN_SCORE", 5)
 
@@ -126,6 +130,18 @@ class Settings:
     hunter_api_key = _str("HUNTER_API_KEY")
     max_hunter_calls_per_month = _int("MAX_HUNTER_CALLS_PER_MONTH", 25)
 
+    # extra discovery sources - each is optional and key-gated
+    foursquare_api_key = _str("FOURSQUARE_API_KEY")
+    companies_house_api_key = _str("COMPANIES_HOUSE_API_KEY")   # UK registry, free
+    opencorporates_api_key = _str("OPENCORPORATES_API_KEY")
+    data_gov_in_api_key = _str("DATA_GOV_IN_API_KEY")             # India MCA registry, free
+    data_gov_in_mca_resources = _str("DATA_GOV_IN_MCA_RESOURCES")  # comma-separated resource ids
+    adzuna_app_id = _str("ADZUNA_APP_ID")                      # job-board hiring signal
+    adzuna_app_key = _str("ADZUNA_APP_KEY")
+    meta_ad_library_token = _str("META_AD_LIBRARY_TOKEN")
+    sweep_cell_radius_m = _int("SWEEP_CELL_RADIUS_M", 1500)
+    sweep_max_cells = _int("SWEEP_MAX_CELLS", 25)
+
     # deep website audit (Phase 4). Cheapest-first: only leads that already look
     # worth pitching (score >= min) get the multi-request audit, and a recent
     # audit is reused for `website_cache_days`.
@@ -141,10 +157,18 @@ class Settings:
 
     # outreach
     dry_run = _bool("DRY_RUN", True)
+    public_url = _str("PUBLIC_URL")   # e.g. https://leads.example.com - used in password-reset links
     resend_api_key = _str("RESEND_API_KEY")
     mail_from = _str("MAIL_FROM")
     mail_from_name = _str("MAIL_FROM_NAME")
     max_emails_per_hour = _int("MAX_EMAILS_PER_HOUR", 20)
+    max_emails_per_day = _int("MAX_EMAILS_PER_DAY", 100)        # 0 = no daily cap
+    send_quiet_start = _int("SEND_QUIET_START", 21)             # local hour, 0-23
+    send_quiet_end = _int("SEND_QUIET_END", 8)                  # start == end disables
+    send_timezone = _str("SEND_TIMEZONE", "Asia/Kolkata")
+    send_weekdays_only = _bool("SEND_WEEKDAYS_ONLY", False)
+    send_jitter_min_s = _int("SEND_JITTER_MIN_S", 20)
+    send_jitter_max_s = _int("SEND_JITTER_MAX_S", 90)
     unsubscribe_mailto = _str("UNSUBSCRIBE_MAILTO")
 
     # operator alerts (Part 7.6)
@@ -160,6 +184,11 @@ class Settings:
     # automation
     automation_enabled = _bool("AUTOMATION_ENABLED", False)
     discovery_time = _str("DISCOVERY_TIME", "06:00")
+    startups_time = _str("STARTUPS_TIME", "05:30")
+    registry_check_time = _str("REGISTRY_CHECK_TIME", "04:30")
+    startup_niches = _str("STARTUP_NICHES", "tech,software,digital,labs,ai")   # name/activity words
+    startup_uk_cities = _str("STARTUP_UK_CITIES", "London")
+    startup_in_cities = _str("STARTUP_IN_CITIES", "")   # blank = anywhere in the dataset
     enrichment_time = _str("ENRICHMENT_TIME", "06:30")
     scoring_time = _str("SCORING_TIME", "07:00")
     followup_time = _str("FOLLOWUP_TIME", "07:30")

@@ -12,9 +12,16 @@ from __future__ import annotations
 import re
 from difflib import SequenceMatcher
 
+from . import contactparse
 from .db import current_ws, get_conn, lead_scope, utcnow
 
 FUZZY_THRESHOLD = 0.80
+
+# Pages that many unrelated businesses list as their "website" - never a duplicate key.
+SHARED_DOMAINS = {"facebook.com", "instagram.com", "linktr.ee", "wa.me", "google.com",
+                  "business.site", "wixsite.com", "wordpress.com", "blogspot.com",
+                  "justdial.com", "indiamart.com", "zomato.com", "swiggy.com", "youtube.com",
+                  "linkedin.com", "twitter.com", "x.com"}
 
 # Words that carry no signal when comparing business names.
 _NOISE = {
@@ -82,6 +89,19 @@ def find_duplicate(conn, candidate: dict,
         ).fetchone()
         if row:
             return dict(row), "phone"
+
+    domain = contactparse.canonical_domain(candidate.get("website_url"))
+    if domain and domain not in SHARED_DOMAINS:
+        for row in conn.execute(
+                "SELECT * FROM leads WHERE workspace_id = ? AND owner_user_id = ? "
+                "AND website_url LIKE ?", (current_ws(), owner, f"%{domain}%")).fetchall():
+            existing = dict(row)
+            if contactparse.canonical_domain(existing.get("website_url")) != domain:
+                continue
+            # A chain's shared site must not merge two branches with different phones.
+            if phone and existing.get("phone") and phone != existing["phone"]:
+                continue
+            return existing, "website domain"
 
     name, city = candidate.get("business_name"), candidate.get("city")
     if not name:

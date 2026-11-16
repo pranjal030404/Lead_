@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from .. import emailintel, leadscore, lineage, social
 from ..config import settings
+from .. import exportutil
 from ..db import current_ws, execute, lead_scope, query, query_one, scalar, utcnow
 from ..fastjson import rows_response
 from ..dedup import dedupe_existing_leads
@@ -155,24 +156,23 @@ def export_leads(
     city: str | None = None, niche: str | None = None, country: str | None = None,
     source: str | None = None, has_website: bool | None = None, tag: str | None = None,
     min_quality: int | None = None, enrichment_status: str | None = None,
+    format: str = Query("csv", pattern="^(csv|jsonl|vcf)$"),
 ):
-    """CSV export - doubles as the manual 'get everything out' safety net (Part 7.4)."""
+    """CSV/JSONL export - doubles as the manual 'get everything out' safety net (Part 7.4)."""
     where, params = _build_filters(q, status, priority, city, niche, country,
                                    has_website, tag, min_quality, enrichment_status, source)
     rows = query(f"SELECT * FROM leads{where} ORDER BY id", tuple(params))
 
-    buffer = io.StringIO()
-    if rows:
-        writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()),
-                                extrasaction="ignore", lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
-    else:
-        buffer.write("no leads matched\n")
-    buffer.seek(0)
-
+    if format == "vcf":
+        return StreamingResponse(
+            iter([exportutil.to_vcard(rows)]), media_type="text/vcard",
+            headers={"Content-Disposition": 'attachment; filename="leads.vcf"'})
+    if format == "jsonl":
+        return StreamingResponse(
+            iter([exportutil.to_jsonl(rows)]), media_type="application/x-ndjson",
+            headers={"Content-Disposition": 'attachment; filename="leads.jsonl"'})
     return StreamingResponse(
-        iter([buffer.getvalue()]),
+        iter([exportutil.to_csv(rows)]),
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="leads.csv"'},
     )

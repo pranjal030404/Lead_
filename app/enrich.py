@@ -92,13 +92,18 @@ def stage_website(lead: dict) -> dict:
 def stage_social(lead: dict) -> dict:
     """Stage 2 - social profile discovery.
 
-    Free path: links already found on the business's own website (stage 1).
-    Anything beyond that needs a search API; rather than scrape a search engine
-    (fragile and against most of their terms), this is left as a deliberate
-    extension point - plug a search provider in here if you want it automated,
-    otherwise fill Instagram/Facebook in by hand on the leads worth it.
+    Free path only: stage 1 reads the home page; this goes on to the contact/about pages the
+    site links to, for any of Instagram/Facebook/LinkedIn still missing. It deliberately does
+    not scrape a search engine (fragile, against their terms). Nothing to do without a site.
     """
-    return {}
+    have = tuple(f for f in ("instagram_url", "facebook_url", "linkedin_url") if lead.get(f))
+    if not lead.get("website_url") or lead.get("has_website") == 0 or len(have) == 3:
+        return {}
+    found = website.find_socials_deep(lead["website_url"], have)
+    if not found:
+        return {}
+    found["_source"] = ("website_scrape", "website")
+    return found
 
 
 def stage_email(lead: dict) -> dict:
@@ -206,7 +211,13 @@ def enrich_lead(lead_id: int) -> dict:
     if not lead:
         raise ValueError(f"Lead {lead_id} not found")
     with workspace_context(lead["workspace_id"]):
-        return _enrich_lead(lead_id, lead)
+        result = _enrich_lead(lead_id, lead)
+        try:
+            from . import snapshots
+            snapshots.record(query_one("SELECT * FROM leads WHERE id = ?", (lead_id,)) or lead)
+        except Exception as exc:  # noqa: BLE001 - history must never break enrichment
+            log_failure("snapshots", str(exc), lead_id)
+        return result
 
 
 def _enrich_lead(lead_id: int, lead: dict) -> dict:
