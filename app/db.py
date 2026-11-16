@@ -112,7 +112,7 @@ CREATE_TABLES = [
         data_quality_score      INT DEFAULT 0,
         score_reasons           TEXT,
         status                  VARCHAR(32) DEFAULT 'NEW',
-        source                  VARCHAR(64),
+        source                  VARCHAR(255),
         niche                   VARCHAR(128),
         tags                    TEXT,
         notes                   TEXT,
@@ -996,6 +996,20 @@ def _ensure_app_settings_updated_at(conn: Conn) -> None:
             cur.execute("ALTER TABLE app_settings ADD COLUMN updated_at VARCHAR(40) NULL")
 
 
+def _widen_leads_source(conn: Conn) -> None:
+    """leads.source was VARCHAR(64); web-AI startup leads store a longer note
+    (incl. the registration date) and failed with error 1406. Idempotent."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT CHARACTER_MAXIMUM_LENGTH AS n FROM information_schema.columns
+               WHERE table_schema = DATABASE() AND table_name = 'leads'
+                 AND column_name = 'source'"""
+        )
+        row = cur.fetchone()
+        if row and row["n"] is not None and int(row["n"]) < 255:
+            cur.execute("ALTER TABLE leads MODIFY source VARCHAR(255) NULL")
+
+
 # ----------------------------------------------------- tenancy migrations --
 
 def _col_exists(cur, table: str, column: str) -> bool:
@@ -1772,6 +1786,7 @@ def init_db() -> None:
             for statement in CREATE_TABLES:
                 cur.execute(statement)
         run_migrations(conn)
+        _widen_leads_source(conn)
 
     for key, value in DEFAULT_SWITCHES.items():
         if get_setting(key) is None:

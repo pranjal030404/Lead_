@@ -100,8 +100,14 @@ def test_find_starts_both_registries(monkeypatch):
     monkeypatch.setattr(startups, "start_search", lambda **kw: calls.append(kw) or len(calls))
     monkeypatch.setattr(startups, "check_search_entitlement", lambda u: {"ok": True})
     r = c.post("/api/startups/find", json={"niche": "software", "country": "both"}).json()
-    assert [k["provider_name"] for k in calls] == ["uk_all", "india_all"] and r["status"] == "RUNNING"
-    assert c.post("/api/startups/find", json={"country": "mars"}).status_code == 400
+    assert [(k["provider_name"], k["country"]) for k in calls] == [
+        ("web_ai", "United Kingdom"), ("web_ai", "India")] and r["status"] == "RUNNING"
+    calls.clear()
+    c.post("/api/startups/find", json={"country": "Germany"})
+    assert [k["country"] for k in calls] == ["Germany"]
+    calls.clear()
+    c.post("/api/startups/find", json={"country": "worldwide"})
+    assert [k["country"] for k in calls] == [""]
 
 
 def test_startups_page_needs_login_and_renders():
