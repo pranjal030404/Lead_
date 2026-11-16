@@ -199,6 +199,9 @@ private fun HomeShell(
             composable("map") { MapScreen(repo = repo, onBack = back, onOpenLead = openLead) }
             composable("pipeline") { PipelineScreen(repo = repo, onBack = back, onOpenLead = openLead) }
             composable("coverage") { CoverageScreen(repo = repo, onBack = back) }
+            composable("tasks") { TasksScreen(repo = repo, onBack = back, onOpenLead = openLead) }
+            composable("meetings") { MeetingsScreen(repo = repo, onBack = back, onOpenLead = openLead) }
+            composable("proposals") { ProposalsScreen(repo = repo, onBack = back, onOpenLead = openLead) }
             composable("approvals") { ApprovalsScreen(repo = repo, onBack = back, onOpenLead = openLead) }
             composable("automation") { AutomationScreen(repo = repo, onBack = back) }
             composable("reports") { ReportsScreen(repo = repo, onBack = back) }

@@ -37,6 +37,8 @@ fun LoginScreen(
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var showPassword by remember { mutableStateOf(false) }
+    var code by remember { mutableStateOf("") }
+    var needsCode by remember { mutableStateOf(false) }
 
     fun signIn() {
         if (username.isBlank() || password.isBlank()) {
@@ -46,13 +48,13 @@ fun LoginScreen(
         busy = true
         error = null
         scope.launch {
-            var result = repo.login(username.trim(), password, false)
+            var result = repo.login(username.trim(), password, false, code)
             // Backend contract: correct admin credentials at the user door get a 403
             // directing them to /admin, so only that specific answer triggers the
             // admin door. Wrong passwords (401) never retry.
             val denied = result.exceptionOrNull() as? com.arthvex.leadgen.data.ApiException
             if (denied?.status == 403 && denied.message?.contains("/admin") == true) {
-                result = repo.login(username.trim(), password, true)
+                result = repo.login(username.trim(), password, true, code)
             }
             result
                 .onSuccess { user ->
@@ -61,7 +63,11 @@ fun LoginScreen(
                     password = ""
                     onLoggedIn(user)
                 }
-                .onFailure { error = it.message ?: "Could not sign in" }
+                .onFailure {
+                    // Two-factor accounts answer 401 "Authenticator code required" until a code is sent.
+                    if (it.message?.startsWith("Authenticator code") == true) needsCode = true
+                    error = it.message ?: "Could not sign in"
+                }
             busy = false
         }
     }
@@ -122,6 +128,19 @@ fun LoginScreen(
                             }
                         }
                     )
+                    if (needsCode) {
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = code,
+                            onValueChange = { code = it.filter(Char::isDigit).take(6) },
+                            label = { Text("Authenticator code") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                                keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword
+                            )
+                        )
+                    }
                     if (error != null) {
                         Spacer(Modifier.height(10.dp))
                         Text(

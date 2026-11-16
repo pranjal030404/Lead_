@@ -5,6 +5,7 @@ import com.arthvex.leadgen.data.json
 import com.arthvex.leadgen.model.*
 import com.arthvex.leadgen.model.Target
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -70,5 +71,41 @@ class ModelParsingTest {
     @Test fun serverUrlIsFixedAndHttpsInProduction() {
         // The URL is not user-editable: whatever is passed in, the build's fixed server is used.
         assertEquals(ApiClient.normalise("http://evil.example"), ApiClient.normalise(""))
+    }
+
+    // ---- screens added in 1.1.0: decoded from live server responses ----
+
+    @Test fun tasks() {
+        val r = json.decodeFromString<TasksResponse>(fixture("tasks.json"))
+        assertTrue(r.tasks.any { it.title == "Call the owner" && it.status == "OPEN" && it.lead_id != null })
+    }
+
+    @Test fun meetings() {
+        val m = json.decodeFromString<MeetingsResponse>(fixture("meetings.json")).meetings.first()
+        assertEquals("Intro call", m.title)
+        assertEquals("SCHEDULED", m.status)
+        assertEquals(30, m.duration_min)
+        assertTrue(m.starts_at.startsWith("20"))
+    }
+
+    @Test fun proposalsAndRevenue() {
+        val p = json.decodeFromString<ProposalsResponse>(fixture("proposals.json")).proposals.first()
+        assertEquals("Website rebuild", p.title)
+        assertEquals("DRAFT", p.effective_status)
+        assertEquals(47200.0, p.total, 0.001)            // 40,000 + 18% tax
+        assertTrue(p.number.startsWith("P-"))
+        val r = json.decodeFromString<Revenue>(fixture("revenue.json"))
+        assertEquals(0, r.accepted)
+    }
+
+    @Test fun loginRequestOmitsCodeUnlessGiven() {
+        assertEquals("""{"username":"a","password":"b"}""", json.encodeToString(LoginRequest("a", "b")))
+        assertEquals("""{"username":"a","password":"b","code":"123456"}""",
+            json.encodeToString(LoginRequest("a", "b", "123456")))
+    }
+
+    @Test fun sessionCookieNameMatchesServer() {
+        // app/security.py SESSION_COOKIE - if these drift the app forgets its sign-in on restart.
+        assertEquals("leadgen_session", com.arthvex.leadgen.data.SessionCookieJar.SESSION_COOKIE)
     }
 }

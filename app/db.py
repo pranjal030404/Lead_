@@ -426,6 +426,7 @@ DEFAULT_SWITCHES = {
     "job_enrichment": "on",
     "job_followup_generation": "on",
     "job_sending": "off",
+    "job_campaigns": "on",
 }
 
 
@@ -481,6 +482,14 @@ def current_user() -> dict | None:
     return _user_var.get()
 
 
+SEES_ALL_ROLES = ("admin", "superadmin", "viewer")     # roles that see the whole workspace, not just own rows
+
+
+def sees_all(user: dict | None) -> bool:
+    """True for admins and read-only viewers (and background work with no user)."""
+    return not user or user.get("role") in SEES_ALL_ROLES
+
+
 def lead_scope(alias: str = "") -> tuple[str, list]:
     """SQL predicate + params for the leads the current user may see.
 
@@ -493,7 +502,7 @@ def lead_scope(alias: str = "") -> tuple[str, list]:
     prefix = f"{alias}." if alias else ""
     ws = current_ws()
     user = current_user()
-    if user and user.get("role") not in ("admin", "superadmin"):
+    if not sees_all(user):
         return f"{prefix}workspace_id = ? AND {prefix}owner_user_id = ?", [ws, user["id"]]
     return f"{prefix}workspace_id = ?", [ws]
 
@@ -505,7 +514,7 @@ def search_scope(alias: str = "") -> tuple[str, list]:
     prefix = f"{alias}." if alias else ""
     ws = current_ws()
     user = current_user()
-    if user and user.get("role") not in ("admin", "superadmin"):
+    if not sees_all(user):
         return f"{prefix}workspace_id = ? AND {prefix}user_id = ?", [ws, user["id"]]
     return f"{prefix}workspace_id = ?", [ws]
 
@@ -1509,6 +1518,203 @@ def _backfill_lineage(conn: Conn) -> None:
 # DROP / column removal / data rewrite): a step is recorded in schema_migrations
 # once applied, and rollback guidance lives in its docstring. Never edit or
 # reorder an applied entry - add a new one.
+def _create_api_tokens(conn: Conn) -> None:
+    """Read-only API tokens (for Claude / scripts). Only a SHA-256 of the token is stored.
+
+    Rollback: DROP TABLE api_tokens."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id INT NOT NULL,
+                user_id      INT NOT NULL,
+                name         VARCHAR(80) NOT NULL,
+                prefix       VARCHAR(16) NOT NULL,
+                token_hash   CHAR(64) NOT NULL,
+                created_at   VARCHAR(40) NOT NULL,
+                last_used_at VARCHAR(40) NULL,
+                revoked      INT NOT NULL DEFAULT 0,
+                UNIQUE KEY uq_token_hash (token_hash),
+                KEY idx_token_user (user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+
+
+def _create_rating_snapshots(conn: Conn) -> None:
+    """Review-count history per lead (review-growth signal). Rollback: DROP TABLE rating_snapshots."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rating_snapshots (
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                workspace_id INT NOT NULL,
+                lead_id      INT NOT NULL,
+                at           VARCHAR(40) NOT NULL,
+                reviews      INT NOT NULL,
+                rating       DOUBLE NULL,
+                KEY idx_snap_lead (lead_id, id),
+                CONSTRAINT fk_snap_lead FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+
+
+def _create_session_and_reset(conn: Conn) -> None:
+    """users.token_version (logout-everywhere) + password_resets (single-use, hashed, expiring).
+    Rollback: ALTER TABLE users DROP COLUMN token_version; DROP TABLE password_resets."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 AS x FROM information_schema.columns WHERE table_schema = DATABASE() "
+                    "AND table_name = 'users' AND column_name = 'token_version'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE users ADD COLUMN token_version INT NOT NULL DEFAULT 0")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS password_resets (
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                user_id    INT NOT NULL,
+                token_hash VARCHAR(64) NOT NULL,
+                expires_at VARCHAR(40) NOT NULL,
+                used_at    VARCHAR(40) NULL,
+                created_at VARCHAR(40) NOT NULL,
+                UNIQUE KEY uq_reset_token (token_hash),
+                KEY idx_reset_user (user_id),
+                CONSTRAINT fk_reset_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+
+
+def _create_crm_security_tables(conn: Conn) -> None:
+    """audit_log, MFA columns, tasks, webhooks. Rollback: DROP TABLE webhook_deliveries, webhooks,
+    tasks, audit_log; ALTER TABLE users DROP COLUMN mfa_secret, DROP COLUMN mfa_enabled."""
+    with conn.cursor() as cur:
+        for col, ddl in (("mfa_secret", "VARCHAR(64) NULL"), ("mfa_enabled", "INT NOT NULL DEFAULT 0")):
+            cur.execute("SELECT 1 AS x FROM information_schema.columns WHERE table_schema = DATABASE() "
+                        "AND table_name = 'users' AND column_name = ?", (col,))
+            if not cur.fetchone():
+                cur.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+        tail = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS audit_log (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NULL, user_id INT NULL,
+            username VARCHAR(64), method VARCHAR(8), path VARCHAR(255), status INT, ip VARCHAR(64),
+            at VARCHAR(40) NOT NULL, KEY idx_audit_at (at), KEY idx_audit_ws (workspace_id, id)) {tail}""")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS tasks (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, lead_id INT NULL,
+            owner_user_id INT NULL, title VARCHAR(255) NOT NULL, notes TEXT NULL,
+            due_at VARCHAR(40) NULL, status VARCHAR(8) NOT NULL DEFAULT 'OPEN',
+            created_at VARCHAR(40) NOT NULL, completed_at VARCHAR(40) NULL,
+            KEY idx_tasks_ws (workspace_id, status, due_at), KEY idx_tasks_lead (lead_id)) {tail}""")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS webhooks (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, url VARCHAR(500) NOT NULL,
+            secret VARCHAR(64) NOT NULL, events VARCHAR(255) NOT NULL, is_active INT NOT NULL DEFAULT 1,
+            created_at VARCHAR(40) NOT NULL, KEY idx_hooks_ws (workspace_id)) {tail}""")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, webhook_id INT NOT NULL,
+            event VARCHAR(64) NOT NULL, status_code INT NULL, error VARCHAR(300) NULL,
+            at VARCHAR(40) NOT NULL, KEY idx_deliv_hook (webhook_id, id)) {tail}""")
+
+
+def _create_campaigns(conn: Conn) -> None:
+    """Campaigns, their steps and per-lead enrolments.
+    Rollback: DROP TABLE campaign_enrollments, campaign_steps, campaigns."""
+    tail = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    with conn.cursor() as cur:
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS campaigns (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, owner_user_id INT NULL,
+            name VARCHAR(150) NOT NULL, status VARCHAR(10) NOT NULL DEFAULT 'DRAFT',
+            criteria TEXT NULL, created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+            KEY idx_camp_ws (workspace_id, status)) {tail}""")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS campaign_steps (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, campaign_id INT NOT NULL,
+            position INT NOT NULL, template_name VARCHAR(128) NOT NULL, delay_days INT NOT NULL DEFAULT 0,
+            UNIQUE KEY uq_step (campaign_id, position),
+            CONSTRAINT fk_step_camp FOREIGN KEY (campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE) {tail}""")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS campaign_enrollments (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, campaign_id INT NOT NULL,
+            lead_id INT NOT NULL, status VARCHAR(10) NOT NULL DEFAULT 'ACTIVE',
+            next_position INT NOT NULL DEFAULT 0, next_due_at VARCHAR(40) NULL,
+            waiting_queue_id INT NULL, stop_reason VARCHAR(120) NULL,
+            enrolled_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+            UNIQUE KEY uq_enroll (campaign_id, lead_id), KEY idx_enroll_lead (lead_id, status),
+            KEY idx_enroll_due (workspace_id, status, next_due_at),
+            CONSTRAINT fk_enroll_camp FOREIGN KEY (campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE,
+            CONSTRAINT fk_enroll_lead FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE) {tail}""")
+
+
+def _create_pipeline_meetings_proposals(conn: Conn) -> None:
+    """Per-workspace configurable pipeline stages, meetings, proposals.
+    Rollback: DROP TABLE proposals, meetings; pipeline_stages keeps working (extra columns are harmless)."""
+    tail = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    with conn.cursor() as cur:
+        def has_col(table, col):
+            cur.execute("SELECT 1 AS x FROM information_schema.columns WHERE table_schema = DATABASE() "
+                        "AND table_name = ? AND column_name = ?", (table, col))
+            return bool(cur.fetchone())
+
+        for col, ddl in (("workspace_id", "INT NULL"), ("label", "VARCHAR(40) NULL"),
+                         ("is_core", "INT NOT NULL DEFAULT 0")):
+            if not has_col("pipeline_stages", col):
+                cur.execute(f"ALTER TABLE pipeline_stages ADD COLUMN {col} {ddl}")
+        cur.execute("SELECT 1 AS x FROM information_schema.statistics WHERE table_schema = DATABASE() "
+                    "AND table_name = 'pipeline_stages' AND index_name = 'uq_stage_name'")
+        if cur.fetchone():
+            cur.execute("ALTER TABLE pipeline_stages DROP INDEX uq_stage_name")
+        cur.execute("SELECT 1 AS x FROM information_schema.statistics WHERE table_schema = DATABASE() "
+                    "AND table_name = 'pipeline_stages' AND index_name = 'uq_stage_ws_name'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE pipeline_stages ADD UNIQUE KEY uq_stage_ws_name (workspace_id, name)")
+        # Legacy global rows become each workspace's own (core) stages.
+        cur.execute("SELECT id FROM workspaces")
+        for w in cur.fetchall():
+            cur.execute("INSERT IGNORE INTO pipeline_stages(workspace_id, name, position, color, "
+                        "auto_follow_up_days, is_core) SELECT ?, name, position, color, auto_follow_up_days, 1 "
+                        "FROM pipeline_stages WHERE workspace_id IS NULL", (w["id"],))
+        cur.execute("DELETE FROM pipeline_stages WHERE workspace_id IS NULL")
+
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS meetings (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, lead_id INT NOT NULL,
+            owner_user_id INT NULL, title VARCHAR(200) NOT NULL, starts_at VARCHAR(40) NOT NULL,
+            duration_min INT NOT NULL DEFAULT 30, location VARCHAR(300) NULL, notes TEXT NULL,
+            status VARCHAR(12) NOT NULL DEFAULT 'SCHEDULED',
+            created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+            KEY idx_meet_ws (workspace_id, status, starts_at), KEY idx_meet_lead (lead_id),
+            CONSTRAINT fk_meet_lead FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE) {tail}""")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS proposals (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, lead_id INT NOT NULL,
+            owner_user_id INT NULL, number VARCHAR(24) NOT NULL, title VARCHAR(200) NOT NULL,
+            status VARCHAR(10) NOT NULL DEFAULT 'DRAFT', currency VARCHAR(3) NOT NULL DEFAULT 'INR',
+            items TEXT NOT NULL, discount_pct DOUBLE NOT NULL DEFAULT 0, tax_pct DOUBLE NOT NULL DEFAULT 0,
+            subtotal DOUBLE NOT NULL DEFAULT 0, total DOUBLE NOT NULL DEFAULT 0,
+            valid_until VARCHAR(40) NULL, notes TEXT NULL, share_token VARCHAR(48) NOT NULL,
+            created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+            sent_at VARCHAR(40) NULL, decided_at VARCHAR(40) NULL,
+            UNIQUE KEY uq_prop_number (workspace_id, number), UNIQUE KEY uq_prop_token (share_token),
+            KEY idx_prop_ws (workspace_id, status), KEY idx_prop_lead (lead_id),
+            CONSTRAINT fk_prop_lead FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE) {tail}""")
+
+
+def _create_segments_and_queue(conn: Conn) -> None:
+    """Saved lead segments and the durable job queue. Rollback: DROP TABLE segments, job_queue."""
+    tail = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+    with conn.cursor() as cur:
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS segments (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NOT NULL, owner_user_id INT NULL,
+            name VARCHAR(120) NOT NULL, filters TEXT NOT NULL, created_at VARCHAR(40) NOT NULL,
+            UNIQUE KEY uq_segment_name (workspace_id, owner_user_id, name)) {tail}""")
+        cur.execute(f"""CREATE TABLE IF NOT EXISTS job_queue (
+            id INT AUTO_INCREMENT PRIMARY KEY, workspace_id INT NULL, kind VARCHAR(40) NOT NULL,
+            payload MEDIUMTEXT NOT NULL, status VARCHAR(8) NOT NULL DEFAULT 'PENDING',
+            attempts INT NOT NULL DEFAULT 0, max_attempts INT NOT NULL DEFAULT 5,
+            run_at VARCHAR(40) NOT NULL, locked_at VARCHAR(40) NULL, last_error VARCHAR(500) NULL,
+            created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL,
+            KEY idx_jobq_due (status, run_at), KEY idx_jobq_ws (workspace_id, status)) {tail}""")
+
+
+def _add_denied_features(conn: Conn) -> None:
+    """Per-user feature restrictions. Rollback: ALTER TABLE users DROP COLUMN denied_features."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 AS x FROM information_schema.columns WHERE table_schema = DATABASE() "
+                    "AND table_name = 'users' AND column_name = 'denied_features'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE users ADD COLUMN denied_features TEXT NULL")
+
+
 MIGRATIONS: list[tuple[int, str, Any]] = [
     (1, "searches.user_id", _ensure_searches_user_id),
     (2, "searches.cached_from", _ensure_searches_cached_from),
@@ -1520,6 +1726,14 @@ MIGRATIONS: list[tuple[int, str, Any]] = [
     (8, "website audits and opportunities", _create_audit_tables),
     (9, "lead scores, signals, competitors", _create_scoring_tables),
     (10, "leads.owner_user_id (per-user leads)", _add_lead_owner),
+    (11, "api_tokens (read-only access tokens)", _create_api_tokens),
+    (12, "rating_snapshots (review-growth history)", _create_rating_snapshots),
+    (13, "users.token_version + password_resets", _create_session_and_reset),
+    (14, "audit_log, MFA, tasks, webhooks", _create_crm_security_tables),
+    (15, "campaigns, steps, enrolments", _create_campaigns),
+    (16, "pipeline stages per workspace, meetings, proposals", _create_pipeline_meetings_proposals),
+    (17, "segments, job_queue", _create_segments_and_queue),
+    (18, "users.denied_features", _add_denied_features),
 ]
 
 CREATE_MIGRATIONS_TABLE = """
@@ -1559,12 +1773,6 @@ def init_db() -> None:
                 cur.execute(statement)
         run_migrations(conn)
 
-    for name, pos, color, days in PIPELINE_STAGES:
-        execute(
-            "INSERT IGNORE INTO pipeline_stages(name, position, color, auto_follow_up_days) "
-            "VALUES(?,?,?,?)",
-            (name, pos, color, days),
-        )
     for key, value in DEFAULT_SWITCHES.items():
         if get_setting(key) is None:
             set_setting(key, value)
@@ -1576,6 +1784,8 @@ def init_db() -> None:
     for ws in query("SELECT id FROM workspaces ORDER BY id"):
         with workspace_context(ws["id"]):
             seed_templates()
+        from .pipeline import seed_stages
+        seed_stages(ws["id"])
 
     # Seed the superadmin from the .env credentials on the very first run, as
     # owner of the default workspace.

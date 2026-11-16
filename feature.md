@@ -27,6 +27,11 @@ module that implements each behaviour.
 17. [Deployment & operations](#17-deployment--operations)
 18. [Tests](#18-tests)
 19. [Deliberate deviations & known limits](#19-deliberate-deviations--known-limits)
+20. [Features — multi-tenancy: organizations, workspaces, private leads](#20-features--multi-tenancy-organizations-workspaces-private-leads)
+21. [Features — lead intelligence](#21-features--lead-intelligence)
+22. [Features — demo websites](#22-features--demo-websites)
+23. [Features — the Android app](#23-features--the-android-app)
+24. [Features — database resilience & health probes](#24-features--database-resilience--health-probes)
 
 ---
 
@@ -238,7 +243,13 @@ Nominatim's policy (real User-Agent, ≤1 req/sec) is respected: the User-Agent
 is derived from the white-label brand name in `app/http.py:_user_agent`, and the
 OSM provider sleeps 1s after geocoding.
 
-### 4.3 Shared search cache
+### 4.3 Search cache
+
+> **Since v2 (workspaces + private leads) the cache is scoped to the workspace
+> and to the searching user** — see [§20](#20-features--multi-tenancy-organizations-workspaces-private-leads).
+> Nobody is ever served another tenant's or another user's cached leads. The
+> mechanics below are otherwise unchanged; expect more provider calls with
+> several tenants.
 
 `app/search_service.py:99` (`search_fingerprint`) and `:129`
 (`find_cached_search`).
@@ -875,6 +886,11 @@ role: admins from `/login` to `/admin`, regular users from `/admin` to
 
 ### 10.3 Roles
 
+> Install-wide controls (automation switches and kill switch, backups, digest,
+> plan create/edit/delete, payment toggle) are **superadmin only**. Workspace
+> admins see and manage only the members of their own workspace. See
+> [§20](#20-features--multi-tenancy-organizations-workspaces-private-leads).
+
 `user` < `admin` < `superadmin`, enforced per request by the `require_role`
 FastAPI dependency (`app/security.py:62`). Only a `superadmin` can grant or
 change a privileged role; the API refuses otherwise. Sidebar entries and routes
@@ -999,6 +1015,7 @@ Mechanics:
 | `#/myplan` | My Plan | Active plan + usage bar, plan catalogue, buy buttons, order history |
 | `#/targets` | Targets | Saved niche+city combos with coverage, frequency, pause/resume, search now |
 | `#/templates` | Templates | Edit every outreach template in place |
+| `#/demos` | Demo websites | Four finished sample sites (CA, dry cleaner, computer service, tiffin) with **Open** buttons — see [§22](#22-features--demo-websites) |
 | `#/users` | Users *(admin)* | Accounts, roles, active toggle, assign plan, delete |
 | `#/plans` | Plans *(admin)* | Plan CRUD, subscriptions with approve/reject/cancel, self-serve toggle |
 | `#/settings` | Settings *(admin)* | Branding, landing copy, outreach identity, provider & quota, suppression list, backups, users/plans links, sign out |
@@ -1022,7 +1039,9 @@ Mechanics:
 
 ## 13. Data model
 
-`app/db.py`, 19 tables, InnoDB / `utf8mb4_unicode_ci`.
+`app/db.py`, 33 tables, InnoDB / `utf8mb4_unicode_ci`. The table below lists the
+original core set; every business table now also carries `workspace_id`, and
+the tables added by the v2 phases are listed after it.
 
 | Table | Holds | Notable |
 |---|---|---|
@@ -1045,6 +1064,19 @@ Mechanics:
 | `users` | Accounts | password_hash, role, is_active |
 | `plans` | Plan catalogue | price, currency, period_days, search_limit, max_results_per_search |
 | `user_subscriptions` | User ↔ plan claims | status, period, searches_used, channel, payment_status, FK to users ON DELETE CASCADE |
+
+**Added in v2** (migrations 4–10 in `app/db.py`, recorded in `schema_migrations`):
+
+| Phase | Tables / columns | Purpose |
+|---|---|---|
+| 2 — workspaces | `organizations`, `workspaces`, `workspace_members`; `workspace_id` on all business tables | tenant boundary and membership |
+| 3 — lineage & contacts | `field_sources`, `contacts`, `email_addresses`, `social_profiles`; `leads.data_confidence_score`, `freshness_status`, `last_verified_at`, `next_verification_at` | provenance, people, emails, socials |
+| 4 — audits | `website_audits`, `lead_opportunities`; `leads.website_audit_score`, `website_audited_at`, `opportunity_count`, `opportunity_value_est` | deep audit history and sellable opportunities |
+| 5 — scoring | `lead_scores`, `lead_score_history`, `lead_signals`, `lead_competitors`; `leads.overall_score`, `opportunity_tier`, `score_confidence`, `intent_score`, `scored_at` | multi-score model, intent signals, competitors |
+| 6 — private leads | `leads.owner_user_id`, `uq_leads_place_owner` | per-user lead ownership |
+
+Migrations are idempotent, non-destructive, applied in order at boot, and each
+has a documented rollback in `MIGRATION_NOTES.md`.
 
 Seed data created at first boot: 8 pipeline stages, default switches, 8 outreach
 templates, and the first `superadmin` from `ADMIN_USER` / `ADMIN_PASSWORD`.
@@ -1097,6 +1129,35 @@ the public list requires a valid session cookie.
 `POST /api/me/subscriptions`,
 `POST /api/subscriptions/{id}/{approve,reject,cancel}`,
 `GET/POST /api/settings/payment`
+
+**Workspaces** — `GET /api/workspaces/mine`, `GET/POST /api/workspaces`
+(superadmin), `GET/POST /api/workspaces/current/members`,
+`DELETE /api/workspaces/current/members/{user_id}`. Select a workspace per
+request with the `X-Workspace-Id` header.
+
+**Intelligence** — `GET /api/leads/{id}/scores`,
+`POST /api/leads/{id}/scores/recompute`, `GET /api/leads/{id}/score-history`,
+`GET/POST /api/leads/{id}/signals[/refresh]`,
+`GET/POST /api/leads/{id}/competitors`, `DELETE /api/leads/{id}/competitors/{cid}`,
+`POST /api/leads/{id}/competitors/audit`, `GET/PUT /api/scoring/weights`,
+`GET /api/scoring/summary`
+
+**Profile, lineage, contacts, emails, socials** — `GET /api/leads/{id}/profile`,
+`GET /api/leads/{id}/lineage`, `POST /api/leads/{id}/verify`,
+`GET /api/freshness/summary`, `GET/POST /api/leads/{id}/contacts`,
+`GET /api/contacts`, `PATCH/DELETE /api/contacts/{id}`,
+`POST /api/contacts/{id}/verify`, `GET/POST /api/leads/{id}/emails`,
+`POST /api/leads/{id}/emails/infer`, `POST /api/emails/{id}/verify`,
+`GET /api/email-verification/status`, `GET/POST /api/leads/{id}/socials`,
+`DELETE /api/socials/{id}`
+
+**Audits & opportunities** — `POST/GET /api/leads/{id}/audit`,
+`GET /api/leads/{id}/audits`, `GET /api/audits/{id}`,
+`GET /api/leads/{id}/opportunities`, `POST /api/leads/{id}/opportunities/detect`,
+`PATCH /api/opportunities/{id}`, `GET /api/opportunities`,
+`GET /api/opportunities/summary`, `GET/PUT /api/opportunities/pricing`
+
+**Health** (unauthenticated) — `GET /health`, `/health/live`, `/health/ready`
 
 **Branding** — `GET /api/branding`, `PUT /api/branding`,
 `POST /api/branding/reset`, `POST /api/branding/logo`, `GET /api/branding/theme.css`
@@ -1294,3 +1355,192 @@ updates. The staged calling pattern is what saves money regardless — never fet
 details for a place you already have, never fetch ratings for a lead that already
 looks cold — but verify the exact field groupings against Google's live pricing
 page before scaling up.
+
+
+---
+
+## 20. Features — multi-tenancy: organizations, workspaces, private leads
+
+`app/tenancy.py`, `app/routers/workspaces.py`, `app/db.py` (`lead_scope`,
+`search_scope`, `workspace_context`).
+
+- **Organizations → workspaces → members.** A *workspace* is the tenant
+  boundary: leads, interactions, searches, search cache, coverage, targets,
+  templates, suppression list and approval queue all carry a `workspace_id`, and
+  every query is filtered by it. An *organization* groups workspaces. Member
+  roles: `owner`, `admin`, `member`.
+- **Active workspace per request.** Chosen with the `X-Workspace-Id` header
+  (validated against membership); defaults to the user's lowest-numbered
+  membership. A signed-in user with no workspace gets `403` on `/api/*`.
+- **Visibility.** A user only sees workspaces they belong to. The superadmin can
+  list and create all workspaces but reads a tenant's *data* only by being a
+  member.
+- **Per-user private leads.** A regular user sees only their own leads; workspace
+  admins and superadmins see every lead in the workspace. `owner_user_id = 0`
+  marks system/unowned leads (automation targets, imports), visible to admins
+  only. Two users can each keep their own copy of the same business.
+- **Per-workspace uniqueness.** Place-id, search-cache fingerprint, coverage,
+  targets, template names and suppression entries are unique per workspace (and
+  place-id per owner), so tenants never collide or leak.
+- **Background work** with no request user stays workspace-scoped through
+  `workspace_context()`.
+- **Upgrade path.** Migration creates a *Default Organization / Workspace* and
+  maps existing users in (superadmin→owner, admin→admin, user→member), so
+  behaviour is unchanged until more workspaces are created.
+
+---
+
+## 21. Features — lead intelligence
+
+Added in phases 3–5. Every output carries its evidence and reasons; unknown data
+is reported as unavailable, never guessed.
+
+### 21.1 Data lineage, confidence & freshness (`app/lineage.py`)
+One `field_sources` row per (lead, field) records where the current value came
+from, how much that source is trusted, and when it was observed. Tracked fields
+are weighted (phone 0.25, email 0.25, website 0.15, address 0.10, …) into a
+per-lead **data confidence score**, a **freshness status**, `last_verified_at`
+and `next_verification_at`. Confidence decays as a value ages. `verified_at` is
+set only by an explicit act (a user attesting or a real verification provider);
+scraping or re-observing a field never counts as verification and clears it.
+Existing leads are backfilled honestly as "legacy, unverified" at confidence 0.5.
+
+### 21.2 Decision-maker contacts (`app/people.py`)
+People come only from real sources: typed in by a user, schema.org `Person` data
+on the business's own site, or an enrichment provider. Titles map to a role
+category (Owner, Founder, CEO, Director, Partner, Marketing/Operations/IT
+Manager, Other) with a transparent keyword-based *decision-maker probability*.
+
+### 21.3 Email intelligence (`app/emailintel.py`)
+Each address is classified by type (`PERSONAL` / `GENERIC` / `ROLE`) and status
+(`UNVERIFIED` / `VERIFIED` / `INFERRED` / `INVALID` / `DISPOSABLE`). Addresses can
+be inferred from a name pattern and verified through a provider. **Outreach
+refuses INVALID, DISPOSABLE and INFERRED addresses**, at queue time and again at
+send time.
+
+### 21.4 Social profiles (`app/social.py`)
+Instagram, Facebook, LinkedIn, YouTube and X profiles discovered from links on
+the business's own website, or entered by hand. Follower counts and activity
+stay empty — they need official platform APIs and are never scraped or guessed.
+
+### 21.5 Deep website audit (`app/audit.py`, `app/netsafe.py`)
+A homepage-centric audit: homepage, `robots.txt`, `sitemap.xml`, a bounded sample
+of same-host links, one TLS handshake and optional Google PageSpeed Insights
+(Core Web Vitals). Each check is `PASS` / `WARN` / `FAIL` / `NA` with a weight,
+rolled up into category scores and an overall 0–100. History is kept per lead.
+Runs automatically during enrichment for leads scoring ≥ `DEEP_AUDIT_MIN_SCORE`
+(default 5), or on demand via *Audit now* (rate-limited by `AUDIT_RATE_LIMIT` /
+`AUDIT_RATE_WINDOW`). Every fetch goes through an **SSRF guard** that rejects
+non-public addresses (loopback, private, link-local, cloud metadata) and
+re-validates every redirect hop.
+
+### 21.6 Opportunities (`app/opportunities.py`)
+Audit findings and lead facts become sellable opportunities, each with evidence,
+confidence, a qualitative business impact, a recommended solution and an
+estimated project value range. Leads with no website get a `NO_WEBSITE`
+opportunity. The price table is editable per workspace
+(`GET/PUT /api/opportunities/pricing`); lists and totals via
+`/api/opportunities` and `/api/opportunities/summary`.
+
+### 21.7 Buying-intent signals (`app/signals.py`)
+Evidence-backed signals: website broken / outdated / changed, running ads, no
+booking system, no e-commerce, no online ordering (niche-gated), strong
+reputation with a poor site, competitor advantage. Event signals decay to zero
+over a TTL; state signals persist while true. The **intent score** is
+`100 × (1 − ∏(1 − strength × decay × confidence))`. Signals that would need
+external feeds (new business, hiring, social activity) are listed as
+unavailable, not faked.
+
+### 21.8 Competitor intelligence (`app/competitors.py`)
+Competitors are other leads already in the workspace — same niche, same city or
+within 15 km — or ones you pin by hand. Shows audit scores, ratings and review
+counts side by side, with a factual gap statement only when at least two
+competitors have a completed audit; otherwise "insufficient data". Competitors
+can be audited on demand.
+
+### 21.9 Multi-score model (`app/leadscore.py`)
+Independent 0–100 component scores — lead quality, digital gap, contactability,
+business value, buying intent, decision-maker, outreach fit and data confidence —
+combine into an **Overall Opportunity Score** (weight-normalised mean of the
+*available* components, with editable weights at `/api/scoring/weights`).
+Unavailable components are excluded and lower the stated **confidence**. Tiers:
+`HOT` ≥ 75, `WARM` ≥ 55. The original 0–10 rule score is untouched. Score history
+is stored, and every score carries its reasons. `/api/leads` gains `min_overall`,
+`min_intent`, `tier` filters and sorts by overall score, intent, audit score and
+opportunity value. Scoring runs nightly, after enrichment, or on
+`POST /api/leads/{id}/scores/recompute`.
+
+---
+
+## 22. Features — demo websites
+
+`#/demos` in the web app and *More → Demo websites* on Android. Lists four
+finished sample sites to show prospects in the same niche, each with an **Open**
+action (web) or open/share actions (Android):
+
+| Niche | URL |
+|---|---|
+| Chartered Accountant | https://ca.demo.arthvex.co.in/ |
+| Dry Cleaner | https://cleanthut.arthvex.co.in/ |
+| Computer Service | https://websites.demo.arthvex.co.in/ |
+| Tiffin Service | https://tiffin.arthvex.co.in/ |
+
+The list is a constant (`DEMO_SITES` in `app/static/app.js`, `DemoSitesScreen.kt`
+on Android); edit both to change it.
+
+---
+
+## 23. Features — the Android app
+
+`android/` — a native Kotlin + Jetpack Compose client (Android 7.0 / API 24+) for
+the same FastAPI backend, account and database. Built for working leads from a
+phone: call and WhatsApp without opening the dashboard. Full web ↔ Android
+parity table: `android/FEATURE_PARITY.md`.
+
+- **Screens:** Dashboard, Leads, Follow-ups, and a *More* menu with Search, Map,
+  Pipeline, Coverage, Approve sends, Control (automation), Reports, My Plan,
+  Targets, Templates, Demo websites, and admin-only Users, Plans and Settings.
+- **One-tap Call** (dialer) and **WhatsApp composer** (pre-filled chat, with
+  WhatsApp templates as chips, editable before sending).
+- **Automatic CRM logging** — opening the dialer or a WhatsApp chat logs a `call`
+  / `whatsapp` interaction; the backend moves `NEW` → `CONTACTED`.
+- **Lead detail:** status, follow-up, notes, interaction timeline, message
+  generator and queue, score reasons, website analysis, intelligence panels,
+  re-enrich, delete.
+- **Leads list:** text search, priority/status/city/niche/website filters, sort,
+  paging, bulk status, CSV export through the share sheet, duplicate merge.
+- **Search:** niche/city/area, provider, near-me with radius, coverage preview,
+  live progress with cancel, history.
+- **Admin:** users, plans and orders, full branding (colours, copy, logo/favicon
+  upload), sender identity and suppression list.
+- **Auth:** separate user and admin doors, following the backend's
+  `403 "Administrators sign in at /admin."` redirect; session cookie stored
+  encrypted (Android Keystore AES-GCM); a 401 clears the session.
+- **Production hardening:** server fixed per build type (release →
+  `https://lead.arthvex.co.in`), cleartext off, system CAs only, R8 shrink, no
+  logging, backups disabled. Debug build targets `http://10.0.2.2:8000`.
+- **Limits:** the debug APK is signed with the debug key (needs a release
+  keystore before store distribution); not yet run on a device; the Google-Maps
+  JS map and landing page are web-only.
+
+---
+
+## 24. Features — database resilience & health probes
+
+`app/db.py`, `app/main.py`, `deploy/`, `DEPLOY_DB_HARDENING.md`.
+
+- **Self-healing connection manager.** Thread-local slots with checkout/release,
+  idle sweeping, lost-connection and timeout detection, and a single
+  reconnect-and-retry for statements that never reached the server (read-only
+  queries are retried; writes only when provably unsent). A MySQL restart heals
+  without restarting the app. Tunables: `MYSQL_CONNECT_TIMEOUT` (10),
+  `MYSQL_READ_TIMEOUT` (120), `MYSQL_WRITE_TIMEOUT` (30).
+- **Three health endpoints**, all unauthenticated:
+  `/health/live` (process and event loop only, no DB),
+  `/health/ready` (MySQL reachable **and** all migrations applied; `503` otherwise;
+  response never leaks driver text or credentials), and `/health` (DB ping).
+- **Optional watchdog** `deploy/leadgen-healthwatch.sh` restarts the service only
+  if `/health/ready` fails for 10 consecutive minutes while `/health/live` is OK.
+- **Hardened systemd unit** `deploy/leadgen.production.service`, plus a deployment
+  runbook with backup, deploy, verify, soak-test and rollback steps.
+- **Tests:** `tests/test_db_reconnect.py` exercises the reconnect behaviour.

@@ -35,6 +35,8 @@ SOCIAL_PATTERNS = {
     "linkedin_url": r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/(?:company|in)/[A-Za-z0-9_.\-]+",
 }
 
+from . import contactparse  # noqa: E402
+
 MAILTO_RE = re.compile(r"mailto:([^\"'?>\s]+)", re.I)
 EMAIL_IN_TEXT_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 YEAR_RE = re.compile(r"(?:©|&copy;|copyright)[^0-9]{0,20}((?:19|20)\d{2})", re.I)
@@ -71,17 +73,7 @@ def _find_socials(html: str) -> dict:
 
 
 def _find_emails(html: str) -> list[str]:
-    emails = [m.lower() for m in MAILTO_RE.findall(html)]
-    emails += [m.lower() for m in EMAIL_IN_TEXT_RE.findall(html)]
-    skip = ("sentry.io", "wixpress.com", ".png", ".jpg", ".gif", ".webp", "example.com")
-    seen, out = set(), []
-    for email in emails:
-        email = email.split("?")[0].strip(".,;")
-        if email in seen or any(s in email for s in skip):
-            continue
-        seen.add(email)
-        out.append(email)
-    return out[:5]
+    return contactparse.extract_emails(html)[:5]
 
 
 def check_website(url: str | None) -> dict:
@@ -192,27 +184,67 @@ def check_website(url: str | None) -> dict:
 
 
 def find_contact_email(website_url: str | None) -> list[str]:
-    """Free email discovery: check the site's contact/about pages (Part 9.3)."""
+    """Free email discovery (Part 9.3): home page, then the contact/about pages the
+    site itself links to, then the fixed fallback paths. Own-domain addresses rank first."""
     if not website_url:
         return []
     base = _normalise_url(website_url).rstrip("/")
     found: list[str] = []
-    for path in CONTACT_PATHS:
+
+    def fetch(url: str) -> str:
         try:
-            response = netsafe.safe_get(base + path, breaker="website_check", retries=1,
-                                        timeout=6)
+            response = netsafe.safe_get(url, breaker="website_check", retries=1, timeout=6)
         except Exception:  # noqa: BLE001
-            continue
-        if response.status_code < 400:
-            found += _find_emails(response.text or "")
-        if found:
+            return ""
+        return (response.text or "") if response.status_code < 400 else ""
+
+    home = fetch(base)
+    found += contactparse.extract_emails(home)
+    targets = contactparse.discover_contact_links(home, base + "/") if home else []
+    targets += [base + p for p in CONTACT_PATHS if base + p not in targets]
+    for url in targets[:6]:
+        if len(found) >= 3:
             break
-    seen, out = set(), []
-    for email in found:
-        if email not in seen:
-            seen.add(email)
-            out.append(email)
-    return out
+        found += contactparse.extract_emails(fetch(url))
+    unique = list(dict.fromkeys(found))
+    return contactparse.rank_emails(unique, base)
+
+
+def find_socials_deep(website_url: str | None, have: tuple[str, ...] = ()) -> dict:
+    """Free social-profile discovery beyond the home page: the contact/about pages the site
+    links to (footers and "follow us" blocks often live there). Only looks for columns not
+    already in `have`; stops as soon as every wanted one is found. No search engine involved."""
+    if not website_url:
+        return {}
+    wanted = [f for f in SOCIAL_PATTERNS if f not in have]
+    if not wanted:
+        return {}
+    base = _normalise_url(website_url).rstrip("/")
+
+    def fetch(url: str) -> str:
+        try:
+            response = netsafe.safe_get(url, breaker="website_check", retries=1, timeout=6)
+        except Exception:  # noqa: BLE001
+            return ""
+        return (response.text or "") if response.status_code < 400 else ""
+
+    found: dict = {}
+    home = fetch(base)
+    pages = [home]
+    targets = contactparse.discover_contact_links(home, base + "/") if home else []
+    targets += [base + p for p in CONTACT_PATHS if base + p not in targets]
+    queue = iter(targets[:5])
+    while True:
+        for field, url in _find_socials(pages[-1]).items():
+            if field in wanted and field not in found:
+                found[field] = url
+        if len(found) == len(wanted):
+            break
+        nxt = next(queue, None)
+        if nxt is None:
+            break
+        pages.append(fetch(nxt))
+    return found
 
 
 def to_db_fields(result: dict) -> dict:

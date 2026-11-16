@@ -18,6 +18,7 @@ from . import emailintel, http
 from .config import settings
 from .db import (current_ws, execute, lead_scope, log_automation, log_failure, query,
                  query_one, scalar, utcnow, workspace_context)
+from . import eligibility, pacing
 from .scoring import observation_for, website_issue_for
 
 RESEND_URL = "https://api.resend.com/emails"
@@ -145,14 +146,32 @@ def whatsapp_link(lead: dict, message: str) -> str | None:
 
 # ---------------------------------------------------------- approval queue --
 
+def ensure_email_validated(lead: dict) -> dict:
+    """`leads.email_valid` defaults to 0, which means "never checked" for imported or hand-added
+    leads as much as "failed". Check it now so unchecked-but-fine addresses aren't blocked as
+    invalid. A genuinely bad address stays 0 and is still refused by eligibility."""
+    from .validation import validate_email
+    if lead.get("email") and not lead.get("email_valid"):
+        cleaned, valid, _ = validate_email(lead["email"])
+        if valid:
+            execute("UPDATE leads SET email = ?, email_valid = 1 WHERE id = ? AND workspace_id = ?",
+                    (cleaned, lead["id"], lead.get("workspace_id") or current_ws()))
+            lead["email"], lead["email_valid"] = cleaned, 1
+    return lead
+
+
 def queue_message(lead: dict, template_name: str, step: str, channel: str = "email") -> int | None:
     if lead.get("workspace_id") != current_ws():
         raise PermissionError("lead belongs to a different workspace")
+    if channel == "email":
+        ensure_email_validated(lead)
     rendered = render_template(template_name, lead)
     to_address = lead.get("email") if channel == "email" else lead.get("whatsapp")
     if channel == "email" and (not to_address or is_suppressed(to_address)):
         return None
     if channel == "email" and emailintel.email_blocked(lead["id"], to_address):
+        return None
+    if not eligibility.outreach_eligibility(lead, channel)["eligible"]:
         return None
 
     existing = query_one(
@@ -193,8 +212,11 @@ def generate_followups() -> dict:
     cover the whole workspace."""
     generated, lost = 0, 0
     scope, params = lead_scope()
+    # Leads inside an active campaign follow that campaign's sequence instead - never both.
     leads = query(f"SELECT * FROM leads WHERE {scope} AND status = 'CONTACTED' "
-                  f"AND last_contacted_date IS NOT NULL", tuple(params))
+                  f"AND last_contacted_date IS NOT NULL AND id NOT IN "
+                  f"(SELECT lead_id FROM campaign_enrollments WHERE workspace_id = ? AND status = 'ACTIVE')",
+                  (*params, current_ws()))
 
     for lead in leads:
         days = _days_since(lead["last_contacted_date"])
@@ -252,6 +274,19 @@ def sent_last_hour() -> int:
     return int(scalar(
         "SELECT COUNT(*) FROM approval_queue WHERE status = 'SENT' AND sent_at >= ?", (cutoff,)
     ))
+
+
+def sent_today() -> int:
+    """Emails sent since local midnight (SEND_TIMEZONE), across all workspaces."""
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(settings.send_timezone)
+    except Exception:  # noqa: BLE001
+        tz = timezone.utc
+    midnight = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = midnight.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return int(scalar("SELECT COUNT(*) FROM approval_queue WHERE status = 'SENT' AND sent_at >= ?",
+                      (cutoff,)))
 
 
 def _footer() -> str:
@@ -347,10 +382,14 @@ def send_approved(limit: int | None = None, workspace_id: int | None = None,
     inside its own workspace so suppression and logging use that tenant's data.
     `owner_user_id` narrows further to one person's leads (a regular user's
     manual send); None leaves every owner in scope (scheduler/admin)."""
-    budget = settings.max_emails_per_hour - sent_last_hour()
-    if budget <= 0:
-        return {"sent": 0, "failed": 0, "skipped": 0,
-                "note": f"hourly cap of {settings.max_emails_per_hour} already used"}
+    decision = pacing.send_decision(
+        datetime.now(timezone.utc), sent_last_hour(), sent_today(),
+        hourly_cap=settings.max_emails_per_hour, daily_cap=settings.max_emails_per_day,
+        quiet_start=settings.send_quiet_start, quiet_end=settings.send_quiet_end,
+        tz_name=settings.send_timezone, weekdays_only=settings.send_weekdays_only)
+    if not decision["allowed"]:
+        return {"sent": 0, "failed": 0, "skipped": 0, "note": decision["reason"]}
+    budget = decision["budget"]
     if limit:
         budget = min(budget, limit)
 
@@ -419,6 +458,8 @@ def _send_row(row: dict) -> str:
             row["lead_id"], "email", row["subject"], row["body"],
             outcome="dry-run" if result.get("dry_run") else "sent",
         )
+        from . import webhooks
+        webhooks.emit("message.sent", {"lead_id": row["lead_id"], "queue_id": row["id"]})
         return "sent"
     execute(
         "UPDATE approval_queue SET status = 'FAILED', error_message = ? "

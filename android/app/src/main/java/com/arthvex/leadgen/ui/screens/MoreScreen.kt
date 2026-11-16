@@ -47,6 +47,9 @@ fun MoreScreen(
                     MoreItem("search", "Search", "Find new businesses", Icons.Default.Search, InfoColor),
                     MoreItem("map", "Map", "Leads by location", Icons.Default.Place, Color(0xFF0891B2)),
                     MoreItem("pipeline", "Pipeline", "Deals by stage", Icons.Default.ViewKanban, PurpleColor),
+                    MoreItem("tasks", "Tasks", "Follow-ups and to-dos", Icons.Default.CheckCircle, GoodColor),
+                    MoreItem("meetings", "Meetings", "Calls booked with leads", Icons.Default.Event, InfoColor),
+                    MoreItem("proposals", "Proposals", "Quotes and won revenue", Icons.Default.Description, WarmColor),
                     MoreItem("coverage", "Coverage", "What you've searched", Icons.Default.Public, GoodColor),
                     MoreItem("reports", "Reports", "Weekly performance", Icons.Default.BarChart, WarmColor)
                 )

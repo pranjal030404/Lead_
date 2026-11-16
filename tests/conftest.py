@@ -31,6 +31,9 @@ os.environ.setdefault("PROVIDER", "mock")
 # Tests never make the multi-request audit implicitly; audit tests opt in.
 os.environ.setdefault("DEEP_AUDIT_ENABLED", "false")
 os.environ.setdefault("DRY_RUN", "true")
+# Quiet hours are real behaviour (tests/test_pacing); other tests must not depend on the wall clock.
+os.environ.setdefault("SEND_QUIET_START", "0")
+os.environ.setdefault("SEND_QUIET_END", "0")
 os.environ.setdefault("ADMIN_USER", "admin")
 os.environ.setdefault("ADMIN_PASSWORD", "pytest-admin")
 os.environ.setdefault("SECRET_KEY", "pytest-secret")
@@ -51,8 +54,8 @@ TABLES = [
     "scheduler_lease", "alerts_sent", "users", "plans", "user_subscriptions",
     "schema_migrations", "field_sources", "contacts", "email_addresses",
     "social_profiles", "website_audits", "lead_opportunities", "lead_scores", "lead_score_history",
-    "lead_signals", "lead_competitors",
-    "workspace_members", "workspaces", "organizations",
+    "lead_signals", "lead_competitors", "api_tokens", "rating_snapshots",
+    "workspace_members", "workspaces", "organizations", "password_resets", "segments", "job_queue", "proposals", "meetings", "campaign_enrollments", "campaign_steps", "campaigns", "audit_log", "tasks", "webhooks", "webhook_deliveries",
 ]
 
 

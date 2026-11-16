@@ -1,0 +1,20 @@
+{
+ "meetings": [
+  {
+   "id": 2,
+   "workspace_id": 1,
+   "lead_id": 23,
+   "owner_user_id": 1,
+   "title": "Intro call",
+   "starts_at": "2026-11-16T19:13:01+00:00",
+   "duration_min": 30,
+   "location": "https://meet.example/x",
+   "notes": "",
+   "status": "SCHEDULED",
+   "created_at": "2026-11-14T19:13:01+00:00",
+   "updated_at": "2026-11-14T19:13:01+00:00",
+   "business_name": "Blue Ridge Dentist Hub"
+  }
+ ],
+ "count": 1
+}

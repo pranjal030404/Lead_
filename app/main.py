@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -10,20 +11,24 @@ from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
                                Response)
 from fastapi.staticfiles import StaticFiles
 
-from . import branding
+from . import apitokens, auditlog, branding, permissions
 from .automation import start_scheduler, stop_scheduler
 from .config import settings
 from .db import ping as db_ping
 from .db import (MIGRATIONS, NoWorkspace, _ws_var, init_db, pool_stats, query, scalar,
                  reset_current_user, set_current_user)
-from .routers import (audits, auth, automation, intelligence, branding as branding_router, leads, outreach,
+from . import mcp as mcp_server
+from .routers import (startups as startups_router, campaigns as campaigns_router, crm, meetings as meetings_router, pipeline as pipeline_router, proposals as proposals_router, segments as segments_router, fit as fit_router, replies as replies_router, discovery, audits, auth, automation, intelligence, branding as branding_router, leads, outreach,
                       plans, profile, search, stats, users, workspaces)
 from .tenancy import TenancyError, resolve_workspace
 from .security import (SESSION_COOKIE, client_ip, load_user, rate_limit, verify_token)
 
 PUBLIC_PATHS = {"/landing", "/login", "/admin", "/health", "/health/live", "/health/ready", "/api/auth/login",
-                "/api/auth/admin/login", "/favicon.ico"}
-PUBLIC_PREFIXES = ("/static/", "/api/uploads/", "/api/branding/theme.css")
+                "/api/auth/admin/login", "/api/auth/password-reset/request",
+                "/api/auth/password-reset/confirm", "/favicon.ico"}
+# Self-service account actions a read-only viewer may still do.
+VIEWER_WRITABLE = ("/api/auth/logout", "/api/auth/mfa", "/api/auth/password-reset")
+PUBLIC_PREFIXES = ("/static/", "/api/uploads/", "/api/branding/theme.css", "/p/")
 
 
 @asynccontextmanager
@@ -69,15 +74,33 @@ app = FastAPI(
 )
 
 
+def _cross_site_write(request: Request) -> bool:
+    """CSRF guard for the cookie session: a state-changing request whose Origin header names a
+    different host than the one it was sent to is refused. Browsers always send Origin on
+    cross-origin writes; requests without it (curl, scripts, bearer tokens) are not a CSRF
+    vector, so they pass."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return False
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    host = request.headers.get("x-forwarded-host") if settings.trust_proxy else None
+    host = host or request.headers.get("host", "")
+    return urlparse(origin).netloc.lower() != host.lower()
+
+
 @app.middleware("http")
 async def auth_and_rate_limit(request: Request, call_next):
     path = request.url.path
 
-    if path.startswith("/api/"):
+    if path.startswith("/api/") or path == "/mcp":
         client = client_ip(request)
         if not rate_limit(f"api:{client}", limit=settings.api_rate_limit,
                           window_seconds=settings.api_rate_window):
             return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+
+    if _cross_site_write(request):
+        return JSONResponse({"detail": "Cross-site request blocked"}, status_code=403)
 
     if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
         response = await call_next(request)
@@ -90,13 +113,23 @@ async def auth_and_rate_limit(request: Request, call_next):
             response.headers["Cache-Control"] = "no-cache"
         return response
 
-    user = verify_token(request.cookies.get(SESSION_COOKIE))
-    if user:
-        # Re-read the row so a deactivated or deleted account is locked out on
-        # the very next request, not whenever the token happened to expire.
-        user = load_user(user)
+    bearer = request.headers.get("authorization", "")
+    token_ws = None
+    if bearer[:11].lower() == "bearer lgk_":
+        # Read-only API token (Claude / scripts): GET on an allow-list only, acts as its owner.
+        if not apitokens.allowed(request.method, path):
+            return JSONResponse({"detail": "API tokens are read-only and limited to lead data"}, status_code=403)
+        found = apitokens.authenticate(bearer[7:].strip())
+        user = load_user(found["username"]) if found else None
+        token_ws = found["workspace_id"] if found else None
+    else:
+        user = verify_token(request.cookies.get(SESSION_COOKIE))
+        if user:
+            # Re-read the row so a deactivated or deleted account is locked out on
+            # the very next request, not whenever the token happened to expire.
+            user = load_user(user)
     if not user:
-        if path.startswith("/api/"):
+        if path.startswith("/api/") or path == "/mcp":
             return JSONResponse({"detail": "Not authenticated"}, status_code=401)
         # The marketing landing page is the public front door; every other
         # page funnels to the sign-in form.
@@ -105,16 +138,25 @@ async def auth_and_rate_limit(request: Request, call_next):
     # Tenant scope. A user with no active workspace gets no scope at all, so any
     # tenant-scoped query fails with NoWorkspace (-> 403) instead of seeing data.
     try:
-        membership = resolve_workspace(user["id"], request.headers.get("x-workspace-id"))
+        membership = resolve_workspace(user["id"], str(token_ws) if token_ws else request.headers.get("x-workspace-id"))
     except TenancyError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=403)
+    if user.get("role") == "viewer" and request.method not in ("GET", "HEAD", "OPTIONS") \
+            and not path.startswith(VIEWER_WRITABLE):
+        return JSONResponse({"detail": "This account is read-only"}, status_code=403)
+    feature = permissions.blocked_feature(user, path)
+    if feature:
+        return JSONResponse({"detail": f"You don't have access to {permissions.FEATURES[feature][0]}. "
+                                       "Ask an administrator."}, status_code=403)
     user["workspace_id"] = membership["workspace_id"] if membership else None
     user["workspace_role"] = membership["member_role"] if membership else None
     request.state.user = user
+    request.state.auth = "token" if token_ws else "cookie"
     wtoken = _ws_var.set(user["workspace_id"])
     utoken = set_current_user(user)
     try:
         response = await call_next(request)
+        auditlog.record(user, request.method, path, response.status_code, client_ip(request))
     finally:
         _ws_var.reset(wtoken)
         reset_current_user(utoken)
@@ -169,6 +211,18 @@ app.include_router(workspaces.router)
 app.include_router(profile.router)
 app.include_router(audits.router)
 app.include_router(intelligence.router)
+app.include_router(discovery.router)
+app.include_router(replies_router.router)
+app.include_router(fit_router.router)
+app.include_router(crm.router)
+app.include_router(campaigns_router.router)
+app.include_router(pipeline_router.router)
+app.include_router(meetings_router.router)
+app.include_router(proposals_router.router)
+app.include_router(proposals_router.public)
+app.include_router(segments_router.router)
+app.include_router(startups_router.router)
+app.include_router(mcp_server.router)
 
 app.mount("/static", StaticFiles(directory=settings.static_dir), name="static")
 
@@ -247,6 +301,11 @@ def admin_login_page(request: Request):
             status_code=302,
         )
     return Response(branding.render_page("admin.html"), media_type="text/html")
+
+
+@app.get("/startups")
+def startups_page():
+    return RedirectResponse("/#/startups", status_code=302)
 
 
 @app.get("/landing")
