@@ -136,6 +136,12 @@ class Settings:
     opencorporates_api_key = _str("OPENCORPORATES_API_KEY")
     data_gov_in_api_key = _str("DATA_GOV_IN_API_KEY")             # India MCA registry, free
     data_gov_in_mca_resources = _str("DATA_GOV_IN_MCA_RESOURCES")  # comma-separated resource ids
+    # optional free/open-source LLM for the web startup finder (any OpenAI-compatible endpoint:
+    # Ollama http://localhost:11434/v1, Groq, OpenRouter free models, llama.cpp, vLLM ...)
+    llm_base_url = _str("LLM_BASE_URL")
+    llm_model = _str("LLM_MODEL", "llama3.1")
+    llm_api_key = _str("LLM_API_KEY")
+    searxng_url = _str("SEARXNG_URL")        # optional self-hosted SearXNG for web search
     adzuna_app_id = _str("ADZUNA_APP_ID")                      # job-board hiring signal
     adzuna_app_key = _str("ADZUNA_APP_KEY")
     meta_ad_library_token = _str("META_AD_LIBRARY_TOKEN")

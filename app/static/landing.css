@@ -43,7 +43,7 @@ h2 { font-size: clamp(26px, 4vw, 38px); letter-spacing: -0.8px; line-height: 1.1
   letter-spacing: 2px; color: var(--accent); margin-bottom: 14px; }
 .section-sub { color: var(--text-dim); max-width: 560px; margin-top: 14px; font-size: 15.5px; }
 
-.wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 clamp(16px, 4vw, 24px); }
 
 /* ------------------------------------------------------------ buttons --- */
 .btn {
@@ -84,7 +84,17 @@ h2 { font-size: clamp(26px, 4vw, 38px); letter-spacing: -0.8px; line-height: 1.1
   display: grid; place-items: center; box-shadow: 0 4px 16px rgb(var(--accent-rgb) / 0.4); }
 .wordmark { font-weight: 700; font-size: 16px; letter-spacing: -0.2px; }
 .wordmark span { color: var(--text-faint); font-weight: 500; }
-@media (max-width: 860px) { .nav-links { display: none; } }
+.nav-toggle { display: none; background: var(--bg-hover); color: var(--text); border: 1px solid var(--line);
+  width: 40px; height: 40px; border-radius: 10px; cursor: pointer; place-items: center; }
+@media (max-width: 860px) {
+  .nav-toggle { display: grid; }
+  .nav.menu-open { background: rgba(11, 11, 13, 0.96); backdrop-filter: blur(14px); }
+  .nav-links { display: none; position: absolute; top: 68px; left: 0; right: 0; margin: 0;
+    flex-direction: column; gap: 0; padding: 8px 24px 16px;
+    background: rgba(11, 11, 13, 0.97); border-bottom: 1px solid var(--line-soft); }
+  .nav-links.open { display: flex; }
+  .nav-links a { padding: 14px 0; font-size: 16px; border-bottom: 1px solid var(--line-soft); }
+}
 
 /* ================================================================ hero --- */
 .hero { position: relative; padding: 170px 0 90px; overflow: hidden; }
@@ -411,3 +421,12 @@ h2 { font-size: clamp(26px, 4vw, 38px); letter-spacing: -0.8px; line-height: 1.1
   html { scroll-behavior: auto; }
   .js .reveal { opacity: 1; transform: none; }
 }
+
+/* Fluid hero type and safe media on every screen. */
+img, video { max-width: 100%; }
+.hero h1 { font-size: clamp(32px, 6.4vw, 66px); overflow-wrap: break-word; }
+@media (max-width: 380px) { .nav-cta .btn.primary { display: none; } .nav-links { padding-inline: 16px; } }
+@media (min-width: 1920px) { html { zoom: 1.25; } }
+@media (min-width: 2560px) { html { zoom: 1.6; } }
+@media (min-width: 3200px) { html { zoom: 2; } }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }

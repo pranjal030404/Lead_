@@ -32,7 +32,7 @@ def list_startups(country: str = "", q: str = "", closed: bool = False,
     scope, params = lead_scope()
     sql = (f"SELECT id, business_name, owner_name, address, city, state, pincode, country, website_url, "
            f"email, phone, status, business_status, lead_score, source, place_id, updated_at FROM leads "
-           f"WHERE {scope} AND (place_id LIKE 'ch:%%' OR place_id LIKE 'mca:%%')")
+           f"WHERE {scope} AND (place_id LIKE 'ch:%%' OR place_id LIKE 'mca:%%' OR place_id LIKE 'web:%%')")
     if country:
         sql += " AND country = ?"; params.append(country)
     if q:
@@ -43,8 +43,8 @@ def list_startups(country: str = "", q: str = "", closed: bool = False,
     sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
     rows = query(sql, (*params, limit, offset))
     for r in rows:
-        r["registry"] = "uk" if r["place_id"].startswith("ch:") else "india"
-        r["registration_number"] = r["place_id"].split(":", 1)[1]
+        r["registry"] = {"ch": "uk", "mca": "india"}.get(r["place_id"].split(":", 1)[0], "web")
+        r["registration_number"] = r["place_id"].split(":", 1)[1] if r["registry"] != "web" else "web"
         r["registered_on"] = _registered(r["source"])
     return {"count": len(rows), "startups": rows}
 
@@ -68,9 +68,9 @@ def find(payload: FindPayload, request: Request, _: dict = WRITE):
         raise HTTPException(400, "country must be uk, india or both")
     runs = []
     if c in ("uk", "both"):
-        runs.append(("uk_all", "United Kingdom"))
+        runs.append(("web_ai", "United Kingdom"))
     if c in ("india", "both"):
-        runs.append(("india_all", "India"))
+        runs.append(("web_ai", "India"))
     ids = [start_search(niche=payload.niche.strip() or "tech", city=payload.city.strip(), area="",
                         country=country, max_results=max_results_for(user, payload.max_results),
                         provider_name=prov, enrich=True, triggered_by="manual",

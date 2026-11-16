@@ -21,7 +21,7 @@
         <span class="logo-mark">{{LOGO_HTML_18}}</span>
         <span class="wordmark">{{WORDMARK_HTML}}</span>
       </a>
-      <nav class="nav-links">
+      <nav class="nav-links" id="navLinks" aria-label="Sections">
         <a href="#features">Features</a>
         <a href="#workflow">How it works</a>
         <a href="#selfhosted">Self-hosted</a>
@@ -30,6 +30,9 @@
       <div class="nav-cta">
         <a class="btn sm" href="/login">Sign in</a>
         <a class="btn sm primary" href="/login">Open workspace</a>
+        <button class="nav-toggle" id="navToggle" type="button" aria-label="Menu" aria-controls="navLinks" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+        </button>
       </div>
     </div>
   </header>
@@ -268,6 +271,14 @@
     const onScroll = () => nav.classList.toggle('scrolled', window.scrollY > 12);
     window.addEventListener('scroll', onScroll, { passive: true });
     onScroll();
+
+    // Mobile menu for the section links.
+    const navToggle = document.getElementById('navToggle'), navLinks = document.getElementById('navLinks');
+    const setMenu = (open) => { navLinks.classList.toggle('open', open); navToggle.setAttribute('aria-expanded', String(open)); nav.classList.toggle('menu-open', open); };
+    navToggle.addEventListener('click', () => setMenu(!navLinks.classList.contains('open')));
+    navLinks.addEventListener('click', (e) => { if (e.target.closest('a')) setMenu(false); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMenu(false); });
+    window.addEventListener('resize', () => { if (innerWidth > 860) setMenu(false); });
 
     // Scroll-reveal: elements with .reveal fade up as they enter the viewport.
     // Anything already on screen when the observer attaches shows immediately,

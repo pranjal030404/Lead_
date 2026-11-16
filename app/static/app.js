@@ -1701,15 +1701,13 @@ routes['/templates'] = async () => {
 routes['/startups'] = async () => {
   view.innerHTML = `
     <div class="page-head"><div><h1>New startups</h1>
-      <div class="subtitle">Newly registered companies and their owners - find, review, check and update</div></div></div>
+      <div class="subtitle">New startups found on the open web (AI search) - find, review and update</div></div></div>
     <div class="card" style="margin-bottom:12px">
       <div class="flex" style="gap:8px;flex-wrap:wrap">
         <input id="su-niche" value="tech" placeholder="niche words (tech, software, cafe)">
         <input id="su-city" placeholder="city (optional)">
         <select id="su-country"><option value="both">UK + India</option><option value="uk">UK</option><option value="india">India</option></select>
         <button id="su-find">Find new startups</button>
-        <button id="su-up" class="sm" type="button">Upload India MCA CSV</button>
-        <input type="file" id="su-file" accept=".csv" style="display:none">
       </div>
     </div>
     <div class="card">
@@ -1728,7 +1726,7 @@ routes['/startups'] = async () => {
     </div>`;
   const $ = (id) => document.getElementById(id);
   const say = (t) => { $('su-msg').textContent = t; };
-  async function load() {
+  async function load(keep) {
     const p = new URLSearchParams({ q: $('su-q').value, country: $('su-lc').value, closed: $('su-closed').checked });
     try {
       const d = await api('/api/startups?' + p);
@@ -1742,7 +1740,7 @@ routes['/startups'] = async () => {
           <td>${esc(s.business_status === 'CLOSED_PERMANENTLY' ? 'closed' : s.status)}</td>
           <td>${s.registry === 'uk' ? `<button class="sm" data-owners="${s.id}">Get owners</button>` : ''}</td>
         </tr>`).join('');
-      say(`${d.count} compan${d.count === 1 ? 'y' : 'ies'}`);
+      if (!keep) say(`${d.count} compan${d.count === 1 ? 'y' : 'ies'}`);
       $('su-rows').querySelectorAll('[data-owners]').forEach((b) => b.onclick = async () => {
         try {
           const r = await post(`/api/startups/${b.dataset.owners}/owners`);
@@ -1764,37 +1762,27 @@ routes['/startups'] = async () => {
   $('su-q').onkeydown = (e) => { if (e.key === 'Enter') load(); };
   $('su-dry').onclick = () => check(true);
   $('su-apply').onclick = () => check(false);
-  $('su-up').onclick = () => $('su-file').click();
-  $('su-file').onchange = async (e) => {
-    const f = e.target.files[0]; if (!f) return;
-    const fd = new FormData(); fd.append('file', f);
-    say('Uploading ' + f.name + '...');
-    try {
-      const res = await fetch('/api/startups/india-csv', { method: 'POST', body: fd, credentials: 'same-origin' });
-      const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j.detail || res.statusText);
-      say(`Uploaded ${j.saved}. Now click "Find new startups".`);
-    } catch (err) { say('Upload failed: ' + err.message); }
-    e.target.value = '';
-  };
   $('su-find').onclick = async () => {
     try {
       const r = await post('/api/startups/find', { niche: $('su-niche').value, city: $('su-city').value, country: $('su-country').value });
       const ids = r.search_ids || [];
-      say('Searching registries...');
-      const errs = [];
-      for (let i = 0; i < 60; i++) {
-        await new Promise((res) => setTimeout(res, 3000));
+      const names = { uk_all: 'UK', india_all: 'India' };
+      const FIN = ['COMPLETED', 'FAILED', 'STOPPED_QUOTA', 'CANCELLED'];
+      const started = Date.now();
+      let sts = [];
+      while (Date.now() - started < 10 * 60 * 1000) {
+        sts = await Promise.all(ids.map((id) => api(`/api/search/${id}/status`).catch(() => null)));
         if (!document.getElementById('su-find')) return;   // navigated away
-        const sts = await Promise.all(ids.map((id) => api(`/api/search/${id}/status`).catch(() => null)));
-        const done = sts.every((x) => x && ['COMPLETED', 'FAILED', 'STOPPED_QUOTA', 'CANCELLED'].includes((x.search || x).status || x.status));
-        if (done) {
-          sts.forEach((x) => { const row = (x && (x.search || x)) || {}; if (row.error_message || row.error) errs.push(row.error_message || row.error); });
-          break;
-        }
+        say('Searching... ' + sts.map((x, i) => x ? `[${x.country || i + 1}] ${x.status}: ${x.progress || ''}` : '[?] no status').join('  '));
+        await load(true);                                  // show leads as they arrive
+        if (sts.every((x) => x && FIN.includes(x.status))) break;
+        await new Promise((res) => setTimeout(res, 3000));
       }
-      await load();
-      if (errs.length) say('Search problem: ' + errs.join(' | '));
+      await load(true);
+      const errs = sts.filter((x) => x && x.error_message).map((x) => `${x.country || ''}: ${x.error_message}`);
+      const found = sts.reduce((n, x) => n + ((x && x.new_leads) || 0), 0);
+      say(errs.length ? 'Search problem: ' + errs.join(' | ')
+          : (sts.every((x) => x && FIN.includes(x.status)) ? `Done - ${found} new companies added.` : 'Still running in the background - click Reload later.'));
     } catch (e) { say(e.message); }
   };
   load();

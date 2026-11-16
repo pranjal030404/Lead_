@@ -15,6 +15,7 @@ from .opencorporates import OpenCorporatesProvider
 from .india_mca import IndiaMcaProvider
 from .india_csv import IndiaCsvProvider
 from .uk_bulk import UkBulkProvider
+from .web_ai import WebAiProvider
 from .combined import CombinedProvider
 from .osm import OverpassProvider
 
@@ -31,6 +32,7 @@ _REGISTRY: dict[str, type[Provider]] = {
     "india_mca": IndiaMcaProvider,
     "india_csv": IndiaCsvProvider,
     "uk_bulk": UkBulkProvider,
+    "web_ai": WebAiProvider,
 }
 
 _KEYS = {"google": "google_api_key", "foursquare": "foursquare_api_key",
@@ -96,6 +98,7 @@ def available_providers() -> list[dict]:
          "ready": bool(settings.data_gov_in_api_key and settings.data_gov_in_mca_resources)},
         {"key": "uk_bulk", "label": "UK new companies - bulk file (free, no key, big first download)", "ready": True},
         {"key": "india_csv", "label": "India new companies - MCA CSVs in data/india_mca (free, no key)", "ready": True},
+        {"key": "web_ai", "label": "Web AI - new startups from the open web (free, no key)", "ready": True},
         {"key": "uk_all", "label": "UK new companies - API key + free bulk file together", "ready": True},
         {"key": "india_all", "label": "India new companies - data.gov.in key + MCA CSVs together", "ready": True},
         {"key": "mock", "label": "Mock data (offline demo)", "ready": True},
