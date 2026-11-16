@@ -1708,6 +1708,8 @@ routes['/startups'] = async () => {
         <input id="su-city" placeholder="city (optional)">
         <select id="su-country"><option value="both">UK + India</option><option value="uk">UK</option><option value="india">India</option></select>
         <button id="su-find">Find new startups</button>
+        <button id="su-up" class="sm" type="button">Upload India MCA CSV</button>
+        <input type="file" id="su-file" accept=".csv" style="display:none">
       </div>
     </div>
     <div class="card">
@@ -1762,6 +1764,19 @@ routes['/startups'] = async () => {
   $('su-q').onkeydown = (e) => { if (e.key === 'Enter') load(); };
   $('su-dry').onclick = () => check(true);
   $('su-apply').onclick = () => check(false);
+  $('su-up').onclick = () => $('su-file').click();
+  $('su-file').onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    const fd = new FormData(); fd.append('file', f);
+    say('Uploading ' + f.name + '...');
+    try {
+      const res = await fetch('/api/startups/india-csv', { method: 'POST', body: fd, credentials: 'same-origin' });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.detail || res.statusText);
+      say(`Uploaded ${j.saved}. Now click "Find new startups".`);
+    } catch (err) { say('Upload failed: ' + err.message); }
+    e.target.value = '';
+  };
   $('su-find').onclick = async () => {
     try {
       const r = await post('/api/startups/find', { niche: $('su-niche').value, city: $('su-city').value, country: $('su-country').value });
