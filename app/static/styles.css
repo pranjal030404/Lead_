@@ -41,7 +41,9 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+img, video, canvas, iframe { max-width: 100%; }
+img, video { height: auto; }
 
 body {
   font-family: var(--font);
@@ -49,6 +51,8 @@ body {
   color: var(--text);
   font-size: 14px;
   line-height: 1.55;
+  overflow-wrap: break-word;
+  min-width: 0;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -88,14 +92,14 @@ a { color: var(--accent); }
 @keyframes growBar      { from { width: 0; } }
 
 /* ============================================================= layout --- */
-.shell { display: grid; grid-template-columns: var(--sidebar-w) 1fr; min-height: 100vh; }
+.shell { display: grid; grid-template-columns: var(--sidebar-w) minmax(0, 1fr); min-height: 100vh; min-height: 100dvh; }
 
 .sidebar {
   background: linear-gradient(180deg, rgba(19, 19, 22, 0.92), rgba(11, 11, 13, 0.96));
   backdrop-filter: blur(14px);
   border-right: 1px solid var(--line-soft);
   padding: 22px 14px 18px;
-  position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  position: sticky; top: 0; height: 100vh; height: 100dvh; overflow-y: auto;
   display: flex; flex-direction: column;
 }
 
@@ -569,17 +573,22 @@ ul.reasons li::before { content: "✓"; color: var(--ok); }
 .gm-style-iw-close-button:hover { background: transparent !important; color: var(--text) !important; }
 
 /* ========================================================== responsive --- */
-@media (max-width: 900px) {
-  .shell { grid-template-columns: 1fr; }
+@media (max-width: 1023px) {          /* tablets and below: sidebar becomes a slide-in drawer */
+  .shell { grid-template-columns: minmax(0, 1fr); }
   .topbar { display: flex; }
   .sidebar {
-    position: fixed; z-index: 50; width: min(280px, 84vw);
-    transform: translateX(-105%);
-    transition: transform 0.3s var(--ease);
+    position: fixed; z-index: 50; width: min(300px, 86vw); height: 100dvh;
+    transform: translateX(-105%); visibility: hidden;
+    transition: transform 0.3s var(--ease), visibility 0s linear 0.3s;
     box-shadow: 20px 0 60px rgba(6, 5, 3, 0.6);
   }
-  .shell.nav-open .sidebar { transform: translateX(0); }
-  .main { padding: 22px 18px 60px; }
+  .shell.nav-open .sidebar { transform: translateX(0); visibility: visible; transition-delay: 0s; }
+  .nav-backdrop { position: fixed; inset: 0; z-index: 45; background: rgba(6, 6, 8, 0.6);
+    backdrop-filter: blur(3px); animation: fadeIn 0.25s ease both; }
+  body.nav-locked { overflow: hidden; }
+  .main { padding: 22px clamp(14px, 3vw, 24px) 60px; }
+}
+@media (max-width: 900px) {
   .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
 }
 
@@ -623,3 +632,128 @@ ul.reasons li::before { content: "✓"; color: var(--ok); }
   }
   html { scroll-behavior: auto; }
 }
+
+
+/* =========================================================================
+   RESPONSIVE SYSTEM (one codebase, every screen)
+   Breakpoints (content-driven, mobile-first additions on the desktop base):
+     <=1023  tablet & below  : sidebar -> drawer, topbar, 2-col grids
+     <=900   small tablet    : 1-col grids
+     <=640   phone           : stacked forms, card-style tables, bigger tap targets
+     <=380   small phone     : 1-col stats, tighter type
+     >=1920  full HD / TV    : whole UI scales up (zoom), 2560 / 3840 scale further
+   ========================================================================= */
+
+/* Fluid type/space scale on every screen. */
+h1 { font-size: clamp(20px, 1.2vw + 14px, 28px); }
+.main { padding-inline: clamp(12px, 2.4vw, 34px); }
+.card { padding: clamp(12px, 1.4vw, 18px); }
+.stat .value { font-size: clamp(22px, 1.4vw + 14px, 30px); }
+.grid { gap: clamp(10px, 1.2vw, 16px); }
+
+/* Auto-fit grids for the 4/5-column stat rows so they never squash. */
+.grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.grid.cols-5 { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.grid.cols-3 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); }
+.grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); }
+
+/* Flex helpers wrap instead of overflowing. */
+.flex { flex-wrap: wrap; }
+.flex > input:not([style*="width"]), .flex > select:not([style*="width"]) { flex: 1 1 150px; min-width: 0; width: auto; }
+.flex > input, .flex > select { min-width: 0; }
+
+/* Inline fixed widths set in JS (filters etc.) may never exceed their container. */
+#view [style*="width:"], .drawer [style*="width:"] { max-width: 100%; }
+#view input, #view select, #view textarea { min-width: 0; }
+
+/* Tables: scroll inside their wrapper, never the page. */
+.table-wrap { max-width: 100%; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
+.card > table, .card > div > table { max-width: 100%; }
+.card { min-width: 0; }
+pre, code { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Keyboard focus is always visible (also drives TV / remote navigation). */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgb(var(--accent-rgb) / 0.25); }
+.nav a:focus-visible { background: var(--bg-hover); color: var(--text); }
+.skip-link { position: absolute; left: -9999px; top: 8px; z-index: 100; background: var(--accent);
+  color: var(--on-accent); padding: 8px 14px; border-radius: 8px; }
+.skip-link:focus { left: 8px; }
+
+/* Touch devices: 44px minimum targets, no sticky hover lift. */
+@media (pointer: coarse) {
+  button, .btn, .nav a, .tabs button { min-height: 44px; }
+  button.sm, .btn.sm { min-height: 38px; }
+  input, select { min-height: 44px; font-size: 16px; }   /* 16px stops iOS zoom-on-focus */
+  button:hover:not(:disabled), .btn:hover, .stat:hover { transform: none; }
+}
+
+/* Short landscape phones: the topbar and drawer must not eat the screen. */
+@media (max-height: 480px) and (orientation: landscape) {
+  .topbar { padding-block: 6px; }
+  .sidebar { padding-top: 12px; }
+  .drawer { padding-top: 14px; }
+}
+
+/* ---- tablet ---- */
+@media (max-width: 1023px) {
+  .page-head > * { min-width: 0; }
+  .topbar { padding-inline: clamp(12px, 3vw, 24px); }
+  .login-wrap { grid-template-columns: 1fr; }
+  .login-hero { display: none; }
+}
+
+/* ---- phone ---- */
+@media (max-width: 640px) {
+  body { font-size: 14px; }
+  .page-head { align-items: flex-start; }
+  .page-head > .flex, .page-head > div:last-child:not(:first-child) { width: 100%; }
+  .flex > input:not([style*="width"]), .flex > select:not([style*="width"]) { flex: 1 1 100%; }
+  .page-head > .flex > button, .page-head > .flex > .btn { flex: 1 1 auto; justify-content: center; }
+  .row > * { min-width: 100%; }
+  .drawer { width: 100%; max-width: 100vw; padding: 18px 14px 56px; }
+  .drawer-head h2 { font-size: 17px; }
+  #toast { left: 12px; right: 12px; transform: none; max-width: none; }
+  th, td { padding: 9px 10px; }
+  .banner { padding-inline: 14px; }
+  .switch { flex-wrap: wrap; }
+  .pipeline, .board, .kanban { scroll-snap-type: x proximity; }
+}
+
+/* ---- small phone ---- */
+@media (max-width: 380px) {
+  .grid.cols-4, .grid.cols-5 { grid-template-columns: 1fr; }
+  h1 { font-size: 19px; }
+  .brand { font-size: 14px; }
+  .topbar .brand { min-width: 0; }
+  .topbar .brand > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tabs button { padding: 8px 10px; }
+}
+
+/* ---- large monitors, 4K and TV: scale the whole UI, keep balanced widths ---- */
+@media (min-width: 1440px) { .main { max-width: min(1500px, 100%); } }
+.main { width: 100%; min-width: 0; }
+@media (min-width: 1920px) {
+  html { zoom: 1.25; }
+  .main { max-width: 1560px; }
+}
+@media (min-width: 2560px) { html { zoom: 1.6; } }
+@media (min-width: 3200px) { html { zoom: 2; } }
+
+/* ---- TV / remote: bigger targets and an unmistakable focus ring ---- */
+body.tv button, body.tv .btn, body.tv .nav a, body.tv input, body.tv select { min-height: 48px; }
+body.tv .nav a { font-size: 15px; margin-block: 2px; }
+body.tv :focus-visible { outline-width: 3px; outline-offset: 3px;
+  box-shadow: 0 0 0 7px rgb(var(--accent-rgb) / 0.35); }
+body.tv tbody tr:focus-visible { background: rgb(var(--accent-rgb) / 0.12); }
+body.tv { scroll-padding: 120px; }
+
+/* Tab strips scroll sideways on any screen instead of widening the page. */
+.tabs { overflow-x: auto; overflow-y: hidden; max-width: 100%; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { white-space: nowrap; flex: 0 0 auto; }
+
+/* Stat rows: 5 / 3 / 2 columns so the last card never sits alone. */
+@media (min-width: 641px) and (max-width: 1099px) { .grid.cols-5 { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 640px) { .grid.cols-5 { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 1100px) { .grid.cols-5 { grid-template-columns: repeat(5, 1fr); } }

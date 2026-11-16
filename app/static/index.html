@@ -17,9 +17,10 @@
   <link rel="stylesheet" href="/api/branding/theme.css">
 </head>
 <body>
+  <a class="skip-link" href="#view">Skip to content</a>
   <!-- Mobile-only top bar. The sidebar stays the primary nav on desktop. -->
   <header class="topbar">
-    <button class="burger" id="menuBtn" aria-label="Toggle navigation">
+    <button class="burger" id="menuBtn" aria-label="Toggle navigation" aria-controls="nav" aria-expanded="false">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
     </button>
     <div class="brand">
@@ -91,13 +92,6 @@
   <div id="drawerRoot"></div>
   <script src="/static/app.js"></script>
   <script src="/static/crm.js"></script>
-  <script>
-    // Mobile navigation: the burger slides the sidebar in; any nav tap slides
-    // it back out. Desktop ignores this entirely.
-    const shell = document.querySelector('.shell');
-    document.getElementById('menuBtn').addEventListener('click', () => shell.classList.toggle('nav-open'));
-    document.querySelectorAll('#nav a').forEach((link) =>
-      link.addEventListener('click', () => shell.classList.remove('nav-open')));
-  </script>
+  <script src="/static/responsive.js"></script>
 </body>
 </html>
