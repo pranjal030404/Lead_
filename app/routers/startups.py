@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 
 from .. import registry_check
@@ -103,3 +103,17 @@ def owners(lead_id: int, _: dict = WRITE):
         execute("UPDATE leads SET owner_name = ?, updated_at = ? WHERE id = ? AND workspace_id = ?",
                 (people[0]["name"], utcnow(), lead_id, current_ws()))
     return {"officers": people}
+
+
+@router.post("/india-csv")
+async def upload_india_csv(file: UploadFile = File(...), _: dict = Depends(require_role("superadmin", "admin"))):
+    """Upload an MCA 'Company Master Data' CSV (data.gov.in) so India searches work."""
+    from ..providers.india_csv import folder
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", file.filename or "mca.csv")
+    if not name.lower().endswith(".csv"):
+        raise HTTPException(400, "Upload a .csv file")
+    data = await file.read()
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "File too large (max 200 MB)")
+    (folder() / name).write_bytes(data)
+    return {"saved": name, "bytes": len(data), "files": len(list(folder().glob("*.csv")))}

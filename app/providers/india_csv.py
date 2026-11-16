@@ -33,24 +33,41 @@ class IndiaCsvProvider:
         since = date.today() - timedelta(days=self.since_days)
         words = [w for w in re.split(r"\W+", (niche or "").lower()) if len(w) > 2]
         place = (city or "").lower()
-        out = []
+        out, older = [], []
+        rows_read = parsed = 0
+        newest = None
         for path in files:
             with open(path, encoding="utf-8-sig", newline="", errors="replace") as f:
                 for row in csv.DictReader(f):
+                    rows_read += 1
                     c = row_to_candidate(row)
                     if not c:
                         continue
+                    parsed += 1
                     reg, status = c.pop("_registered"), c.pop("_status")
                     text, addr = c.pop("_text"), c.pop("_addr")
-                    if reg is None or reg < since or (status and "active" not in status):
+                    if reg and (newest is None or reg > newest):
+                        newest = reg
+                    if status and "active" not in status:
                         continue
                     if words and not any(w in text for w in words):
                         continue
                     if place and place not in addr:
                         continue
                     c["city"] = city or None
-                    out.append(c)
-        out.sort(key=lambda c: c["source"].split("registered ")[-1], reverse=True)
+                    (out if reg and reg >= since else older).append((reg, c))
+        if not out and older:   # data export is old: return the most recent matches instead of nothing
+            older = [x for x in older if x[0]]
+            older.sort(key=lambda x: x[0], reverse=True)
+            out = older[:max_results]
+        if not out:
+            raise RuntimeError(
+                f"CSV had {rows_read} rows, {parsed} readable, newest registration "
+                f"{newest or 'unknown (date column not recognised)'}; none matched niche "
+                f"'{niche}'{' / city ' + city if city else ''} and Active status. "
+                "Try a broader niche word or leave the city blank.")
+        out.sort(key=lambda x: x[0] or date.min, reverse=True)
+        out = [c for _, c in out]
         return out[:max_results]
 
     def fetch_details(self, candidate):

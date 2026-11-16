@@ -40,8 +40,8 @@ def _pick(row: dict, *names: str):
 def parse_date(s: str | None) -> date | None:
     if not s:
         return None
-    s = s.strip()[:10]
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%Y/%m/%d"):
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%Y", "%Y/%m/%d", "%d-%m-%y", "%d/%m/%y", "%d-%b-%y"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
