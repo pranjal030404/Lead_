@@ -209,3 +209,26 @@ def test_repeat_reply_does_not_duplicate_open_task(api):
     api.patch(f"/api/tasks/{tid}", json={"status": "DONE"})                       # once done, a new reply may add a fresh one
     api.post(f"/api/leads/{lid}/reply", json={"text": "Yes interested, can we talk Tuesday?"})
     assert len(api.get("/api/tasks", params={"lead_id": lid}).json()["tasks"]) == 1   # (the OPEN list: only the new one)
+
+
+def test_ab_step_splits_leads_by_variant_and_reports(api):
+    camp = _campaign(api, steps=[{"template": "cold_email_first", "template_b": "follow_up_day_3",
+                                  "delay_days": 0}])
+    assert camp["steps"][0]["template_b"] == "follow_up_day_3"
+    a = _lead("AB even", email="even@shop.example")
+    b = _lead("AB odd", email="odd@shop.example")
+    even, odd = (a, b) if a % 2 == 0 else (b, a)
+    api.post(f"/api/campaigns/{camp['id']}/enroll", json={"lead_ids": [even, odd]})
+    api.patch(f"/api/campaigns/{camp['id']}", json={"status": "ACTIVE"})
+    api.post(f"/api/campaigns/{camp['id']}/run")
+    used = {r["lead_id"]: r["template_name"] for r in query(
+        "SELECT lead_id, template_name FROM approval_queue WHERE step = ?", (f"c{camp['id']}s0",))}
+    assert used[even] == "cold_email_first" and used[odd] == "follow_up_day_3"
+    res = api.get(f"/api/campaigns/{camp['id']}").json()["stats"]["variants"]
+    assert res[0]["A"]["template"] == "cold_email_first" and res[0]["B"]["template"] == "follow_up_day_3"
+
+
+def test_ab_unknown_template_rejected(api):
+    r = api.post("/api/campaigns", json={"name": "x", "steps": [
+        {"template": "cold_email_first", "template_b": "nope_nope", "delay_days": 0}]})
+    assert r.status_code == 400

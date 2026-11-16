@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from . import (audit, emailintel, http, leadscore, lineage, opportunities, people, social,
+from . import (audit, emailintel, finder, http, leadscore, lineage, opportunities, people, social,
                website)
 from .config import settings
 from .db import execute, log_automation, log_failure, query_one, utcnow
@@ -114,6 +114,13 @@ def stage_email(lead: dict) -> dict:
     # Free: the site's own contact / about page.
     for candidate in website.find_contact_email(lead.get("website_url")):
         email, valid, _ = validate_email(candidate)
+        if valid:
+            return {"email": email, "email_valid": 1, "_source": ("website_scrape", "website")}
+
+    # Free: our own finder - deep crawl, mail-server check, INFERRED guesses.
+    found = finder.find(lead)
+    if found["email"]:
+        email, valid, _ = validate_email(found["email"])
         if valid:
             return {"email": email, "email_valid": 1, "_source": ("website_scrape", "website")}
 

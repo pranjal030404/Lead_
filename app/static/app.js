@@ -105,7 +105,7 @@ function configureNav() {
   document.getElementById('navPlans').style.display = admin && !isFree() ? '' : 'none';
   document.querySelectorAll('#nav a[href="#/myplan"]').forEach((a) => { a.style.display = isFree() ? 'none' : ''; });
   document.getElementById('navSettings').style.display = admin ? '' : 'none';
-  ['navIntegrations', 'navAudit'].forEach((id) => { const n = document.getElementById(id); if (n) n.style.display = admin ? '' : 'none'; });
+  ['navIntegrations', 'navAudit', 'navGrowth'].forEach((id) => { const n = document.getElementById(id); if (n) n.style.display = admin ? '' : 'none'; });
   const user = me().user;
   if (user) {
     const name = [user.full_name, user.username].filter(Boolean).join(' · ');
@@ -1701,12 +1701,13 @@ routes['/templates'] = async () => {
 routes['/startups'] = async () => {
   view.innerHTML = `
     <div class="page-head"><div><h1>New startups</h1>
-      <div class="subtitle">New startups found on the open web (AI search) - find, review and update</div></div></div>
+      <div class="subtitle">New startups found on the open web (free, no key) - 10-20 per run, each verified with contact, address, founders and registration date</div></div></div>
     <div class="card" style="margin-bottom:12px">
       <div class="flex" style="gap:8px;flex-wrap:wrap">
         <input id="su-niche" value="tech" placeholder="niche words (tech, software, cafe)">
         <input id="su-city" placeholder="city (optional)">
         <select id="su-country"><option value="worldwide">All countries (worldwide)</option><option value="both">UK + India</option><option>India</option><option>United Kingdom</option><option>United States</option><option>Canada</option><option>Australia</option><option>Germany</option><option>France</option><option>Netherlands</option><option>Singapore</option><option>United Arab Emirates</option><option>Brazil</option><option>Nigeria</option><option>South Africa</option><option>Indonesia</option><option>Philippines</option><option>Pakistan</option><option>Bangladesh</option><option>Sri Lanka</option><option>Nepal</option><option>Spain</option><option>Italy</option><option>Ireland</option><option>Sweden</option><option>Japan</option></select>
+        <select id="su-n" title="How many per run (10-20)"><option value="10">10 startups</option><option value="15" selected>15 startups</option><option value="20">20 startups</option></select>
         <button id="su-find">Find new startups</button>
       </div>
     </div>
@@ -1720,9 +1721,9 @@ routes['/startups'] = async () => {
         <button id="su-apply" class="sm">Check &amp; apply</button>
       </div>
       <div id="su-msg" class="faint" style="margin-bottom:8px"></div>
-      <div style="overflow-x:auto"><table><thead><tr><th>Company</th><th>Owner</th><th>Registered</th>
-        <th>Reg. no.</th><th>Location</th><th>Contact</th><th>Status</th><th></th></tr></thead>
-        <tbody id="su-rows"></tbody></table></div>
+      <div id="su-prog" class="su-prog" hidden><i></i></div>
+      <div id="su-stats" class="su-stats"></div>
+      <div id="su-rows" class="su-grid"></div>
     </div>`;
   const $ = (id) => document.getElementById(id);
   const say = (t) => { $('su-msg').textContent = t; };
@@ -1730,16 +1731,34 @@ routes['/startups'] = async () => {
     const p = new URLSearchParams({ q: $('su-q').value, country: $('su-lc').value, closed: $('su-closed').checked });
     try {
       const d = await api('/api/startups?' + p);
-      $('su-rows').innerHTML = d.startups.map((s) => `
-        <tr style="${s.business_status === 'CLOSED_PERMANENTLY' ? 'opacity:.55' : ''}">
-          <td><a href="javascript:void(0)" onclick="openLead(${s.id})">${esc(s.business_name)}</a></td>
-          <td>${esc(s.owner_name || '-')}</td><td>${esc(s.registered_on || '-')}</td>
-          <td>${esc(s.registration_number)}</td>
-          <td>${esc([s.city, s.state, s.pincode].filter(Boolean).join(', ') || '-')}</td>
-          <td>${esc([s.email, s.phone, s.website_url].filter(Boolean).join(' | ') || '-')}</td>
-          <td>${esc(s.business_status === 'CLOSED_PERMANENTLY' ? 'closed' : s.status)}</td>
-          <td>${s.registry === 'uk' ? `<button class="sm" data-owners="${s.id}">Get owners</button>` : ''}</td>
-        </tr>`).join('');
+      const chip = (ic, v, href) => v ? `<a class="su-chip" ${href ? `href="${esc(href)}" target="_blank" rel="noopener"` : ''}>${ic} ${esc(v)}</a>` : '';
+      const age = (d) => { if (!d) return ''; const n = Math.floor((Date.now() - new Date(d)) / 864e5); return isNaN(n) ? '' : n < 1 ? 'born today' : n < 31 ? `born ${n}d ago` : n < 730 ? `born ${Math.floor(n / 30)}mo ago` : `born ${Math.floor(n / 365)}y ago`; };
+      const st = d.startups;
+      $('su-stats').innerHTML = `<span><b>${st.length}</b> startups</span><span><b>${st.filter((x) => x.email).length}</b> with email</span><span><b>${st.filter((x) => x.phone).length}</b> with phone</span><span><b>${st.filter((x) => x.owner_name).length}</b> with founder</span>`;
+      $('su-rows').innerHTML = st.length ? st.map((s) => `
+        <div class="su-card" style="${s.business_status === 'CLOSED_PERMANENTLY' ? 'opacity:.55' : ''}">
+          <div class="su-head">
+            <a class="su-name" href="javascript:void(0)" onclick="openLead(${s.id})">${esc(s.business_name)}</a>
+            <span class="pill ${esc(s.status)}">${esc(s.business_status === 'CLOSED_PERMANENTLY' ? 'closed' : s.status)}</span>
+          </div>
+          <div class="su-meta">${esc(s.registered_on ? `Registered ${s.registered_on} - ${age(s.registered_on)}` : 'Registration date unknown')}${s.registration_number && s.registry !== 'web' ? ` - Reg. ${esc(s.registration_number)}` : ''}</div>
+          <div class="su-about">${esc(s.about || '')}</div>
+          <div class="su-chips">
+            ${chip('&#127760;', (s.website_url || '').replace(/^https?:\/\//, ''), s.website_url)}
+            ${chip('&#9993;', s.email, s.email && 'mailto:' + s.email)}
+            ${chip('&#9742;', s.phone, s.phone && 'tel:' + s.phone)}
+            ${chip('&#128205;', [s.address, s.city, s.state, s.country].filter(Boolean).join(', '))}
+            ${chip('&#128100;', s.owner_name)}
+            ${s.linkedin_url ? chip('in', 'LinkedIn', s.linkedin_url) : ''}${s.instagram_url ? chip('ig', 'Instagram', s.instagram_url) : ''}${s.facebook_url ? chip('f', 'Facebook', s.facebook_url) : ''}
+          </div>
+          <div class="su-foot">
+            <div class="su-meter" title="${s.completeness}% of details found"><i style="width:${s.completeness}%"></i></div>
+            <span class="faint">${s.completeness}% complete</span>
+            <span style="flex:1"></span>
+            ${s.registry === 'uk' ? `<button class="sm" data-owners="${s.id}">Get owners</button>` : ''}
+            <button class="sm" onclick="openLead(${s.id})">Details</button>
+          </div>
+        </div>`).join('') : '<div class="faint" style="padding:24px;text-align:center">No startups yet - pick a niche and click "Find new startups".</div>';
       if (!keep) say(`${d.count} compan${d.count === 1 ? 'y' : 'ies'}`);
       $('su-rows').querySelectorAll('[data-owners]').forEach((b) => b.onclick = async () => {
         try {
@@ -1764,12 +1783,13 @@ routes['/startups'] = async () => {
   $('su-apply').onclick = () => check(false);
   $('su-find').onclick = async () => {
     try {
-      const r = await post('/api/startups/find', { niche: $('su-niche').value, city: $('su-city').value, country: $('su-country').value });
+      const r = await post('/api/startups/find', { niche: $('su-niche').value, city: $('su-city').value, country: $('su-country').value, max_results: +$('su-n').value });
       const ids = r.search_ids || [];
       const names = { uk_all: 'UK', india_all: 'India' };
       const FIN = ['COMPLETED', 'FAILED', 'STOPPED_QUOTA', 'CANCELLED'];
       const started = Date.now();
       let sts = [];
+      $('su-prog').hidden = false; $('su-find').disabled = true;
       while (Date.now() - started < 10 * 60 * 1000) {
         sts = await Promise.all(ids.map((id) => api(`/api/search/${id}/status`).catch(() => null)));
         if (!document.getElementById('su-find')) return;   // navigated away
@@ -1778,6 +1798,7 @@ routes['/startups'] = async () => {
         if (sts.every((x) => x && FIN.includes(x.status))) break;
         await new Promise((res) => setTimeout(res, 3000));
       }
+      $('su-prog').hidden = true; $('su-find').disabled = false;
       await load(true);
       const errs = sts.filter((x) => x && x.error_message).map((x) => `${x.country || ''}: ${x.error_message}`);
       const found = sts.reduce((n, x) => n + ((x && x.new_leads) || 0), 0);

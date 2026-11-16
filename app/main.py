@@ -18,7 +18,7 @@ from .db import ping as db_ping
 from .db import (MIGRATIONS, NoWorkspace, _ws_var, init_db, pool_stats, query, scalar,
                  reset_current_user, set_current_user)
 from . import mcp as mcp_server
-from .routers import (startups as startups_router, campaigns as campaigns_router, crm, meetings as meetings_router, pipeline as pipeline_router, proposals as proposals_router, segments as segments_router, fit as fit_router, replies as replies_router, discovery, audits, auth, automation, intelligence, branding as branding_router, leads, outreach,
+from .routers import (growth as growth_router, capture as capture_router, startups as startups_router, campaigns as campaigns_router, crm, meetings as meetings_router, pipeline as pipeline_router, proposals as proposals_router, segments as segments_router, fit as fit_router, replies as replies_router, discovery, audits, auth, automation, intelligence, branding as branding_router, leads, outreach,
                       plans, profile, search, stats, users, workspaces)
 from .tenancy import TenancyError, resolve_workspace
 from .security import (SESSION_COOKIE, client_ip, load_user, rate_limit, verify_token)
@@ -28,7 +28,7 @@ PUBLIC_PATHS = {"/landing", "/login", "/admin", "/health", "/health/live", "/hea
                 "/api/auth/password-reset/confirm", "/favicon.ico"}
 # Self-service account actions a read-only viewer may still do.
 VIEWER_WRITABLE = ("/api/auth/logout", "/api/auth/mfa", "/api/auth/password-reset")
-PUBLIC_PREFIXES = ("/static/", "/api/uploads/", "/api/branding/theme.css", "/p/")
+PUBLIC_PREFIXES = ("/static/", "/api/uploads/", "/api/branding/theme.css", "/p/", "/c/")
 
 
 @asynccontextmanager
@@ -222,6 +222,8 @@ app.include_router(proposals_router.router)
 app.include_router(proposals_router.public)
 app.include_router(segments_router.router)
 app.include_router(startups_router.router)
+app.include_router(capture_router.public)
+app.include_router(growth_router.router)
 app.include_router(mcp_server.router)
 
 app.mount("/static", StaticFiles(directory=settings.static_dir), name="static")

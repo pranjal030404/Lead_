@@ -41,7 +41,7 @@ OBFUSCATED_RE = re.compile(
 
 JUNK_DOMAINS = ("sentry.io", "sentry-next.wixpress.com", "wixpress.com", "example.com",
                 "domain.com", "email.com", "yourdomain.com", "mysite.com", "schema.org",
-                "w3.org", "godaddy.com", "squarespace.com")
+                "w3.org", "godaddy.com", "squarespace.com", "github.com")
 JUNK_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css", ".js", ".woff",
                  ".woff2", ".ico")
 JUNK_LOCALS = {"you", "your", "name", "yourname", "email", "user", "username", "test",

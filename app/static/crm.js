@@ -3,6 +3,7 @@
 
 ADMIN_ONLY['/integrations'] = 1;
 ADMIN_ONLY['/auditlog'] = 1;
+ADMIN_ONLY['/growth'] = 1;
 
 // ---------------------------------------------------------------- tasks ---
 function dueLabel(task) {
@@ -231,7 +232,8 @@ function addStepRow(delay = 0) {
   const div = document.createElement('div');
   div.className = 'row cpStep'; div.style.marginBottom = '6px';
   div.innerHTML = `<div class="shrink" style="width:60px;align-self:center"><b>#${n}</b></div>
-    <div><select class="cpTpl">${opts}</select></div>
+    <div><select class="cpTpl">${opts}</select>
+      <select class="cpTplB" title="Optional: A/B test a second template (half the leads get each)" style="margin-top:4px"><option value="">A/B: no second template</option>${cmpTemplates.map((t) => `<option value="${esc(t)}">B: ${esc(t)}</option>`).join('')}</select></div>
     <div class="shrink" style="width:300px;display:flex;align-items:center;gap:8px;white-space:nowrap"><input class="cpDelay" type="number" min="0" max="90" value="${delay}" title="Days to wait" style="width:80px"> <span class="faint">days after ${n === 1 ? 'enrolment' : 'previous email'}</span></div>
     <div class="shrink"><button class="sm danger" onclick="this.closest('.cpStep').remove()">✕</button></div>`;
   wrap.appendChild(div);
@@ -239,7 +241,7 @@ function addStepRow(delay = 0) {
 
 async function createCampaign() {
   const steps = [...document.querySelectorAll('.cpStep')].map((r) => ({
-    template: r.querySelector('.cpTpl').value, delay_days: Number(r.querySelector('.cpDelay').value) || 0 }));
+    template: r.querySelector('.cpTpl').value, template_b: r.querySelector('.cpTplB').value || null, delay_days: Number(r.querySelector('.cpDelay').value) || 0 }));
   const name = document.getElementById('cpName').value.trim();
   if (!name) return toast('Name the campaign', 'err');
   if (!steps.length) return toast('Add at least one step', 'err');
@@ -258,8 +260,14 @@ async function campaignDetail(id) {
   const s = c.stats, crit = c.criteria || {};
   const critText = Object.keys(crit).length
     ? Object.entries(crit).map(([k, v]) => `${esc(k.replace('_', ' '))}: ${esc(v)}`).join(' · ') : 'none set';
-  const stepRows = c.steps.map((st, i) => `<tr><td>#${i + 1}</td><td>${esc(st.template)}</td>
+  const stepRows = c.steps.map((st, i) => `<tr><td>#${i + 1}</td><td>${esc(st.template)}${st.template_b ? ` <span class="faint">vs</span> ${esc(st.template_b)}` : ''}</td>
     <td class="faint">${st.delay_days === 0 ? (i === 0 ? 'immediately' : 'right after previous is sent') : st.delay_days + ' day(s) after ' + (i === 0 ? 'enrolment' : 'previous is sent')}</td></tr>`);
+  const abRows = (s.variants || []).map((v) => {
+    const rate = (x) => (x.sent ? Math.round((1000 * x.replied) / x.sent) / 10 : 0);
+    return `<tr><td>#${v.position + 1}</td><td>A: ${esc(v.A.template)}</td><td class="num">${v.A.sent}</td><td class="num">${v.A.replied}</td><td class="num">${rate(v.A)}%</td></tr>
+      <tr><td></td><td>B: ${esc(v.B.template)}</td><td class="num">${v.B.sent}</td><td class="num">${v.B.replied}</td><td class="num">${rate(v.B)}%</td></tr>`;
+  });
+  const abBlock = abRows.length ? `<h3 style="margin-top:20px">A/B results</h3>${table(['Step', 'Template', 'Sent', 'Replied', 'Reply rate'], abRows)}` : '';
   const rows = en.enrollments.map((e) => `<tr>
     <td><a href="#/leads" onclick="openLead(${e.lead_id});return false"><b>${esc(e.business_name)}</b></a>
       <div class="faint" style="font-size:11.5px">${esc(e.email || '')}</div></td>
@@ -283,7 +291,7 @@ async function campaignDetail(id) {
       <p class="faint" style="margin:0 0 8px">Auto-pick uses this campaign's filters (${critText}) over your NEW/CONTACTED leads with an email.
       Leads that replied, opted out, are in another campaign, or have no usable email are skipped and counted.</p>
       <div class="flex"><button class="primary" onclick="enrollCriteria(${id})">Enrol matching leads</button></div></div>
-    <h3>Sequence</h3>${table(['Step', 'Template', 'Timing'], stepRows)}
+    <h3>Sequence</h3>${table(['Step', 'Template', 'Timing'], stepRows)}${abBlock}
     <h3 style="margin-top:20px">Leads in this campaign</h3>
     ${table(['Lead', 'State', 'Progress / reason', 'Next step due', ''], rows, 'No leads enrolled yet.')}`;
 }
@@ -648,3 +656,53 @@ const FEATURE_NAV = { search: ['#/search', '#/discover', '#/targets', '#/map'], 
     } else if (++tries > 40) clearInterval(timer);
   }, 250);
 })();
+
+// --------------------------------------------------------------- growth ---
+async function saveGrowth(patch) {
+  try { await put('/api/growth/settings', patch); toast('Saved', 'ok'); navigate(); }
+  catch (e) { toast(e.message, 'err'); }
+}
+async function saveThresholds() {
+  await saveGrowth({ mql_threshold: Number(document.getElementById('gMql').value),
+                     sql_threshold: Number(document.getElementById('gSql').value) });
+}
+function copyCaptureUrl(url) { navigator.clipboard.writeText(url).then(() => toast('Link copied', 'ok')); }
+
+routes['/growth'] = async () => {
+  const d = await api('/api/growth');
+  const s = d.settings, c = d.capture, f = d.finder, q = d.qualification;
+  const fullUrl = c.url.startsWith('http') ? c.url : location.origin + c.url;
+  const srcRows = d.sources.map((r) => `<tr><td>${esc(r.source)}</td><td class="num">${r.leads}</td>
+    <td class="num">${r.contacted}</td><td class="num">${r.won}</td><td class="num">${r.lost}</td>
+    <td class="num">${r.win_rate}%</td></tr>`);
+  const emailPct = f.total_leads ? Math.round((100 * f.leads_with_email) / f.total_leads) : 0;
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Growth</h1>
+      <div class="subtitle">Admin-only controls for inbound capture, the free email finder, lead qualification and sources.</div></div></div>
+    <div class="grid" style="display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))">
+      <div class="card"><h3 style="margin-top:0">Inbound form</h3>
+        <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" style="width:auto" ${s.capture_enabled ? 'checked' : ''}
+          onchange="saveGrowth({capture_enabled:this.checked})"> Form is live</label>
+        <div class="faint" style="margin:8px 0">Share this link or put it on your website. Add <span class="mono">?utm_source=…&amp;utm_campaign=…</span> to track where leads come from.</div>
+        <div class="mono" style="word-break:break-all">${esc(fullUrl)}</div>
+        ${c.public_url_set ? '' : '<div class="faint" style="margin-top:6px">Set PUBLIC_URL in .env so links are correct outside this browser.</div>'}
+        <div class="flex" style="margin-top:10px"><button class="sm" onclick="copyCaptureUrl('${esc(fullUrl)}')">Copy link</button>
+          <a class="btn sm" href="${esc(c.url)}" target="_blank" rel="noopener">Open</a></div>
+        <div style="margin-top:10px">${c.inbound_leads} inbound leads &middot; ${c.last_7_days} in the last 7 days</div></div>
+      <div class="card"><h3 style="margin-top:0">Free email finder</h3>
+        <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" style="width:auto" ${s.finder_enabled ? 'checked' : ''}
+          onchange="saveGrowth({finder_enabled:this.checked})"> Run automatically during enrichment</label>
+        <div class="faint" style="margin:8px 0">Deep site crawl, mail-server check, then name-pattern guesses. Guesses are never sent to.</div>
+        <div>${f.leads_with_email} of ${f.total_leads} leads have an email (${emailPct}%)</div>
+        <div>${f.guessed_addresses} guessed addresses waiting for review</div></div>
+      <div class="card"><h3 style="margin-top:0">Lead qualification</h3>
+        <div class="faint" style="margin-bottom:8px">Inbound enquiries and leads whose overall score (0–100) is at or above the SQL line are sales-ready; the MQL line marks leads worth nurturing.</div>
+        <div class="flex" style="gap:12px;align-items:end">
+          <div><label>MQL from score</label><input id="gMql" type="number" min="0" max="100" value="${s.mql_threshold}" style="width:90px"></div>
+          <div><label>SQL from score</label><input id="gSql" type="number" min="0" max="100" value="${s.sql_threshold}" style="width:90px"></div>
+          <button class="sm" onclick="saveThresholds()">Save</button></div>
+        <div style="margin-top:12px"><b>${q.SQL}</b> SQL &middot; <b>${q.MQL}</b> MQL &middot; ${q.UNQUALIFIED} unqualified <span class="faint">(open leads)</span></div></div>
+    </div>
+    <h3 style="margin-top:24px">Lead sources</h3>
+    ${table(['Source', 'Leads', 'Contacted', 'Won', 'Lost', 'Win rate'], srcRows, 'No leads yet.')}`;
+};

@@ -15,10 +15,11 @@ import html as htmllib
 import json
 import re
 import time
-from datetime import date
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .. import http
+from .. import contactparse, http, netsafe, people as people_mod
 from ..config import settings
 from .base import blank_candidate
 
@@ -33,6 +34,136 @@ SKIP = {"linkedin.com", "facebook.com", "twitter.com", "x.com", "instagram.com",
         "gov.uk", "bbc.com", "theguardian.com", "linkedin.cn", "clutch.co", "goodfirms.co",
         "tiktok.com", "bloomberg.com", "reuters.com", "businessinsider.com", "wired.com"}
 _TAG = re.compile(r"<[^>]+>")
+
+MIN_BATCH, MAX_BATCH = 10, 20          # one run returns 10-20 startups, never more
+MAX_DOMAIN_AGE_DAYS = 3 * 365          # "new": the domain was registered in the last 3 years
+_SENTENCE = re.compile(r"\b(is|are|was|were|how|why|what|with|your|you|our|we|to|for|and|the|of|a|an|in|on|"
+                       r"get|new|launch|launches|launched|built|build|help|helps|find|make|makes)\b", re.I)
+_META = re.compile(r'<meta[^>]+(?:name|property)=["\'](og:site_name|og:description|description)["\'][^>]*>', re.I)
+_META_VAL = re.compile(r'content=["\']([^"\']*)["\']', re.I)
+_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def clamp_batch(n: int | None) -> int:
+    """Requested result count forced into the 10-20 window."""
+    try:
+        n = int(n or MAX_BATCH)
+    except (TypeError, ValueError):
+        n = MAX_BATCH
+    return max(MIN_BATCH, min(n, MAX_BATCH))
+
+
+def good_name(name: str | None) -> bool:
+    """A company name, not a headline: short, no sentence words."""
+    n = (name or "").strip()
+    words = n.split()
+    if not (2 <= len(n) <= 40) or len(words) > 4:
+        return False
+    if len(words) >= 3 and _SENTENCE.search(n):
+        return False
+    return not re.search(r"[.!?]$", n)
+
+
+def rdap_created(domain: str) -> str | None:
+    """Domain registration date (YYYY-MM-DD) from RDAP - free, open, keyless. It is the best
+    public proof of when a web startup was 'born'."""
+    try:
+        r = http.get(f"https://rdap.org/domain/{domain}", breaker="rdap", retries=1, timeout=8,
+                     follow_redirects=True)
+        if r.status_code >= 400:
+            return None
+        for ev in r.json().get("events", []):
+            if ev.get("eventAction") == "registration" and ev.get("eventDate"):
+                return ev["eventDate"][:10]
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def profile(site: str) -> dict | None:
+    """Verify a startup's own site is alive and read every public detail off it:
+    name, description, emails, phones, address, founders. None when the site is dead."""
+    try:
+        r = netsafe.safe_get(site, breaker="webpage", retries=1, timeout=8)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.status_code >= 400 or "html" not in r.headers.get("content-type", "html"):
+        return None
+    base = str(r.url).rstrip("/")
+    pages = [r.text or ""]
+    for link in contactparse.discover_contact_links(pages[0], base + "/", limit=2):
+        try:
+            x = netsafe.safe_get(link, breaker="webpage", retries=1, timeout=6)
+            if x.status_code < 400:
+                pages.append(x.text or "")
+        except Exception:  # noqa: BLE001
+            continue
+    meta = {}
+    for m in _META.finditer(pages[0]):
+        v = _META_VAL.search(m.group(0))
+        if v:
+            meta.setdefault(m.group(1).lower(), htmllib.unescape(v.group(1)).strip())
+    title = _text(_TITLE.search(pages[0]).group(1)) if _TITLE.search(pages[0]) else ""
+    struct: dict = {}
+    emails: list[str] = []
+    phones: list[str] = []
+    founders: list[dict] = []
+    for pg in pages:
+        st = contactparse.extract_structured(pg)
+        for k, v in st.items():
+            if v and not struct.get(k):
+                struct[k] = v
+        emails += contactparse.extract_emails(pg)
+        phones += contactparse.extract_phones(pg)
+        founders += people_mod.extract_people(pg)
+    emails = contactparse.rank_emails(list(dict.fromkeys(emails)), base)
+    phones = list(dict.fromkeys(phones))
+    if struct.get("telephone"):
+        phones.insert(0, re.sub(r"[^\d+]", "", struct["telephone"]))
+    return {"site_name": meta.get("og:site_name") or struct.get("name"),
+            "title": title, "about": meta.get("og:description") or meta.get("description") or "",
+            "email": emails[0] if emails else struct.get("email"),
+            "phone": phones[0] if phones else None, "address": struct.get("address"),
+            "founders": [f["name"] for f in founders if f.get("name")][:3]}
+
+
+def _age_ok(created: str | None) -> bool:
+    if not created:
+        return True          # RDAP gave nothing (some TLDs): don't punish
+    try:
+        d = datetime.fromisoformat(created).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - d).days <= MAX_DOMAIN_AGE_DAYS
+
+
+def complete(f: dict) -> dict | None:
+    """Verify one found startup and fill in everything public about it. None = reject."""
+    site = (f.get("website") or "").strip()
+    dom = _domain(site if site.startswith("http") else "https://" + site) if site else ""
+    if not dom or _skip(dom):
+        return None
+    prof = profile(f"https://{dom}")
+    if prof is None:
+        return None
+    created = rdap_created(dom)
+    if not _age_ok(created):
+        return None
+    name = f.get("name") if good_name(f.get("name")) else None
+    if not name:
+        for cand in (prof["site_name"], re.split(r"\s[-|–—:·]\s|\s\|\s", prof["title"])[0]):
+            if good_name(cand):
+                name = cand.strip(); break
+    if not name:
+        name = dom.split(".")[0].replace("-", " ").title()
+    return {**f, "name": name, "dom": dom, "created": created, "prof": prof,
+            "about": (prof["about"] or f.get("about") or "")[:160]}
+
+
+def _richness(c: dict) -> int:
+    p = c["prof"]
+    return (3 * bool(c["created"]) + 2 * bool(p["email"]) + 2 * bool(p["phone"]) + 2 * bool(p["address"])
+            + 2 * bool(p["founders"] or c.get("founders")) + bool(c["about"]))
 
 
 def _text(s: str) -> str:
@@ -237,24 +368,36 @@ class WebAiProvider:
             found = llm_extract(base, place, material)
         if not found and results:
             found = heuristic_extract(results)
-        out, keys = [], set()
+        limit = clamp_batch(max_results)
+        pool, keys = [], set()
         for f in found:
             name = str(f.get("name") or "").strip()
             site = (f.get("website") or "").strip()
             dom = _domain(site if site.startswith("http") else "https://" + site) if site else ""
-            key = f"web:{dom or name.lower()}"
-            if not name or key in keys or (dom and _skip(dom)):
+            k = dom or name.lower()
+            if not name or not dom or k in keys or _skip(dom):
                 continue
-            keys.add(key)
-            c = blank_candidate()
-            c.update(place_id=key, business_name=name[:200], country=(None if f.get("global") else country or None),
-                     city=(f.get("city") or city or None),
-                     website_url=(f"https://{dom}" if dom else None),
-                     owner_name=(str(f.get("founders"))[:200] if f.get("founders") else None),
-                     source=(f"Web AI search ({'LLM' if settings.llm_base_url else 'heuristic'}; "
-                             f"registered {f.get('founded') or 'n/a'}; {str(f.get('about') or '')[:120]})")[:250])
-            out.append(c)
-        return out[:max_results]
+            keys.add(k)
+            pool.append(f)
+        # verify + complete each (parallel), keep the richest `limit`
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            done = [c for c in ex.map(complete, pool[:limit * 3]) if c]
+        done.sort(key=_richness, reverse=True)
+        out = []
+        for c in done[:limit]:
+            p = c["prof"]
+            cand = blank_candidate()
+            owner = p["founders"] or ([c["founders"]] if c.get("founders") else [])
+            cand.update(
+                place_id=f"web:{c['dom']}", business_name=c["name"][:200],
+                country=(None if c.get("global") else country or None),
+                city=(c.get("city") or city or None), address=(p["address"] or None),
+                phone=p["phone"], email=p["email"], website_url=f"https://{c['dom']}",
+                owner_name=(", ".join(owner)[:200] if owner else None),
+                source=(f"Web AI search ({'LLM' if settings.llm_base_url else 'heuristic'}; "
+                        f"registered {c['created'] or c.get('founded') or 'n/a'}; {c['about']})")[:250])
+            out.append(cand)
+        return out
 
     def fetch_details(self, candidate):
         return {}

@@ -15,6 +15,7 @@ router = APIRouter(prefix="/api/campaigns", tags=["campaigns"])
 
 class StepIn(BaseModel):
     template: str = Field(min_length=1, max_length=128)
+    template_b: str | None = Field(None, min_length=1, max_length=128)   # optional A/B variant
     delay_days: int = Field(0, ge=0, le=90)
 
 
@@ -52,7 +53,7 @@ def _own(campaign_id: int, request: Request) -> dict:
 
 
 def _steps(campaign_id: int) -> list[dict]:
-    return query("SELECT position, template_name AS template, delay_days FROM campaign_steps "
+    return query("SELECT position, template_name AS template, template_b, delay_days FROM campaign_steps "
                  "WHERE campaign_id = ? ORDER BY position", (campaign_id,))
 
 
@@ -82,7 +83,7 @@ def list_campaigns(request: Request):
 
 @router.post("")
 def create(p: CampaignIn, request: Request):
-    _check_templates([s.template for s in p.steps])
+    _check_templates([s.template for s in p.steps] + [s.template_b for s in p.steps if s.template_b])
     user = getattr(request.state, "user", None) or {}
     now = utcnow()
     cid = execute("INSERT INTO campaigns(workspace_id, owner_user_id, name, status, criteria, created_at, "
@@ -90,8 +91,8 @@ def create(p: CampaignIn, request: Request):
                   (current_ws(), user.get("id"), p.name.strip(),
                    json.dumps(p.criteria.model_dump(exclude_none=True)) if p.criteria else None, now, now))
     for i, s in enumerate(p.steps):
-        execute("INSERT INTO campaign_steps(workspace_id, campaign_id, position, template_name, delay_days) "
-                "VALUES(?,?,?,?,?)", (current_ws(), cid, i, s.template, s.delay_days))
+        execute("INSERT INTO campaign_steps(workspace_id, campaign_id, position, template_name, template_b, "
+                "delay_days) VALUES(?,?,?,?,?,?)", (current_ws(), cid, i, s.template, s.template_b, s.delay_days))
     return _out(_own(cid, request))
 
 
