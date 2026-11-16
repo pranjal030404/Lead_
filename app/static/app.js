@@ -1764,8 +1764,22 @@ routes['/startups'] = async () => {
   $('su-apply').onclick = () => check(false);
   $('su-find').onclick = async () => {
     try {
-      await post('/api/startups/find', { niche: $('su-niche').value, city: $('su-city').value, country: $('su-country').value });
-      say('Search running in the background - reload in a minute.');
+      const r = await post('/api/startups/find', { niche: $('su-niche').value, city: $('su-city').value, country: $('su-country').value });
+      const ids = r.search_ids || [];
+      say('Searching registries...');
+      const errs = [];
+      for (let i = 0; i < 60; i++) {
+        await new Promise((res) => setTimeout(res, 3000));
+        if (!document.getElementById('su-find')) return;   // navigated away
+        const sts = await Promise.all(ids.map((id) => api(`/api/search/${id}/status`).catch(() => null)));
+        const done = sts.every((x) => x && ['COMPLETED', 'FAILED', 'STOPPED_QUOTA', 'CANCELLED'].includes((x.search || x).status || x.status));
+        if (done) {
+          sts.forEach((x) => { const row = (x && (x.search || x)) || {}; if (row.error_message || row.error) errs.push(row.error_message || row.error); });
+          break;
+        }
+      }
+      await load();
+      if (errs.length) say('Search problem: ' + errs.join(' | '));
     } catch (e) { say(e.message); }
   };
   load();
